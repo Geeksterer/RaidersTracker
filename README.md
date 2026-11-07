@@ -1,6 +1,6 @@
 # Raiders Tracker (WoW 3.3.5a)
 
-**Raiders Tracker** (v1.1.2 by Copper) is an all-in-one raid performance, utility, consumable, and death-tracking addon built specifically for **World of Warcraft: Wrath of the Lich King (3.3.5a)**.
+**Raiders Tracker** (v1.1.3 by Copper) is an all-in-one raid performance, utility, consumable, and death-tracking addon built specifically for **World of Warcraft: Wrath of the Lich King (3.3.5a)**.
 
 Leading a 10-man or 25-man raid takes enough focus without having to dig through raw combat logs mid-run to see who pre-potted, whether a tank used a defensive cooldown, who cast Tricks of the Trade, or what actually killed someone on a wipe. **Raiders Tracker** automatically segments your raid into Trash and Boss pulls, snapshots your roster's buffs, and organizes potions, procs, class utility, and detailed death logs into clean in-game panels—complete with a one-click **Discord Markdown** report generator.
 
