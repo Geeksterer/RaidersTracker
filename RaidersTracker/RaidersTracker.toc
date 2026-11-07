@@ -2,7 +2,7 @@
 ## Title: Raiders Tracker
 ## Notes: Combat buff, potion, and raid utility tracker for WotLK 3.3.5 raids.
 ## Author: Copper
-## Version: 1.1.2
+## Version: 1.1.3
 ## SavedVariables: RaidersTrackerDB
 
 RaidersTracker.lua
