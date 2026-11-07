@@ -6,7 +6,7 @@ local ADDON_NAME = "Raiders Tracker"
 local AUTHOR = "Copper"
 
 local function GetAddonVersion()
-    return GetAddOnMetadata("RaidersTracker", "Version") or "1.7.0"
+    return GetAddOnMetadata("RaidersTracker", "Version") or "1.1.3"
 end
 
 local function GetFooterText()
@@ -360,10 +360,10 @@ local WOTLK_BOSS_DB = {
     [32871] = { name = "Algalon the Observer", scriptedFinish = true },
 
     -- Trial of the Crusader / ToGC
-    [34796] = { name = "Northrend Beasts", isSubBoss = true }, -- Gormok the Impaler (starts encounter, Icehowl ends it)
-    [34799] = { name = "Northrend Beasts", isSubBoss = true }, -- Dreadscale
-    [35144] = { name = "Northrend Beasts", isSubBoss = true }, -- Acidmaw
-    [34797] = { name = "Northrend Beasts" },                   -- Icehowl (Final Beast)
+    [34796] = { name = "Northrend Beasts", isSubBoss = true },
+    [34799] = { name = "Northrend Beasts", isSubBoss = true },
+    [35144] = { name = "Northrend Beasts", isSubBoss = true },
+    [34797] = { name = "Northrend Beasts" },
     [34780] = { name = "Lord Jaraxxus" },
     [34497] = { name = "Twin Val'kyr", isGroup = true },
     [34496] = { name = "Twin Val'kyr", isGroup = true },
@@ -392,20 +392,18 @@ local WOTLK_BOSS_DB = {
     [36609] = { name = "The Lich King", isAdd = true },
     [36701] = { name = "The Lich King", isAdd = true },
 
-    -- Ruby Sanctum (RS)
+    -- Ruby Sanctum (RS) - Halion and Independent Mini-Boss Encounters
+    [39751] = { name = "Baltharus the Warborn" },
+    [39899] = { name = "Baltharus the Warborn", isAdd = true }, -- Baltharus Clone
+    [39747] = { name = "Saviana Ragefire" },
+    [39746] = { name = "General Zarithrian" },
     [39863] = { name = "Halion" },
-    [40142] = { name = "Halion", isPhase = true },
-    [39751] = { name = "Halion", isMini = true },
-    [39747] = { name = "Halion", isMini = true },
-    [39746] = { name = "Halion", isMini = true }
+    [40142] = { name = "Halion", isPhase = true }
 }
 
--- Register all 28 Horde & Alliance Faction Champions NPC IDs (34441 to 34475) in Trial of the Crusader
 local FACTION_CHAMPION_NPC_IDS = {
-    -- Horde Champions (fought by Alliance raids)
     34441, 34444, 34445, 34447, 34448, 34449, 34450,
     34451, 34453, 34454, 34455, 34456, 34458, 34459,
-    -- Alliance Champions (fought by Horde raids)
     34460, 34461, 34463, 34465, 34466, 34467, 34468,
     34469, 34470, 34471, 34472, 34473, 34474, 34475
 }
@@ -513,7 +511,10 @@ local BOSS_ENGAGE_SPEECH = {
     ["In the name of our dark master"] = "Twin Val'kyr",
     ["This place will serve as your tomb!"] = "Anub'arak",
 
-    -- RS
+    -- Ruby Sanctum (Halion & Mini-Bosses)
+    ["Ah, the entertainment has arrived"] = "Baltharus the Warborn",
+    ["You will sssuffer for this intrusion"] = "Saviana Ragefire",
+    ["Alexstrasza has chosen capable allies"] = "General Zarithrian",
     ["Your world totters on the brink of destruction"] = "Halion"
 }
 
@@ -568,7 +569,7 @@ local BOSS_DEFEAT_SPEECH = {
     ["Your fate is sealed. The end of days is finally upon you"] = "Yogg-Saron",
     ["I have seen worlds bathed in the Makers' flames"] = "Algalon the Observer",
 
-    -- ToC (Fixed Faction Champions Defeat Yells)
+    -- ToC
     ["Another will take my place. Your world is doomed"] = "Lord Jaraxxus",
     ["A shallow and tragic victory"] = "Faction Champions",
     ["A superficial victory"] = "Faction Champions",
@@ -576,18 +577,23 @@ local BOSS_DEFEAT_SPEECH = {
     ["The Scourge cannot be stopped"] = "Twin Val'kyr",
     ["I have failed you, master"] = "Anub'arak",
 
-    -- RS
+    -- Ruby Sanctum (Halion & Mini-Bosses)
+    ["I... didn't see that... coming"] = "Baltharus the Warborn",
+    ["HALION! I"] = "General Zarithrian",
     ["Relish this victory, mortals, for it will be your last"] = "Halion"
 }
 
--- Direct Boss Combat Spells (Removed 65877 Faction Champions spell collision with Twin Val'kyr)
 local WOTLK_BOSS_INITIATORS = {
     [69076] = "Lord Marrowgar", [69057] = "Lord Marrowgar",
     [70867] = "Lady Deathwhisper", [69680] = "Icecrown Gunship Battle",
     [72293] = "Deathbringer Saurfang", [72219] = "Festergut", [69674] = "Rotface",
     [70351] = "Professor Putricide", [71807] = "Blood Prince Council", [70877] = "Blood-Queen Lana'thel",
     [71741] = "Valithria Dreamwalker", [70123] = "Sindragosa", [72350] = "The Lich King",
-    [74562] = "Halion", [66331] = "Northrend Beasts", [66532] = "Lord Jaraxxus",
+    [74505] = "Baltharus the Warborn", [74509] = "Baltharus the Warborn",
+    [74403] = "Saviana Ragefire", [74452] = "Saviana Ragefire", [78722] = "Saviana Ragefire",
+    [74367] = "General Zarithrian", [74384] = "General Zarithrian",
+    [74562] = "Halion",
+    [66331] = "Northrend Beasts", [66532] = "Lord Jaraxxus",
     [65875] = "Twin Val'kyr", [65876] = "Twin Val'kyr", [66013] = "Anub'arak",
     [62374] = "Flame Leviathan", [62680] = "Ignis the Furnace Master", [64021] = "Razorscale",
     [62776] = "XT-002 Deconstructor", [61888] = "Assembly of Iron", [63356] = "Kologarn",
@@ -671,25 +677,28 @@ local POTIONS_AND_BUFFS = {
     [72412] = "Ashen Melee Ring Proc",
     [72414] = "Ashen Tank Ring Proc",
 
-    -- Major WotLK Trinket Procs (Verified 3.3.5a Spell IDs)
+    -- Major WotLK Trinket Procs
     [71605] = "Phylactery Proc (N)",
     [71636] = "Phylactery Proc (HC)",
     [71601] = "DFO Proc (N)",
     [71644] = "DFO Proc (HC)",
-    -- Deathbringer's Will Normal (50362)
-    [71484] = "DBW Proc (Taunka Str)",
-    [71485] = "DBW Proc (Vrykul Agi)",
-    [71486] = "DBW Proc (Taunka AP)",
-    [71487] = "DBW Proc (Dwarf ArP)",
-    [71491] = "DBW Proc (Dwarf Crit)",
-    [71492] = "DBW Proc (Vrykul Haste)",
-    -- Deathbringer's Will Heroic (50363)
-    [71561] = "DBW Proc HC (Taunka Str)",
-    [71556] = "DBW Proc HC (Vrykul Agi)",
-    [71558] = "DBW Proc HC (Taunka AP)",
-    [71557] = "DBW Proc HC (Dwarf ArP)",
-    [71559] = "DBW Proc HC (Dwarf Crit)",
-    [71560] = "DBW Proc HC (Vrykul Haste)",
+
+    -- Deathbringer's Will Normal (Item 50362) - All 6 Distinct Buffs
+    [71484] = "DBW: Strength of the Taunka (+600 Str)",
+    [71485] = "DBW: Agility of the Vrykul (+600 Agi)",
+    [71486] = "DBW: Power of the Taunka (+1200 AP)",
+    [71487] = "DBW: Precision of the Iron Dwarves (+600 ArP)",
+    [71491] = "DBW: Aim of the Iron Dwarves (+600 Crit)",
+    [71492] = "DBW: Speed of the Vrykul (+600 Haste)",
+
+    -- Deathbringer's Will Heroic (Item 50363) - All 6 Distinct Buffs
+    [71561] = "DBW HC: Strength of the Taunka (+700 Str)",
+    [71556] = "DBW HC: Agility of the Vrykul (+700 Agi)",
+    [71558] = "DBW HC: Power of the Taunka (+1400 AP)",
+    [71557] = "DBW HC: Precision of the Iron Dwarves (+700 ArP)",
+    [71559] = "DBW HC: Aim of the Iron Dwarves (+700 Crit)",
+    [71560] = "DBW HC: Speed of the Vrykul (+700 Haste)",
+
     -- Other Raid Trinkets
     [71635] = "CTS Organ/Coin Proc (N)",
     [71646] = "CTS Organ/Coin Proc (HC)",
@@ -748,15 +757,16 @@ local POTIONS_AND_BUFFS = {
     [6346]  = "Fear Ward"
 }
 
--- Only allow SPELL_AURA_REFRESH on external cooldowns/potions
 local ALLOW_REFRESH_BUFFS = {
     [53908] = true, [53909] = true, [28494] = true, [28507] = true, [28508] = true,
     [53762] = true, [53753] = true, [54117] = true, [28714] = true,
     [57933] = true, [10060] = true, [49016] = true, [29166] = true,
     [33206] = true, [47788] = true, [6940]  = true, [1038]  = true, [1044] = true,
+    [71484] = true, [71485] = true, [71486] = true, [71487] = true, [71491] = true, [71492] = true,
+    [71561] = true, [71556] = true, [71558] = true, [71557] = true, [71559] = true, [71560] = true,
 }
 
--- Per-spell minimum cooldown (in seconds) for zero-ICD or stacking buffs
+-- Per-spell minimum cooldown (in seconds) so single procs never double-count on form/model updates
 local CUSTOM_BUFF_ICD = {
     [59620] = 12.0, -- Berserking Proc
     [28093] = 10.0, -- Mongoose Proc
@@ -764,6 +774,9 @@ local CUSTOM_BUFF_ICD = {
     [71570] = 30.0, -- Muradin's Spyglass (N)
     [71572] = 30.0, -- Muradin's Spyglass (HC)
     [65006] = 30.0, -- Eye of the Broodmother
+    -- Deathbringer's Will Normal & Heroic (30s buff duration, 105s ICD; 45s guard prevents form-shift double-counting)
+    [71484] = 45.0, [71485] = 45.0, [71486] = 45.0, [71487] = 45.0, [71491] = 45.0, [71492] = 45.0,
+    [71561] = 45.0, [71556] = 45.0, [71558] = 45.0, [71557] = 45.0, [71559] = 45.0, [71560] = 45.0,
 }
 
 local SNAPSHOT_PERSISTENT_BUFFS = {
@@ -1017,7 +1030,7 @@ local INSTANT_CONSUMABLES = {
 -- Encounter State Management, Segment Handlers & Session Helpers
 -------------------------------------------------------------------------------
 local recentProcs = {}
-local recentPrePullEvents = {} -- Stores buffs, potions, and utility casts within 5s before boss engage
+local recentPrePullEvents = {}
 local lastDamageTaken = {}
 local recentDeathLock = {}
 local defeatedGroupNPCs = {}
@@ -1133,7 +1146,6 @@ end
 local function SaveCurrentLiveSession(startFreshAfterSave)
     if not currentSession or #currentSession.segments == 0 then return end
 
-    -- Filter out empty TRASH segments so saved sessions have the latest boss/action segment at index 1
     local cleanedSegments = {}
     for _, seg in ipairs(currentSession.segments) do
         if seg.isBoss or not IsSegmentEmpty(seg) then
@@ -1268,7 +1280,6 @@ local function StartEncounter(bossID, bossName, overrideData, fromSpeech)
 
     SnapshotRaidActiveBuffs(newBossSeg)
 
-    -- Migrate any pre-pull potions, buffs, and utility casts used within 5 seconds before boss engage
     for _, ev in ipairs(recentPrePullEvents) do
         if (now - ev.ts) <= 5.0 then
             newBossSeg.players[ev.pName] = ev.pClass
@@ -1307,7 +1318,6 @@ local function StartEncounter(bossID, bossName, overrideData, fromSpeech)
     end
     table.wipe(recentPrePullEvents)
 
-    -- Remove the preceding TRASH segment if all of its pre-pull events were migrated into the Boss segment
     if prevTrashSeg and currentSession.segments[2] == prevTrashSeg and IsSegmentEmpty(prevTrashSeg) then
         table.remove(currentSession.segments, 2)
     end
@@ -1326,7 +1336,6 @@ local function EndEncounter(isVictory, reason)
     local timeStr = string.format("%dm %ds", mins, secs)
     local finishedBoss = activeBossName or "Boss"
 
-    -- Faction Champions fallback: if combat ended after killing the champions (or raid is alive after killing >= 5 champions), mark as Victory
     if not isVictory and finishedBoss == "Faction Champions" then
         local champsKilled = 0
         for _ in pairs(defeatedGroupNPCs) do
@@ -1677,12 +1686,9 @@ local uiRefreshFrame = CreateFrame("Frame")
 local uiRefreshElapsed = 0
 local uiRefreshPending = false
 
+-- Only refreshes MainTrackerFrame on background combat log events so button clicks in Deaths/Characters are never interrupted
 RequestMainViewRefresh = function()
-    local anyShown = (MainTrackerFrame and MainTrackerFrame:IsShown())
-        or (CharacterFrame and CharacterFrame:IsShown())
-        or (DeathsFrame and DeathsFrame:IsShown())
-        or (DeathLogFrame and DeathLogFrame:IsShown())
-    if not anyShown then
+    if not MainTrackerFrame or not MainTrackerFrame:IsShown() then
         return
     end
     if not uiRefreshPending then
@@ -1695,15 +1701,6 @@ RequestMainViewRefresh = function()
                 uiRefreshPending = false
                 if MainTrackerFrame and MainTrackerFrame:IsShown() then
                     RefreshMainView()
-                end
-                if CharacterFrame and CharacterFrame:IsShown() then
-                    RefreshCharactersView()
-                end
-                if DeathsFrame and DeathsFrame:IsShown() then
-                    RefreshDeathsView()
-                end
-                if DeathLogFrame and DeathLogFrame:IsShown() then
-                    RefreshDeathLogView()
                 end
             end
         end)
@@ -2025,8 +2022,6 @@ local function CreateMainTrackerFrame()
             viewStatusText:SetText("|cff00CCFFViewing: Raider Utility Spells & Cooldowns Used|r")
         end
 
-        for i = 1, 1500 do fontStrings[i]:Hide() end
-
         local lineIndex = 1
         if seg then
             local dataSource = (currentView == "POTIONS") and seg.potionsAndBuffs or seg.raidUtility
@@ -2076,6 +2071,10 @@ local function CreateMainTrackerFrame()
             lineIndex = 2
         end
 
+        for i = lineIndex, 1500 do
+            fontStrings[i]:Hide()
+        end
+
         UpdateFooterLive()
         scrollContent:SetHeight(math.max(375, (lineIndex - 1) * 18 + 16))
 
@@ -2120,7 +2119,7 @@ local function CreateMainTrackerFrame()
 end
 
 -------------------------------------------------------------------------------
--- Deaths Panel & Death Log Panel Implementation
+-- Deaths Panel & Death Log Panel Implementation (Instant First-Click Response)
 -------------------------------------------------------------------------------
 local function CollectDeathsForActiveScope()
     local activeSession = GetActiveSession()
@@ -2207,6 +2206,14 @@ local function CreateDeathsFrame()
         btnLog:SetSize(90, 20)
         btnLog:SetPoint("RIGHT", row, "RIGHT", -6, 0)
         btnLog:SetText("Death Log")
+        btnLog:RegisterForClicks("LeftButtonUp")
+        btnLog:SetScript("OnClick", function(self)
+            if self.playerName then
+                selectedDeathPlayer = self.playerName
+                CloseAllPanels()
+                DeathLogFrame:Show()
+            end
+        end)
 
         row.text = text
         row.btnLog = btnLog
@@ -2222,7 +2229,6 @@ local function CreateDeathsFrame()
     RefreshDeathsView = function()
         if not DeathsFrame or not DeathsFrame:IsShown() then return end
 
-        for i = 1, 100 do rows[i]:Hide() end
         btnScope:SetText(deathsScopeAllSession and "Scope: All Session Segments" or "Scope: Selected Segment")
 
         local deathsByPlayer, playerClasses = CollectDeathsForActiveScope()
@@ -2244,6 +2250,7 @@ local function CreateDeathsFrame()
         end)
 
         if #sortedList == 0 then
+            for i = 1, 100 do rows[i]:Hide() end
             emptyLabel:Show()
             scrollContent:SetHeight(330)
             return
@@ -2251,22 +2258,23 @@ local function CreateDeathsFrame()
 
         emptyLabel:Hide()
 
-        for idx, item in ipairs(sortedList) do
-            if idx <= 100 then
-                local hexColor = GetPlayerClassColor(item.class)
-                local deathWord = (item.count == 1) and "Death" or "Deaths"
-                rows[idx].text:SetText(string.format("%d. %s  |cffFF4444(%d %s)|r", idx, ColorizeText(item.name, hexColor), item.count, deathWord))
-                local capturedName = item.name
-                rows[idx].btnLog:SetScript("OnClick", function()
-                    selectedDeathPlayer = capturedName
-                    CloseAllPanels()
-                    DeathLogFrame:Show()
-                end)
+        local shownCount = math.min(#sortedList, 100)
+        for idx = 1, shownCount do
+            local item = sortedList[idx]
+            local hexColor = GetPlayerClassColor(item.class)
+            local deathWord = (item.count == 1) and "Death" or "Deaths"
+            rows[idx].text:SetText(string.format("%d. %s  |cffFF4444(%d %s)|r", idx, ColorizeText(item.name, hexColor), item.count, deathWord))
+            rows[idx].btnLog.playerName = item.name
+            if not rows[idx]:IsShown() then
                 rows[idx]:Show()
             end
         end
 
-        scrollContent:SetHeight(math.max(330, #sortedList * 24 + 12))
+        for idx = shownCount + 1, 100 do
+            rows[idx]:Hide()
+        end
+
+        scrollContent:SetHeight(math.max(330, shownCount * 24 + 12))
     end
 
     DeathsFrame:SetScript("OnShow", RefreshDeathsView)
@@ -2316,8 +2324,6 @@ local function CreateDeathLogFrame()
     RefreshDeathLogView = function()
         if not DeathLogFrame or not DeathLogFrame:IsShown() then return end
 
-        for i = 1, 300 do logLines[i]:Hide() end
-
         local pName = selectedDeathPlayer or "Unknown"
         local deathsByPlayer, playerClasses = CollectDeathsForActiveScope()
         local pClass = playerClasses[pName] or GetSafePlayerClass(pName)
@@ -2329,40 +2335,45 @@ local function CreateDeathLogFrame()
         if #pDeaths == 0 then
             logLines[1]:SetText("|cff999999No deaths recorded for this player in the selected scope.|r")
             logLines[1]:Show()
+            for i = 2, 300 do logLines[i]:Hide() end
             scrollContent:SetHeight(340)
             return
         end
 
-        for idx, d in ipairs(pDeaths) do
-            if idx <= 300 then
-                local killer = d.killer or "Unknown Mob"
-                local ability = d.ability or "Unknown Attack"
-                local amount = tonumber(d.amount) or 0
-                local overkill = tonumber(d.overkill) or 0
-                local segLabel = d.segment or "Segment"
-                local timeStr = d.time or ""
+        local shownCount = math.min(#pDeaths, 300)
+        for idx = 1, shownCount do
+            local d = pDeaths[idx]
+            local killer = d.killer or "Unknown Mob"
+            local ability = d.ability or "Unknown Attack"
+            local amount = tonumber(d.amount) or 0
+            local overkill = tonumber(d.overkill) or 0
+            local segLabel = d.segment or "Segment"
+            local timeStr = d.time or ""
 
-                local dmgText = (amount > 0) and string.format("%d dmg", amount) or "Fatal Effect"
-                if overkill > 0 then
-                    dmgText = string.format("%d dmg (%d overkill)", amount, overkill)
-                end
-
-                logLines[idx]:SetText(string.format(
-                    "%d. |cff888888[%s - %s]|r Killed by |cffFF5555%s|r  |  Ability: |cffFFD100%s|r  |  Damage: |cffFF2222%s|r",
-                    idx, timeStr, segLabel, killer, ability, dmgText
-                ))
-                logLines[idx]:Show()
+            local dmgText = (amount > 0) and string.format("%d dmg", amount) or "Fatal Effect"
+            if overkill > 0 then
+                dmgText = string.format("%d dmg (%d overkill)", amount, overkill)
             end
+
+            logLines[idx]:SetText(string.format(
+                "%d. |cff888888[%s - %s]|r Killed by |cffFF5555%s|r  |  Ability: |cffFFD100%s|r  |  Damage: |cffFF2222%s|r",
+                idx, timeStr, segLabel, killer, ability, dmgText
+            ))
+            logLines[idx]:Show()
         end
 
-        scrollContent:SetHeight(math.max(340, #pDeaths * 20 + 16))
+        for idx = shownCount + 1, 300 do
+            logLines[idx]:Hide()
+        end
+
+        scrollContent:SetHeight(math.max(340, shownCount * 20 + 16))
     end
 
     DeathLogFrame:SetScript("OnShow", RefreshDeathLogView)
 end
 
 -------------------------------------------------------------------------------
--- Character Panel Implementation
+-- Character Panel Implementation (Instant First-Click Whisper Response)
 -------------------------------------------------------------------------------
 local function CreateCharacterFrame()
     CharacterFrame = CreateRUTPanel("RTCharacterFrame", 500, 440, "Session Characters")
@@ -2401,6 +2412,16 @@ local function CreateCharacterFrame()
         btnWhisper:SetSize(65, 20)
         btnWhisper:SetPoint("RIGHT", row, "RIGHT", -10, 0)
         btnWhisper:SetText("Whisper")
+        btnWhisper:RegisterForClicks("LeftButtonUp")
+        btnWhisper:SetScript("OnClick", function(self)
+            if self.playerName then
+                if ChatFrame_SendTell then
+                    ChatFrame_SendTell(self.playerName)
+                else
+                    ChatFrame_OpenChat("/w " .. self.playerName .. " ")
+                end
+            end
+        end)
 
         row.text = text
         row.btnWhisper = btnWhisper
@@ -2411,7 +2432,6 @@ local function CreateCharacterFrame()
     RefreshCharactersView = function()
         if not CharacterFrame or not CharacterFrame:IsShown() then return end
 
-        for i = 1, 100 do rows[i]:Hide() end
         local activeSession = GetActiveSession()
         local playerMap = {}
 
@@ -2429,6 +2449,7 @@ local function CreateCharacterFrame()
         table.sort(sortedPlayers)
 
         if #sortedPlayers == 0 then
+            for i = 1, 100 do rows[i]:Hide() end
             emptyLabel:Show()
             scrollContent:SetHeight(330)
             return
@@ -2436,19 +2457,23 @@ local function CreateCharacterFrame()
 
         emptyLabel:Hide()
 
-        for idx, pName in ipairs(sortedPlayers) do
-            if idx <= 100 then
-                local pClass = playerMap[pName]
-                local hexColor = GetPlayerClassColor(pClass)
-                rows[idx].text:SetText(string.format("%s |cff888888(%s)|r", ColorizeText(pName, hexColor), pClass))
-                rows[idx].btnWhisper:SetScript("OnClick", function()
-                    ChatFrame_OpenChat("/w " .. pName .. " ")
-                end)
+        local shownCount = math.min(#sortedPlayers, 100)
+        for idx = 1, shownCount do
+            local pName = sortedPlayers[idx]
+            local pClass = playerMap[pName]
+            local hexColor = GetPlayerClassColor(pClass)
+            rows[idx].text:SetText(string.format("%s |cff888888(%s)|r", ColorizeText(pName, hexColor), pClass))
+            rows[idx].btnWhisper.playerName = pName
+            if not rows[idx]:IsShown() then
                 rows[idx]:Show()
             end
         end
 
-        scrollContent:SetHeight(math.max(330, #sortedPlayers * 22 + 12))
+        for idx = shownCount + 1, 100 do
+            rows[idx]:Hide()
+        end
+
+        scrollContent:SetHeight(math.max(330, shownCount * 22 + 12))
     end
 
     CharacterFrame:SetScript("OnShow", RefreshCharactersView)
@@ -2792,6 +2817,7 @@ local function RecordProc(sourceName, sourceGUID, destName, destGUID, category, 
     local dstIsMember = IsGroupMember(destName, destGUID)
     local srcClass = GetSafePlayerClass(sourceName, sourceGUID)
     local dstClass = GetSafePlayerClass(destName, destGUID)
+    local addedNewSessionPlayer = false
 
     if category == "POTIONS" then
         local pName = nil
@@ -2809,6 +2835,9 @@ local function RecordProc(sourceName, sourceGUID, destName, destGUID, category, 
 
         targetSegment.players[pName] = pClass
         currentSession.players = currentSession.players or {}
+        if not currentSession.players[pName] then
+            addedNewSessionPlayer = true
+        end
         currentSession.players[pName] = pClass
 
         local baseBuffName = POTIONS_AND_BUFFS[spellID] or rawSpellName or ("Spell #" .. tostring(spellID))
@@ -2817,6 +2846,9 @@ local function RecordProc(sourceName, sourceGUID, destName, destGUID, category, 
 
         if not isInstantCast and srcIsMember and sourceName ~= pName then
             targetSegment.players[sourceName] = srcClass
+            if not currentSession.players[sourceName] then
+                addedNewSessionPlayer = true
+            end
             currentSession.players[sourceName] = srcClass
             extraPlayer, extraClass = sourceName, srcClass
             local coloredGiver = ColorizeText(sourceName, GetPlayerClassColor(srcClass))
@@ -2850,12 +2882,18 @@ local function RecordProc(sourceName, sourceGUID, destName, destGUID, category, 
 
         targetSegment.players[sourceName] = srcClass
         currentSession.players = currentSession.players or {}
+        if not currentSession.players[sourceName] then
+            addedNewSessionPlayer = true
+        end
         currentSession.players[sourceName] = srcClass
         local entryName = baseName
         local extraPlayer, extraClass = nil, nil
 
         if dstIsMember and EXTERNAL_TARGETED_UTILITY[baseName] then
             targetSegment.players[destName] = dstClass
+            if not currentSession.players[destName] then
+                addedNewSessionPlayer = true
+            end
             currentSession.players[destName] = dstClass
             extraPlayer, extraClass = destName, dstClass
             local coloredTarget = ColorizeText(destName, GetPlayerClassColor(dstClass))
@@ -2876,6 +2914,10 @@ local function RecordProc(sourceName, sourceGUID, destName, destGUID, category, 
                 ts = GetTime()
             })
         end
+    end
+
+    if addedNewSessionPlayer and CharacterFrame and CharacterFrame:IsShown() then
+        RefreshCharactersView()
     end
 
     RequestMainViewRefresh()
@@ -2931,6 +2973,12 @@ local function RecordPlayerDeath(destName, destGUID)
         overkill = overkill
     })
 
+    if DeathsFrame and DeathsFrame:IsShown() then
+        RefreshDeathsView()
+    end
+    if DeathLogFrame and DeathLogFrame:IsShown() then
+        RefreshDeathLogView()
+    end
     RequestMainViewRefresh()
 end
 
@@ -3089,7 +3137,7 @@ eventHandler:SetScript("OnEvent", function(self, event, ...)
 
         local spellID, spellName = arg9, arg10
 
-        -- B. Secondary Boss Engage Detection (Now supports Northrend Beasts sub-bosses & all 28 Faction Champions)
+        -- B. Secondary Boss Engage Detection (Includes Ruby Sanctum Mini-Bosses Baltharus, Saviana, Zarithrian)
         if not inCombatState and IsRaidInCombat() then
             local srcID = GetNPCIDFromGUID(sourceGUID)
             local dstID = GetNPCIDFromGUID(destGUID)
@@ -3116,10 +3164,9 @@ eventHandler:SetScript("OnEvent", function(self, event, ...)
 
             if inCombatState then
                 local deadID = GetNPCIDFromGUID(destGUID)
-                if deadID and WOTLK_BOSS_DB[deadID] then
+                if deadID and WOTLK_BOSS_DB[deadID] and not WOTLK_BOSS_DB[deadID].isAdd then
                     local bInfo = activeBossName and BOSS_NAME_TO_INFO[activeBossName]
                     if bInfo and bInfo.isFactionChamp and WOTLK_BOSS_DB[deadID].isFactionChamp then
-                        -- Track unique Faction Champion deaths (6 in 10-man, 10 in 25-man)
                         if destGUID then
                             defeatedGroupNPCs[destGUID] = true
                         else
