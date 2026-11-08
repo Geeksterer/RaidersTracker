@@ -6,7 +6,7 @@ local ADDON_NAME = "Raiders Tracker"
 local AUTHOR = "Copper"
 
 local function GetAddonVersion()
-    return GetAddOnMetadata("RaidersTracker", "Version") or "1.1.3"
+    return GetAddOnMetadata("RaidersTracker", "Version") or "1.1.4"
 end
 
 local function GetFooterText()
@@ -19,7 +19,6 @@ end
 local defaultDB = {
     enabled = true,
     minimapPos = 45,
-    lastCharacter = nil,
     savedSessions = {},
     liveSession = { name = "Live Current Session", segments = {}, players = {} }
 }
@@ -50,6 +49,7 @@ local function InitializeDB()
             end
         end
     end
+    RaidersTrackerDB.lastCharacter = nil
     currentSession = RaidersTrackerDB.liveSession
     currentSession.players = currentSession.players or {}
     if #currentSession.segments > 0 then
@@ -1082,16 +1082,6 @@ local function IsSegmentEmpty(seg)
     return true
 end
 
-local function HasLiveSessionData()
-    if not currentSession or not currentSession.segments then return false end
-    for _, seg in ipairs(currentSession.segments) do
-        if not IsSegmentEmpty(seg) then
-            return true
-        end
-    end
-    return false
-end
-
 local function EnsureTrashSegment()
     if inCombatState or not currentSession then return end
 
@@ -1457,6 +1447,20 @@ local RefreshDeathsView = function() end
 local RefreshDeathLogView = function() end
 local RefreshCharactersView = function() end
 
+local function WipeAllSessionsAndData()
+    RaidersTrackerDB.savedSessions = {}
+    selectedSessionIndex = 0
+    selectedSegmentIndex = 1
+    segmentPage = 1
+    selectedDeathPlayer = nil
+    ResetLiveSessionState()
+    RefreshMainView()
+    RefreshCharactersView()
+    RefreshDeathsView()
+    RefreshDeathLogView()
+    AnnounceLocalChat("All sessions, deaths, and saved characters cleared.")
+end
+
 local function HideAllCustomDropdownMenus()
     for _, menu in ipairs(activeCustomMenus) do
         menu:Hide()
@@ -1686,7 +1690,6 @@ local uiRefreshFrame = CreateFrame("Frame")
 local uiRefreshElapsed = 0
 local uiRefreshPending = false
 
--- Only refreshes MainTrackerFrame on background combat log events so button clicks in Deaths/Characters are never interrupted
 RequestMainViewRefresh = function()
     if not MainTrackerFrame or not MainTrackerFrame:IsShown() then
         return
@@ -1708,23 +1711,17 @@ RequestMainViewRefresh = function()
 end
 
 -------------------------------------------------------------------------------
--- New Character Login Prompt Popup Dialog
+-- Join Party / Raid Refresh Prompt Popup Dialog
 -------------------------------------------------------------------------------
-StaticPopupDialogs["RT_NEW_CHAR_SESSION_PROMPT"] = {
-    text = "|cff00FF00" .. ADDON_NAME .. "|r\n\nRecorded data from |cffFFD100%s|r was found in the Live Current Session.\n\nDo you want to save the current live session and start a fresh session for |cff00FF00%s|r?",
-    button1 = YES,
-    button2 = NO,
+StaticPopupDialogs["RT_REFRESH_ON_GROUP_JOIN"] = {
+    text = "|cff00FF00" .. ADDON_NAME .. "|r\n\nDo you want to Refresh Raiders Tracker?\n\nClicking Accept will wipe all session data.",
+    button1 = ACCEPT,
+    button2 = CANCEL,
     OnAccept = function()
-        SaveCurrentLiveSession(true)
-        selectedSessionIndex = 0
-        selectedSegmentIndex = 1
-        segmentPage = 1
-        if MainTrackerFrame and MainTrackerFrame:IsShown() then
-            RefreshMainView()
-        end
+        WipeAllSessionsAndData()
     end,
     OnCancel = function()
-        AnnounceLocalChat("Continuing in the existing Live Current Session.")
+        -- Do nothing; existing data remains in the database
     end,
     timeout = 0,
     whileDead = true,
@@ -2720,17 +2717,7 @@ local function CreateConfigFrame()
         button1 = "Yes",
         button2 = "No",
         OnAccept = function()
-            RaidersTrackerDB.savedSessions = {}
-            selectedSessionIndex = 0
-            selectedSegmentIndex = 1
-            segmentPage = 1
-            selectedDeathPlayer = nil
-            ResetLiveSessionState()
-            RefreshMainView()
-            RefreshCharactersView()
-            RefreshDeathsView()
-            RefreshDeathLogView()
-            AnnounceLocalChat("All sessions, deaths, and saved characters cleared.")
+            WipeAllSessionsAndData()
         end,
         timeout = 0,
         whileDead = true,
@@ -2743,7 +2730,7 @@ local function CreateConfigFrame()
 end
 
 -------------------------------------------------------------------------------
--- Slash Commands, Load Message & New Character Session Prompt
+-- Slash Commands, Load Message & Group Join Refresh Prompt
 -------------------------------------------------------------------------------
 SLASH_RAIDERSTRACKER1 = "/rt"
 SLASH_RAIDERSTRACKER2 = "/raiderstracker"
@@ -2764,20 +2751,27 @@ SlashCmdList["RAIDERSTRACKER"] = function(msg)
 end
 
 local hasPrintedLoadMsg = false
-local hasCheckedNewCharPrompt = false
+local groupStateInitialized = false
+local wasInGroup = false
 local loadMsgTimer = CreateFrame("Frame")
 
-local function CheckNewCharacterSessionPrompt()
-    if hasCheckedNewCharPrompt then return end
-    local currentPlayer = UnitName("player")
-    if not currentPlayer or currentPlayer == UNKNOWN then return end
+local function IsPlayerInGroup()
+    return (GetNumRaidMembers() > 0) or (GetNumPartyMembers() > 0)
+end
 
-    hasCheckedNewCharPrompt = true
-    local prevChar = RaidersTrackerDB.lastCharacter
-    RaidersTrackerDB.lastCharacter = currentPlayer
+local function CheckGroupJoinPrompt()
+    local currentlyInGroup = IsPlayerInGroup()
+    if not groupStateInitialized then
+        wasInGroup = currentlyInGroup
+        groupStateInitialized = true
+        return
+    end
 
-    if prevChar and prevChar ~= currentPlayer and HasLiveSessionData() then
-        StaticPopup_Show("RT_NEW_CHAR_SESSION_PROMPT", prevChar, currentPlayer)
+    if currentlyInGroup and not wasInGroup then
+        wasInGroup = true
+        StaticPopup_Show("RT_REFRESH_ON_GROUP_JOIN")
+    elseif not currentlyInGroup and wasInGroup then
+        wasInGroup = false
     end
 end
 
@@ -2797,7 +2791,6 @@ local function ScheduleLoadMessage(delay)
                     DEFAULT_CHAT_FRAME:AddMessage("  - Chat commands: |cff00FF00/rt|r or |cff00FF00/rt reset|r to reset panel positions.")
                 end
             end
-            CheckNewCharacterSessionPrompt()
         end
     end)
 end
@@ -3023,11 +3016,11 @@ eventHandler:SetScript("OnEvent", function(self, event, ...)
 
     if event == "PLAYER_ENTERING_WORLD" then
         UpdateGroupCache()
+        wasInGroup = IsPlayerInGroup()
+        groupStateInitialized = true
         HandleZoneOrDifficultyUpdate(false)
         if not hasPrintedLoadMsg then
             ScheduleLoadMessage(2.0)
-        else
-            CheckNewCharacterSessionPrompt()
         end
         return
     end
@@ -3045,6 +3038,7 @@ eventHandler:SetScript("OnEvent", function(self, event, ...)
 
     if event == "PARTY_MEMBERS_CHANGED" or event == "RAID_ROSTER_UPDATE" then
         UpdateGroupCache()
+        CheckGroupJoinPrompt()
         HandleZoneOrDifficultyUpdate(false)
         return
     end
