@@ -4,6 +4,7 @@
 
 local ADDON_NAME = "Raiders Tracker"
 local AUTHOR = "Copper"
+local GITHUB_URL = "https://github.com/Geeksterer/RaidersTracker/"
 
 local function GetAddonVersion()
     return GetAddOnMetadata("RaidersTracker", "Version") or "1.1.4"
@@ -1447,6 +1448,21 @@ local RefreshDeathsView = function() end
 local RefreshDeathLogView = function() end
 local RefreshCharactersView = function() end
 
+-- Clears ONLY the Live Current Session (used when accepting the Group Join Refresh prompt)
+local function WipeLiveSessionOnly()
+    selectedSessionIndex = 0
+    selectedSegmentIndex = 1
+    segmentPage = 1
+    selectedDeathPlayer = nil
+    ResetLiveSessionState()
+    RefreshMainView()
+    RefreshCharactersView()
+    RefreshDeathsView()
+    RefreshDeathLogView()
+    AnnounceLocalChat("Live Current Session refreshed (Saved Sessions preserved).")
+end
+
+-- Clears ALL Sessions (both Saved and Live - used only by the Config 'Delete All Sessions' button)
 local function WipeAllSessionsAndData()
     RaidersTrackerDB.savedSessions = {}
     selectedSessionIndex = 0
@@ -1458,7 +1474,7 @@ local function WipeAllSessionsAndData()
     RefreshCharactersView()
     RefreshDeathsView()
     RefreshDeathLogView()
-    AnnounceLocalChat("All sessions, deaths, and saved characters cleared.")
+    AnnounceLocalChat("All sessions (saved and live), deaths, and saved characters cleared.")
 end
 
 local function HideAllCustomDropdownMenus()
@@ -1711,14 +1727,14 @@ RequestMainViewRefresh = function()
 end
 
 -------------------------------------------------------------------------------
--- Join Party / Raid Refresh Prompt Popup Dialog
+-- Join Party / Raid Refresh Prompt Popup Dialog (Clears Live Session Only)
 -------------------------------------------------------------------------------
 StaticPopupDialogs["RT_REFRESH_ON_GROUP_JOIN"] = {
-    text = "|cff00FF00" .. ADDON_NAME .. "|r\n\nDo you want to Refresh Raiders Tracker?\n\nClicking Accept will wipe all session data.",
+    text = "|cff00FF00" .. ADDON_NAME .. "|r\n\nDo you want to Refresh Raiders Tracker?\n\nClicking Accept will clear the current Live Session (Saved Sessions will be kept).",
     button1 = ACCEPT,
     button2 = CANCEL,
     OnAccept = function()
-        WipeAllSessionsAndData()
+        WipeLiveSessionOnly()
     end,
     OnCancel = function()
         -- Do nothing; existing data remains in the database
@@ -2477,7 +2493,7 @@ local function CreateCharacterFrame()
 end
 
 -------------------------------------------------------------------------------
--- Comprehensive Report Panel Implementation (Characters, Deaths, Potions & Utility)
+-- Comprehensive Report Panel Implementation (Plain Text, Discord Markdown & HTML Export)
 -------------------------------------------------------------------------------
 local function CreateReportFrame()
     ReportFrame = CreateRUTPanel("RTReportFrame", 620, 500, "Report Segment Data")
@@ -2490,9 +2506,19 @@ local function CreateReportFrame()
 
     local chkDiscord = CreateFrame("CheckButton", nil, ReportFrame, "UICheckButtonTemplate")
     chkDiscord:SetPoint("TOPLEFT", ReportFrame, "TOPLEFT", 18, -36)
-    chkDiscord.text = chkDiscord:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    chkDiscord.text = chkDiscord:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
     chkDiscord.text:SetPoint("LEFT", chkDiscord, "RIGHT", 4, 0)
-    chkDiscord.text:SetText("Discord Markdown Format (Ctrl+C to copy)")
+    chkDiscord.text:SetText("Discord Markdown")
+
+    local chkHTML = CreateFrame("CheckButton", nil, ReportFrame, "UICheckButtonTemplate")
+    chkHTML:SetPoint("LEFT", chkDiscord.text, "RIGHT", 20, 0)
+    chkHTML.text = chkHTML:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    chkHTML.text:SetPoint("LEFT", chkHTML, "RIGHT", 4, 0)
+    chkHTML.text:SetText("Export as HTML")
+
+    local copyHint = ReportFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    copyHint:SetPoint("LEFT", chkHTML.text, "RIGHT", 18, 0)
+    copyHint:SetText("|cff888888(Ctrl+A, Ctrl+C to copy)|r")
 
     local viewBox = CreateWhiteBorderViewBox(ReportFrame, -68, 46)
 
@@ -2503,6 +2529,8 @@ local function CreateReportFrame()
     local editBox = CreateFrame("EditBox", "RTReportEditBox", scrollFrame)
     editBox:SetMultiLine(true)
     editBox:SetAutoFocus(false)
+    if editBox.SetMaxLetters then editBox:SetMaxLetters(0) end
+    if editBox.SetMaxBytes then editBox:SetMaxBytes(0) end
     editBox:SetFontObject(GameFontHighlightSmall)
     editBox:SetWidth(540)
     editBox:SetScript("OnEscapePressed", function(self)
@@ -2520,6 +2548,20 @@ local function CreateReportFrame()
         return str:gsub("|c%x%x%x%x%x%x%x%x", ""):gsub("|r", "")
     end
 
+    local function EscapeHTML(str)
+        if not str then return "" end
+        return str:gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;"):gsub('"', "&quot;")
+    end
+
+    -- Converts WoW |cffHEX...|r color tags into inline CSS <span style="color: #HEX;">...</span>
+    local function ConvertWoWColorsToHTML(str)
+        if not str then return "" end
+        local escaped = EscapeHTML(str)
+        escaped = escaped:gsub("|c%x%x(%x%x%x%x%x%x)(.-)|r", '<span style="color: #%1; font-weight: bold;">%2</span>')
+        escaped = escaped:gsub("|c%x%x%x%x%x%x%x%x", ""):gsub("|r", "")
+        return escaped
+    end
+
     local function GenerateReport()
         local activeSession = GetActiveSession()
         local seg = (activeSession and activeSession.segments or {})[selectedSegmentIndex]
@@ -2529,14 +2571,15 @@ local function CreateReportFrame()
         end
 
         local isDiscord = chkDiscord:GetChecked()
+        local isHTML = chkHTML:GetChecked()
         local lines = {}
 
-        table.insert(lines, GetFooterText())
-        local header = string.format("[%s %s] - %s (Full Segment Report)", seg.zone or GetCurrentZoneSafe(), seg.difficulty or GetRaidDifficultySuffix(), seg.name or "TRASH")
-        table.insert(lines, isDiscord and ("# " .. header) or ("=== " .. header .. " ==="))
-        table.insert(lines, "")
+        local segZone = seg.zone or GetCurrentZoneSafe()
+        local segDiff = seg.difficulty or GetRaidDifficultySuffix()
+        local segName = seg.name or "TRASH"
+        local header = string.format("[%s %s] - %s (Full Segment Report)", segZone, segDiff, segName)
 
-        -- 1. Collect All Characters Present in the Segment
+        -- Collect All Characters Present in the Segment
         local presentMap = {}
         for pName, pClass in pairs(seg.players or {}) do
             presentMap[pName] = string.upper(pClass)
@@ -2555,18 +2598,7 @@ local function CreateReportFrame()
         for pName in pairs(presentMap) do table.insert(presentList, pName) end
         table.sort(presentList)
 
-        table.insert(lines, isDiscord and string.format("## 1. Characters Present (%d)", #presentList) or string.format("--- 1. Characters Present (%d) ---", #presentList))
-        if #presentList == 0 then
-            table.insert(lines, "  None")
-        else
-            for _, pName in ipairs(presentList) do
-                local pClass = presentMap[pName] or "WARRIOR"
-                table.insert(lines, isDiscord and string.format("  * **%s** (%s)", pName, pClass) or string.format("  - %s (%s)", pName, pClass))
-            end
-        end
-        table.insert(lines, "")
-
-        -- 2. Deaths & Detailed Death Log for the Segment
+        -- Collect Deaths for the Segment
         local deathPlayers = {}
         local totalSegDeaths = 0
         for pName, dList in pairs(seg.deaths or {}) do
@@ -2580,84 +2612,234 @@ local function CreateReportFrame()
             return a.name < b.name
         end)
 
-        table.insert(lines, isDiscord and string.format("## 2. Deaths & Death Log (%d Total)", totalSegDeaths) or string.format("--- 2. Deaths & Death Log (%d Total) ---", totalSegDeaths))
-        if #deathPlayers == 0 then
-            table.insert(lines, "  None")
-        else
-            for _, dPlayer in ipairs(deathPlayers) do
-                local pName = dPlayer.name
-                local pClass = presentMap[pName] or string.upper(GetSafePlayerClass(pName))
-                local deathWord = (dPlayer.count == 1) and "Death" or "Deaths"
-                table.insert(lines, isDiscord and string.format("**%s (%s) - %d %s**", pName, pClass, dPlayer.count, deathWord) or string.format("%s (%s) - %d %s", pName, pClass, dPlayer.count, deathWord))
-
-                for idx, d in ipairs(dPlayer.list) do
-                    local killer = StripColorCodes(d.killer or "Unknown Mob")
-                    local ability = StripColorCodes(d.ability or "Unknown Attack")
-                    local amount = tonumber(d.amount) or 0
-                    local overkill = tonumber(d.overkill) or 0
-                    local timeStr = d.time or ""
-                    local dmgText = (amount > 0) and string.format("%d dmg", amount) or "Fatal Effect"
-                    if overkill > 0 then
-                        dmgText = string.format("%d dmg (%d overkill)", amount, overkill)
-                    end
-                    local logEntry = string.format("[%s] Killed by %s | Ability: %s | Damage: %s", timeStr, killer, ability, dmgText)
-                    table.insert(lines, isDiscord and string.format("  * %d. %s", idx, logEntry) or string.format("  - %d. %s", idx, logEntry))
-                end
-            end
-        end
-        table.insert(lines, "")
-
-        -- 3. Potions & Buffs for the Segment
-        table.insert(lines, isDiscord and "## 3. Potions & Buffs" or "--- 3. Potions & Buffs ---")
+        -- Collect Potions & Buffs Players
         local potPlayers = {}
         for pName, entries in pairs(seg.potionsAndBuffs or {}) do
             if next(entries) ~= nil then table.insert(potPlayers, pName) end
         end
         table.sort(potPlayers)
 
-        if #potPlayers == 0 then
-            table.insert(lines, "  None")
-        else
-            for _, pName in ipairs(potPlayers) do
-                local pClass = presentMap[pName] or string.upper(seg.players[pName] or "WARRIOR")
-                table.insert(lines, isDiscord and string.format("**%s (%s)**", pName, pClass) or string.format("%s (%s)", pName, pClass))
-
-                local sortedEntries = {}
-                for buffName, count in pairs(seg.potionsAndBuffs[pName]) do
-                    table.insert(sortedEntries, { name = StripColorCodes(buffName), count = count })
-                end
-                table.sort(sortedEntries, function(a, b) return a.name < b.name end)
-
-                for _, entry in ipairs(sortedEntries) do
-                    table.insert(lines, isDiscord and string.format("  * %s: %d", entry.name, entry.count) or string.format("  - %s: %d", entry.name, entry.count))
-                end
-            end
-        end
-        table.insert(lines, "")
-
-        -- 4. Raid Utility for the Segment
-        table.insert(lines, isDiscord and "## 4. Raid Utility" or "--- 4. Raid Utility ---")
+        -- Collect Raid Utility Players
         local utilPlayers = {}
         for pName, entries in pairs(seg.raidUtility or {}) do
             if next(entries) ~= nil then table.insert(utilPlayers, pName) end
         end
         table.sort(utilPlayers)
 
-        if #utilPlayers == 0 then
-            table.insert(lines, "  None")
-        else
-            for _, pName in ipairs(utilPlayers) do
-                local pClass = presentMap[pName] or string.upper(seg.players[pName] or "WARRIOR")
-                table.insert(lines, isDiscord and string.format("**%s (%s)**", pName, pClass) or string.format("%s (%s)", pName, pClass))
+        -----------------------------------------------------------------------
+        -- HTML Export Mode (Inline CSS with Class Colors, h1, ul, li)
+        -----------------------------------------------------------------------
+        if isHTML then
+            table.insert(lines, "<!DOCTYPE html>")
+            table.insert(lines, "<html>")
+            table.insert(lines, "<head>")
+            table.insert(lines, '  <meta charset="UTF-8">')
+            table.insert(lines, "  <title>Raiders Tracker by Copper - " .. EscapeHTML(header) .. "</title>")
+            table.insert(lines, "</head>")
+            table.insert(lines, '<body style="background-color: #141419; color: #E0E0E0; font-family: Arial, Helvetica, sans-serif; line-height: 1.5; padding: 20px;">')
+            table.insert(lines, '  <h1 style="color: #00FF00; margin-bottom: 4px;">Raiders Tracker by Copper</h1>')
+            table.insert(lines, string.format('  <p style="margin-top: 0; margin-bottom: 18px;">Version %s &mdash; <a href="%s" target="_blank" style="color: #69CCF0; text-decoration: underline;">%s</a></p>', EscapeHTML(GetAddonVersion()), GITHUB_URL, GITHUB_URL))
+            table.insert(lines, string.format('  <h1 style="color: #FFFFFF; border-bottom: 1px solid #444444; padding-bottom: 6px;">%s</h1>', EscapeHTML(header)))
 
-                local sortedEntries = {}
-                for utilName, count in pairs(seg.raidUtility[pName]) do
-                    table.insert(sortedEntries, { name = StripColorCodes(utilName), count = count })
+            -- 1. Characters Present
+            table.insert(lines, string.format('  <h1 style="color: #FFD100; font-size: 1.35em; margin-top: 24px;">1. Characters Present (%d)</h1>', #presentList))
+            table.insert(lines, "  <ul>")
+            if #presentList == 0 then
+                table.insert(lines, "    <li>None</li>")
+            else
+                for _, pName in ipairs(presentList) do
+                    local pClass = presentMap[pName] or "WARRIOR"
+                    local hexColor = GetPlayerClassColor(pClass)
+                    table.insert(lines, string.format('    <li><span style="color: #%s; font-weight: bold;">%s</span> (%s)</li>', hexColor, EscapeHTML(pName), EscapeHTML(pClass)))
                 end
-                table.sort(sortedEntries, function(a, b) return a.name < b.name end)
+            end
+            table.insert(lines, "  </ul>")
 
-                for _, entry in ipairs(sortedEntries) do
-                    table.insert(lines, isDiscord and string.format("  * %s: %d", entry.name, entry.count) or string.format("  - %s: %d", entry.name, entry.count))
+            -- 2. Deaths & Death Log
+            table.insert(lines, string.format('  <h1 style="color: #FFD100; font-size: 1.35em; margin-top: 24px;">2. Deaths &amp; Death Log (%d Total)</h1>', totalSegDeaths))
+            table.insert(lines, "  <ul>")
+            if #deathPlayers == 0 then
+                table.insert(lines, "    <li>None</li>")
+            else
+                for _, dPlayer in ipairs(deathPlayers) do
+                    local pName = dPlayer.name
+                    local pClass = presentMap[pName] or string.upper(GetSafePlayerClass(pName))
+                    local hexColor = GetPlayerClassColor(pClass)
+                    local deathWord = (dPlayer.count == 1) and "Death" or "Deaths"
+                    table.insert(lines, string.format('    <li><span style="color: #%s; font-weight: bold;">%s</span> (%s) &mdash; <span style="color: #FF4444; font-weight: bold;">%d %s</span>', hexColor, EscapeHTML(pName), EscapeHTML(pClass), dPlayer.count, deathWord))
+                    table.insert(lines, "      <ul>")
+                    for idx, d in ipairs(dPlayer.list) do
+                        local killer = StripColorCodes(d.killer or "Unknown Mob")
+                        local ability = StripColorCodes(d.ability or "Unknown Attack")
+                        local amount = tonumber(d.amount) or 0
+                        local overkill = tonumber(d.overkill) or 0
+                        local timeStr = d.time or ""
+                        local dmgText = (amount > 0) and string.format("%d dmg", amount) or "Fatal Effect"
+                        if overkill > 0 then
+                            dmgText = string.format("%d dmg (%d overkill)", amount, overkill)
+                        end
+                        table.insert(lines, string.format(
+                            '        <li>%d. [%s] Killed by <span style="color: #FF5555;">%s</span> | Ability: <span style="color: #FFD100;">%s</span> | Damage: <span style="color: #FF2222;">%s</span></li>',
+                            idx, EscapeHTML(timeStr), EscapeHTML(killer), EscapeHTML(ability), EscapeHTML(dmgText)
+                        ))
+                    end
+                    table.insert(lines, "      </ul>")
+                    table.insert(lines, "    </li>")
+                end
+            end
+            table.insert(lines, "  </ul>")
+
+            -- 3. Potions & Buffs
+            table.insert(lines, '  <h1 style="color: #FFD100; font-size: 1.35em; margin-top: 24px;">3. Potions &amp; Buffs</h1>')
+            table.insert(lines, "  <ul>")
+            if #potPlayers == 0 then
+                table.insert(lines, "    <li>None</li>")
+            else
+                for _, pName in ipairs(potPlayers) do
+                    local pClass = presentMap[pName] or string.upper(seg.players[pName] or "WARRIOR")
+                    local hexColor = GetPlayerClassColor(pClass)
+                    table.insert(lines, string.format('    <li><span style="color: #%s; font-weight: bold;">%s</span> (%s)', hexColor, EscapeHTML(pName), EscapeHTML(pClass)))
+                    table.insert(lines, "      <ul>")
+
+                    local sortedEntries = {}
+                    for buffName, count in pairs(seg.potionsAndBuffs[pName]) do
+                        table.insert(sortedEntries, { rawName = buffName, cleanName = StripColorCodes(buffName), count = count })
+                    end
+                    table.sort(sortedEntries, function(a, b) return a.cleanName < b.cleanName end)
+
+                    for _, entry in ipairs(sortedEntries) do
+                        table.insert(lines, string.format('        <li>%s: <span style="color: #00FF00; font-weight: bold;">%d</span></li>', ConvertWoWColorsToHTML(entry.rawName), entry.count))
+                    end
+                    table.insert(lines, "      </ul>")
+                    table.insert(lines, "    </li>")
+                end
+            end
+            table.insert(lines, "  </ul>")
+
+            -- 4. Raid Utility
+            table.insert(lines, '  <h1 style="color: #FFD100; font-size: 1.35em; margin-top: 24px;">4. Raid Utility</h1>')
+            table.insert(lines, "  <ul>")
+            if #utilPlayers == 0 then
+                table.insert(lines, "    <li>None</li>")
+            else
+                for _, pName in ipairs(utilPlayers) do
+                    local pClass = presentMap[pName] or string.upper(seg.players[pName] or "WARRIOR")
+                    local hexColor = GetPlayerClassColor(pClass)
+                    table.insert(lines, string.format('    <li><span style="color: #%s; font-weight: bold;">%s</span> (%s)', hexColor, EscapeHTML(pName), EscapeHTML(pClass)))
+                    table.insert(lines, "      <ul>")
+
+                    local sortedEntries = {}
+                    for utilName, count in pairs(seg.raidUtility[pName]) do
+                        table.insert(sortedEntries, { rawName = utilName, cleanName = StripColorCodes(utilName), count = count })
+                    end
+                    table.sort(sortedEntries, function(a, b) return a.cleanName < b.cleanName end)
+
+                    for _, entry in ipairs(sortedEntries) do
+                        table.insert(lines, string.format('        <li>%s: <span style="color: #00FF00; font-weight: bold;">%d</span></li>', ConvertWoWColorsToHTML(entry.rawName), entry.count))
+                    end
+                    table.insert(lines, "      </ul>")
+                    table.insert(lines, "    </li>")
+                end
+            end
+            table.insert(lines, "  </ul>")
+            table.insert(lines, "</body>")
+            table.insert(lines, "</html>")
+
+        -----------------------------------------------------------------------
+        -- Discord Markdown & Plain Text Modes
+        -----------------------------------------------------------------------
+        else
+            if isDiscord then
+                table.insert(lines, string.format("# Raiders Tracker by Copper (v%s)", GetAddonVersion()))
+                table.insert(lines, GITHUB_URL)
+                table.insert(lines, "# " .. header)
+            else
+                table.insert(lines, string.format("Raiders Tracker by Copper (v%s)", GetAddonVersion()))
+                table.insert(lines, "GitHub: " .. GITHUB_URL)
+                table.insert(lines, "=== " .. header .. " ===")
+            end
+            table.insert(lines, "")
+
+            -- 1. Characters Present
+            table.insert(lines, isDiscord and string.format("## 1. Characters Present (%d)", #presentList) or string.format("--- 1. Characters Present (%d) ---", #presentList))
+            if #presentList == 0 then
+                table.insert(lines, "  None")
+            else
+                for _, pName in ipairs(presentList) do
+                    local pClass = presentMap[pName] or "WARRIOR"
+                    table.insert(lines, isDiscord and string.format("  * **%s** (%s)", pName, pClass) or string.format("  - %s (%s)", pName, pClass))
+                end
+            end
+            table.insert(lines, "")
+
+            -- 2. Deaths & Detailed Death Log
+            table.insert(lines, isDiscord and string.format("## 2. Deaths & Death Log (%d Total)", totalSegDeaths) or string.format("--- 2. Deaths & Death Log (%d Total) ---", totalSegDeaths))
+            if #deathPlayers == 0 then
+                table.insert(lines, "  None")
+            else
+                for _, dPlayer in ipairs(deathPlayers) do
+                    local pName = dPlayer.name
+                    local pClass = presentMap[pName] or string.upper(GetSafePlayerClass(pName))
+                    local deathWord = (dPlayer.count == 1) and "Death" or "Deaths"
+                    table.insert(lines, isDiscord and string.format("**%s (%s) - %d %s**", pName, pClass, dPlayer.count, deathWord) or string.format("%s (%s) - %d %s", pName, pClass, dPlayer.count, deathWord))
+
+                    for idx, d in ipairs(dPlayer.list) do
+                        local killer = StripColorCodes(d.killer or "Unknown Mob")
+                        local ability = StripColorCodes(d.ability or "Unknown Attack")
+                        local amount = tonumber(d.amount) or 0
+                        local overkill = tonumber(d.overkill) or 0
+                        local timeStr = d.time or ""
+                        local dmgText = (amount > 0) and string.format("%d dmg", amount) or "Fatal Effect"
+                        if overkill > 0 then
+                            dmgText = string.format("%d dmg (%d overkill)", amount, overkill)
+                        end
+                        local logEntry = string.format("[%s] Killed by %s | Ability: %s | Damage: %s", timeStr, killer, ability, dmgText)
+                        table.insert(lines, isDiscord and string.format("  * %d. %s", idx, logEntry) or string.format("  - %d. %s", idx, logEntry))
+                    end
+                end
+            end
+            table.insert(lines, "")
+
+            -- 3. Potions & Buffs
+            table.insert(lines, isDiscord and "## 3. Potions & Buffs" or "--- 3. Potions & Buffs ---")
+            if #potPlayers == 0 then
+                table.insert(lines, "  None")
+            else
+                for _, pName in ipairs(potPlayers) do
+                    local pClass = presentMap[pName] or string.upper(seg.players[pName] or "WARRIOR")
+                    table.insert(lines, isDiscord and string.format("**%s (%s)**", pName, pClass) or string.format("%s (%s)", pName, pClass))
+
+                    local sortedEntries = {}
+                    for buffName, count in pairs(seg.potionsAndBuffs[pName]) do
+                        table.insert(sortedEntries, { name = StripColorCodes(buffName), count = count })
+                    end
+                    table.sort(sortedEntries, function(a, b) return a.name < b.name end)
+
+                    for _, entry in ipairs(sortedEntries) do
+                        table.insert(lines, isDiscord and string.format("  * %s: %d", entry.name, entry.count) or string.format("  - %s: %d", entry.name, entry.count))
+                    end
+                end
+            end
+            table.insert(lines, "")
+
+            -- 4. Raid Utility
+            table.insert(lines, isDiscord and "## 4. Raid Utility" or "--- 4. Raid Utility ---")
+            if #utilPlayers == 0 then
+                table.insert(lines, "  None")
+            else
+                for _, pName in ipairs(utilPlayers) do
+                    local pClass = presentMap[pName] or string.upper(seg.players[pName] or "WARRIOR")
+                    table.insert(lines, isDiscord and string.format("**%s (%s)**", pName, pClass) or string.format("%s (%s)", pName, pClass))
+
+                    local sortedEntries = {}
+                    for utilName, count in pairs(seg.raidUtility[pName]) do
+                        table.insert(sortedEntries, { name = StripColorCodes(utilName), count = count })
+                    end
+                    table.sort(sortedEntries, function(a, b) return a.name < b.name end)
+
+                    for _, entry in ipairs(sortedEntries) do
+                        table.insert(lines, isDiscord and string.format("  * %s: %d", entry.name, entry.count) or string.format("  - %s: %d", entry.name, entry.count))
+                    end
                 end
             end
         end
@@ -2670,7 +2852,20 @@ local function CreateReportFrame()
         editBox:ClearFocus()
     end
 
-    chkDiscord:SetScript("OnClick", GenerateReport)
+    chkDiscord:SetScript("OnClick", function(self)
+        if self:GetChecked() then
+            chkHTML:SetChecked(false)
+        end
+        GenerateReport()
+    end)
+
+    chkHTML:SetScript("OnClick", function(self)
+        if self:GetChecked() then
+            chkDiscord:SetChecked(false)
+        end
+        GenerateReport()
+    end)
+
     ReportFrame:SetScript("OnShow", GenerateReport)
 end
 
