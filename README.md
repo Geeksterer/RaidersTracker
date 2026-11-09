@@ -35,7 +35,7 @@ Stop guessing what caused a wipe or why a player died:
 ### 5. Instant Discord Reports, Session Archiving & Roster Tools
 * **One-Click Segment Reports (`Report Seg`):** Generates a full summary of the selected segment organized into four sections: **1. Characters Present**, **2. Deaths & Death Log**, **3. Potions & Buffs**, and **4. Raid Utility**.
 * **Discord Markdown Toggle:** Check the **Discord Markdown Format** box in the report window, press `Ctrl+C`, and paste a clean, pre-formatted report directly into your guild's Discord channel.
-* **Resetting your data:** The addon will issue a popup when you join a group to ask if you want to reset. If you click Agree, the addon purges all session data and starts a fresh live session.
+* **Resetting your data:** The addon will issue a popup when you join a group to ask if you want to reset. If you click Agree, the addon purges the live session data and starts a fresh live session. Your saved sessions remain intact until you click delete all sessions in the config panel.
 * **Session Characters & Quick Whisper (`Characters`):** View an alphabetical, class-colored list of every player recorded in the active session with a one-click **Whisper** button beside each name.
 - **Added HTML export**: You can now export your current reported segment to HTML! Sample here: <https://sites.google.com/view/raiders-tracker-by-copper/raiders-tracker-output>
 ---
