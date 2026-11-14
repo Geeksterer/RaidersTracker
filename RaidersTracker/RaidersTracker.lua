@@ -7,7 +7,7 @@ local AUTHOR = "Copper"
 local GITHUB_URL = "https://github.com/Geeksterer/RaidersTracker/"
 
 local function GetAddonVersion()
-    return GetAddOnMetadata("RaidersTracker", "Version") or "1.1.4"
+    return GetAddOnMetadata("RaidersTracker", "Version") or "1.1.5"
 end
 
 local function GetFooterText()
@@ -40,6 +40,70 @@ local function DeepCopyTable(orig)
     return copy
 end
 
+local function MergeSegmentDataInto(targetSeg, sourceSeg)
+    if not targetSeg or not sourceSeg then return end
+
+    targetSeg.players = targetSeg.players or {}
+    for pName, pClass in pairs(sourceSeg.players or {}) do
+        targetSeg.players[pName] = pClass
+    end
+
+    targetSeg.potionsAndBuffs = targetSeg.potionsAndBuffs or {}
+    for pName, entries in pairs(sourceSeg.potionsAndBuffs or {}) do
+        targetSeg.potionsAndBuffs[pName] = targetSeg.potionsAndBuffs[pName] or {}
+        for bName, count in pairs(entries) do
+            targetSeg.potionsAndBuffs[pName][bName] = (targetSeg.potionsAndBuffs[pName][bName] or 0) + count
+        end
+    end
+
+    targetSeg.raidUtility = targetSeg.raidUtility or {}
+    for pName, entries in pairs(sourceSeg.raidUtility or {}) do
+        targetSeg.raidUtility[pName] = targetSeg.raidUtility[pName] or {}
+        for uName, count in pairs(entries) do
+            targetSeg.raidUtility[pName][uName] = (targetSeg.raidUtility[pName][uName] or 0) + count
+        end
+    end
+
+    targetSeg.deaths = targetSeg.deaths or {}
+    for pName, dList in pairs(sourceSeg.deaths or {}) do
+        if type(dList) == "table" and #dList > 0 then
+            targetSeg.deaths[pName] = targetSeg.deaths[pName] or {}
+            for _, dEntry in ipairs(dList) do
+                table.insert(targetSeg.deaths[pName], dEntry)
+            end
+        end
+    end
+end
+
+-- Automatically merges any split Lich King RP wipe segment into its paired Lich King Victory segment
+local function RepairSplitLichKingSegments(session)
+    if not session or not session.segments or #session.segments < 2 then return end
+    local segs = session.segments
+    local i = 1
+    while i < #segs do
+        local s1 = segs[i]
+        local s2 = segs[i + 1]
+        if s1 and s2 and s1.bossName == "The Lich King" and s2.bossName == "The Lich King" then
+            local s1IsVic = (s1.name and s1.name:find("Victory") ~= nil)
+            local s2IsVic = (s2.name and s2.name:find("Victory") ~= nil)
+            local s1IsWipe = (s1.name and s1.name:find("Wipe") ~= nil)
+            local s2IsWipe = (s2.name and s2.name:find("Wipe") ~= nil)
+
+            if s1IsWipe and s2IsVic then
+                MergeSegmentDataInto(s2, s1)
+                table.remove(segs, i)
+            elseif s1IsVic and s2IsWipe then
+                MergeSegmentDataInto(s1, s2)
+                table.remove(segs, i + 1)
+            else
+                i = i + 1
+            end
+        else
+            i = i + 1
+        end
+    end
+end
+
 local function InitializeDB()
     for k, v in pairs(defaultDB) do
         if RaidersTrackerDB[k] == nil then
@@ -60,7 +124,11 @@ local function InitializeDB()
             seg.potionsAndBuffs = seg.potionsAndBuffs or {}
             seg.raidUtility = seg.raidUtility or {}
         end
+        RepairSplitLichKingSegments(currentSession)
         currentSegment = currentSession.segments[1]
+    end
+    for _, savedSess in ipairs(RaidersTrackerDB.savedSessions or {}) do
+        RepairSplitLichKingSegments(savedSess)
     end
 end
 
@@ -389,7 +457,7 @@ local WOTLK_BOSS_DB = {
     [37955] = { name = "Blood-Queen Lana'thel" },
     [36789] = { name = "Valithria Dreamwalker", scriptedFinish = true },
     [36853] = { name = "Sindragosa" },
-    [36597] = { name = "The Lich King", scriptedFinish = true },
+    [36597] = { name = "The Lich King" }, -- Fires UNIT_DIED when finished off after Tirion RP
     [36609] = { name = "The Lich King", isAdd = true },
     [36701] = { name = "The Lich King", isAdd = true },
 
@@ -520,7 +588,7 @@ local BOSS_ENGAGE_SPEECH = {
 }
 
 local BOSS_DEFEAT_SPEECH = {
-    -- ICC
+    -- ICC (Case-insensitive matching enabled; "No questions remain unanswered" moved to LK 10% RP handler)
     ["I see... only darkness"] = "Lord Marrowgar",
     ["All is part of the Master's plan"] = "Lady Deathwhisper",
     ["Don't say I didn't warn ya, scoundrels"] = "Icecrown Gunship Battle",
@@ -531,9 +599,10 @@ local BOSS_DEFEAT_SPEECH = {
     ["Bad news, everyone... I don't think I'm going to make it"] = "Professor Putricide",
     ["My queen, they... come"] = "Blood Prince Council",
     ["But... we had... such a good arrangement"] = "Blood-Queen Lana'thel",
-    ["I am renewed! Ysera grant me"] = "Valithria Dreamwalker",
+    ["I am renewed"] = "Valithria Dreamwalker",
+    ["Ysera grant me"] = "Valithria Dreamwalker",
+    ["foul creatures to rest"] = "Valithria Dreamwalker",
     ["Free... at last"] = "Sindragosa",
-    ["No questions remain unanswered"] = "The Lich King",
     ["Father! Is it... over?"] = "The Lich King",
 
     -- VoA
@@ -584,12 +653,24 @@ local BOSS_DEFEAT_SPEECH = {
     ["Relish this victory, mortals, for it will be your last"] = "Halion"
 }
 
+-- Speech phrases during The Lich King 10% Fury of Frostmourne / Tirion Fordring RP that keep the encounter open
+local LICH_KING_RP_SPEECH = {
+    "no questions remain unanswered",
+    "greatest champions",
+    "light, grant me one final blessing",
+    "shatter this prison",
+    "no more, arthas",
+    "now i stand, the lion",
+    "they cannot fear"
+}
+
 local WOTLK_BOSS_INITIATORS = {
     [69076] = "Lord Marrowgar", [69057] = "Lord Marrowgar",
     [70867] = "Lady Deathwhisper", [69680] = "Icecrown Gunship Battle",
     [72293] = "Deathbringer Saurfang", [72219] = "Festergut", [69674] = "Rotface",
     [70351] = "Professor Putricide", [71807] = "Blood Prince Council", [70877] = "Blood-Queen Lana'thel",
-    [71741] = "Valithria Dreamwalker", [70123] = "Sindragosa", [72350] = "The Lich King",
+    [71741] = "Valithria Dreamwalker", [70123] = "Sindragosa",
+    [72262] = "The Lich King", [70337] = "The Lich King",
     [74505] = "Baltharus the Warborn", [74509] = "Baltharus the Warborn",
     [74403] = "Saviana Ragefire", [74452] = "Saviana Ragefire", [78722] = "Saviana Ragefire",
     [74367] = "General Zarithrian", [74384] = "General Zarithrian",
@@ -1044,6 +1125,8 @@ local activeBossName = nil
 local activeBossData = nil
 local inCombatState = false
 local hasEnteredBossCombat = false
+local lichKingRPActive = false
+local lichKingRPElapsed = 0
 
 local lastKnownZone = nil
 local lastKnownDiff = nil
@@ -1120,6 +1203,8 @@ local function ResetLiveSessionState()
     currentSegment = nil
     inCombatState = false
     hasEnteredBossCombat = false
+    lichKingRPActive = false
+    lichKingRPElapsed = 0
     activeBossID = nil
     activeBossName = nil
     activeBossData = nil
@@ -1136,6 +1221,8 @@ end
 
 local function SaveCurrentLiveSession(startFreshAfterSave)
     if not currentSession or #currentSession.segments == 0 then return end
+
+    RepairSplitLichKingSegments(currentSession)
 
     local cleanedSegments = {}
     for _, seg in ipairs(currentSession.segments) do
@@ -1254,6 +1341,8 @@ local function StartEncounter(bossID, bossName, overrideData, fromSpeech)
     activeBossData = overrideData or (activeBossID and WOTLK_BOSS_DB[activeBossID]) or info or {}
     inCombatState = true
     hasEnteredBossCombat = IsRaidInCombat()
+    lichKingRPActive = false
+    lichKingRPElapsed = 0
     bossStartTime = now
     outOfCombatAccum = 0
     gracePeriodAccum = 0
@@ -1327,6 +1416,7 @@ local function EndEncounter(isVictory, reason)
     local timeStr = string.format("%dm %ds", mins, secs)
     local finishedBoss = activeBossName or "Boss"
 
+    -- Faction Champions fallback
     if not isVictory and finishedBoss == "Faction Champions" then
         local champsKilled = 0
         for _ in pairs(defeatedGroupNPCs) do
@@ -1339,33 +1429,43 @@ local function EndEncounter(isVictory, reason)
         end
     end
 
+    -- The Lich King fallback: if the raid reached the 10% Fury of Frostmourne / Fordring RP and is alive when combat ends, it is a Victory
+    if not isVictory and finishedBoss == "The Lich King" and lichKingRPActive and not UnitIsDeadOrGhost("player") then
+        isVictory = true
+    end
+
     if isVictory then
         bossEndCooldowns[finishedBoss] = now
         defeatedBossLocks[finishedBoss] = now
         if currentSession.segments[1] and currentSession.segments[1].isBoss then
             currentSession.segments[1].name = string.format("%s [Victory - %s]", finishedBoss, timeStr)
         end
+        RepairSplitLichKingSegments(currentSession)
         AnnounceLocalChat(string.format("VICTORY: %s was killed and it was a victory! (%s)", finishedBoss, timeStr))
     else
-        if duration < 15 or not hasEnteredBossCombat then
+        -- Purge any non-victory boss pull under 25 seconds (combo-point building / quick despawns)
+        if duration < 25 or not hasEnteredBossCombat then
             if currentSession.segments[1] and currentSession.segments[1].isBoss then
                 table.remove(currentSession.segments, 1)
             end
             if activeBossName and bossAttemptCount[activeBossName] and bossAttemptCount[activeBossName] > 0 then
                 bossAttemptCount[activeBossName] = bossAttemptCount[activeBossName] - 1
             end
-            AnnounceLocalChat(string.format("Boss combat ended: %s (Reset < 15s purged)", finishedBoss))
+            AnnounceLocalChat(string.format("Boss combat ended: %s (Attempt < 25s removed)", finishedBoss))
         else
             bossEndCooldowns[finishedBoss] = now
             if currentSession.segments[1] and currentSession.segments[1].isBoss then
                 currentSession.segments[1].name = string.format("%s [Wipe %d - %s]", finishedBoss, currentSession.segments[1].attempt or 1, timeStr)
             end
+            RepairSplitLichKingSegments(currentSession)
             AnnounceLocalChat(string.format("Boss combat ended: %s (%s)", finishedBoss, timeStr))
         end
     end
 
     inCombatState = false
     hasEnteredBossCombat = false
+    lichKingRPActive = false
+    lichKingRPElapsed = 0
     activeBossID = nil
     activeBossName = nil
     activeBossData = nil
@@ -1400,6 +1500,19 @@ combatWatchdogFrame:SetScript("OnUpdate", function(self, elapsed)
     end
 
     gracePeriodAccum = gracePeriodAccum + elapsed
+
+    -- Keep The Lich King encounter open during the 10% Fury of Frostmourne -> Tirion Fordring -> Mass Resurrection RP
+    if activeBossName == "The Lich King" and lichKingRPActive then
+        lichKingRPElapsed = lichKingRPElapsed + elapsed
+        if IsRaidInCombat() then
+            outOfCombatAccum = 0
+            return
+        end
+        -- Wait up to 240 seconds for Tirion Fordring & Terenas Menethil RP + finish
+        if lichKingRPElapsed < 240.0 then
+            return
+        end
+    end
 
     if IsRaidInCombat() then
         hasEnteredBossCombat = true
@@ -2553,7 +2666,6 @@ local function CreateReportFrame()
         return str:gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;"):gsub('"', "&quot;")
     end
 
-    -- Converts WoW |cffHEX...|r color tags into inline CSS <span style="color: #HEX;">...</span>
     local function ConvertWoWColorsToHTML(str)
         if not str then return "" end
         local escaped = EscapeHTML(str)
@@ -3254,21 +3366,34 @@ eventHandler:SetScript("OnEvent", function(self, event, ...)
 
     if not RaidersTrackerDB.enabled then return end
 
-    -- 1. Boss Speech Recognition Engine
+    -- 1. Boss Speech Recognition Engine (Case-Insensitive Matching)
     if event == "CHAT_MSG_MONSTER_YELL" or event == "CHAT_MSG_MONSTER_EMOTE" or event == "CHAT_MSG_RAID_BOSS_EMOTE" then
         local msg = ...
         msg = msg or ""
+        local lowerMsg = msg:lower()
 
         if not inCombatState then
             for phrase, bossName in pairs(BOSS_ENGAGE_SPEECH) do
-                if msg:find(phrase, 1, true) or msg:find(phrase) then
+                if lowerMsg:find(phrase:lower(), 1, true) then
                     StartEncounter(nil, bossName, nil, true)
                     break
                 end
             end
         else
+            -- Check if The Lich King is in his 10% Fury of Frostmourne / Tirion Fordring RP phase
+            if activeBossName == "The Lich King" then
+                for _, rpPhrase in ipairs(LICH_KING_RP_SPEECH) do
+                    if lowerMsg:find(rpPhrase, 1, true) then
+                        lichKingRPActive = true
+                        lichKingRPElapsed = 0
+                        outOfCombatAccum = 0
+                        break
+                    end
+                end
+            end
+
             for phrase, bossName in pairs(BOSS_DEFEAT_SPEECH) do
-                if (msg:find(phrase, 1, true) or msg:find(phrase)) and activeBossName == bossName then
+                if lowerMsg:find(phrase:lower(), 1, true) and activeBossName == bossName then
                     EndEncounter(true, "Boss Defeat Speech Triggered")
                     break
                 end
@@ -3326,7 +3451,23 @@ eventHandler:SetScript("OnEvent", function(self, event, ...)
 
         local spellID, spellName = arg9, arg10
 
-        -- B. Secondary Boss Engage Detection (Includes Ruby Sanctum Mini-Bosses Baltharus, Saviana, Zarithrian)
+        -- B. Special Encounter State Triggers (Valithria Dreamwalker 100% HP & Lich King 10% RP)
+        if inCombatState and type(spellID) == "number" then
+            -- Valithria Dreamwalker casts Dreamwalker's Rage (71189) when healed to 100% HP
+            if activeBossName == "Valithria Dreamwalker" and spellID == 71189 then
+                EndEncounter(true, "Valithria Dreamwalker Healed to 100%")
+                return
+            end
+
+            -- The Lich King casts Fury of Frostmourne (72350 / 70063), Raise Dead RP (71769), or Terenas casts Mass Resurrection (72429 / 72423)
+            if activeBossName == "The Lich King" and (spellID == 72350 or spellID == 70063 or spellID == 71769 or spellID == 72398 or spellID == 72429 or spellID == 72423) then
+                lichKingRPActive = true
+                lichKingRPElapsed = 0
+                outOfCombatAccum = 0
+            end
+        end
+
+        -- C. Secondary Boss Engage Detection (Includes Ruby Sanctum Mini-Bosses Baltharus, Saviana, Zarithrian)
         if not inCombatState and IsRaidInCombat() then
             local srcID = GetNPCIDFromGUID(sourceGUID)
             local dstID = GetNPCIDFromGUID(destGUID)
@@ -3345,7 +3486,7 @@ eventHandler:SetScript("OnEvent", function(self, event, ...)
             end
         end
 
-        -- C. UNIT_DIED Handling (Raid Member Death Log + Boss Victory Verification)
+        -- D. UNIT_DIED Handling (Raid Member Death Log + Boss Victory Verification)
         if subevent == "UNIT_DIED" then
             if destName and IsGroupMember(destName, destGUID) then
                 RecordPlayerDeath(destName, destGUID)
@@ -3394,7 +3535,7 @@ eventHandler:SetScript("OnEvent", function(self, event, ...)
             return
         end
 
-        -- D. Buffs/Potions Received (View 1) & Raid Utility Used (View 2)
+        -- E. Buffs/Potions Received (View 1) & Raid Utility Used (View 2)
         if type(spellID) == "number" then
             local isAuraApplied = (subevent == "SPELL_AURA_APPLIED" and POTIONS_AND_BUFFS[spellID] ~= nil)
             local isAllowedRefresh = (subevent == "SPELL_AURA_REFRESH" and ALLOW_REFRESH_BUFFS[spellID] == true and POTIONS_AND_BUFFS[spellID] ~= nil)
