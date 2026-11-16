@@ -210,7 +210,7 @@ local function EnqueueRaidChatLines(rawLines)
                 local splitPos = clean:sub(1, 250):match("^.*()%s") or 250
                 if splitPos < 40 then splitPos = 250 end
                 table.insert(chatQueue, clean:sub(1, splitPos))
-                clean = "  " .. clean:sub(splitPos + 1):gsub("^%s+", "")
+                clean = clean:sub(splitPos + 1):gsub("^%s+", "")
             end
             if clean ~= "" then
                 table.insert(chatQueue, clean)
@@ -1493,12 +1493,26 @@ end)
 -------------------------------------------------------------------------------
 -- Segment Analysis Helpers (Duration, Pull Time, Buffs/Utility/Tank/Fails)
 -------------------------------------------------------------------------------
-local function IsFuryOfFrostmourneDeath(d)
+local function IsWipeDeath(d, allSegmentDeaths)
     if not d then return false end
     if d.isScriptedRP then return true end
     local ab = StripColorCodes(d.ability or ""):lower()
     if ab:find("fury of frostmourne", 1, true) then
         return true
+    end
+    local pTime = d.pullTime
+    if type(pTime) == "number" and allSegmentDeaths then
+        local clusterCount = 0
+        for _, other in ipairs(allSegmentDeaths) do
+            if other and type(other.pullTime) == "number" then
+                if math.abs(other.pullTime - pTime) <= 5.0 then
+                    clusterCount = clusterCount + 1
+                end
+            end
+        end
+        if clusterCount >= 7 then
+            return true
+        end
     end
     return false
 end
@@ -1684,7 +1698,7 @@ local function GetEnrageSummaryString(seg)
 end
 
 local function BuildCondensedEntryLines(entryMap, indentPrefix)
-    indentPrefix = indentPrefix or "  - "
+    indentPrefix = indentPrefix or ""
     if not entryMap or next(entryMap) == nil then return {} end
     local grouped = {}
     local groupOrder = {}
@@ -2738,38 +2752,43 @@ local function CreateCharacterFrame()
 end
 
 -------------------------------------------------------------------------------
--- Multi-Panel Reporting Hub (4 Panels + Throttled Raid Chat Queue)
+-- Multi-Panel Reporting Hub (Flush Left, Clean Fails & Line Limits)
 -------------------------------------------------------------------------------
 local function CreateReportFrame()
     ReportFrame = CreateRUTPanel("RTReportFrame", 680, 540, "Report Segment Hub")
 
-    local activeReportPanel = "ALL"      -- "ALL", "CHAR", "FAILS", "DEATHS"
-    local activeAllFormat = "PLAIN"      -- "PLAIN", "DISCORD", "HTML"
-    local activeCharSubMode = "BUFFS"    -- "BUFFS", "FAILS"
+    local activeReportPanel = "ALL"        -- "ALL", "CHAR", "FAILS", "DEATHS"
+    local activeAllFormat = "PLAIN"        -- "PLAIN", "DISCORD", "HTML"
+    local activeCharSubMode = "BUFFS"      -- "BUFFS", "FAILS"
+    local activeFailSubMode = "EARLY"      -- "EARLY", "SLACKERS", "FAILS"
+    local failLineLimit = 10               -- 5, 10, 20, 9999 (All)
     local selectedReportChar = nil
     local currentPreviewText = ""
     local currentRaidChatLines = {}
 
+    local GenerateReport -- Forward declaration
+
     local btnPanelAll = CreateFrame("Button", nil, ReportFrame, "UIPanelButtonTemplate")
-    btnPanelAll:SetSize(152, 24)
+    btnPanelAll:SetSize(130, 24)
     btnPanelAll:SetPoint("TOPLEFT", ReportFrame, "TOPLEFT", 18, -34)
-    btnPanelAll:SetText("1. Report ALL Data")
+    btnPanelAll:SetText("1. ALL Data")
 
     local btnPanelChar = CreateFrame("Button", nil, ReportFrame, "UIPanelButtonTemplate")
-    btnPanelChar:SetSize(158, 24)
+    btnPanelChar:SetSize(130, 24)
     btnPanelChar:SetPoint("LEFT", btnPanelAll, "RIGHT", 6, 0)
-    btnPanelChar:SetText("2. Character Data")
+    btnPanelChar:SetText("2. Character")
 
     local btnPanelFails = CreateFrame("Button", nil, ReportFrame, "UIPanelButtonTemplate")
-    btnPanelFails:SetSize(152, 24)
+    btnPanelFails:SetSize(130, 24)
     btnPanelFails:SetPoint("LEFT", btnPanelChar, "RIGHT", 6, 0)
-    btnPanelFails:SetText("3. Report Raid Fails")
+    btnPanelFails:SetText("3. Raid Fails")
 
     local btnPanelDeaths = CreateFrame("Button", nil, ReportFrame, "UIPanelButtonTemplate")
-    btnPanelDeaths:SetSize(162, 24)
+    btnPanelDeaths:SetSize(145, 24)
     btnPanelDeaths:SetPoint("LEFT", btnPanelFails, "RIGHT", 6, 0)
     btnPanelDeaths:SetText("4. Suspicious Deaths")
 
+    -- Sub-Bar for Panel 1 (ALL Data)
     local subFrameAll = CreateFrame("Frame", nil, ReportFrame)
     subFrameAll:SetSize(640, 28)
     subFrameAll:SetPoint("TOPLEFT", ReportFrame, "TOPLEFT", 18, -62)
@@ -2797,6 +2816,7 @@ local function CreateReportFrame()
     copyHint:SetPoint("LEFT", chkHTML.text, "RIGHT", 14, 0)
     copyHint:SetText("|cff888888(Ctrl+A, Ctrl+C to copy)|r")
 
+    -- Sub-Bar for Panel 2 (CHARACTER Data)
     local subFrameChar = CreateFrame("Frame", nil, ReportFrame)
     subFrameChar:SetSize(640, 28)
     subFrameChar:SetPoint("TOPLEFT", ReportFrame, "TOPLEFT", 18, -62)
@@ -2806,19 +2826,54 @@ local function CreateReportFrame()
     charLabel:SetPoint("LEFT", subFrameChar, "LEFT", 2, 0)
     charLabel:SetText("Raider:")
 
-    local charDropdown = CreateCustomDropdown(subFrameChar, 180, 24)
+    local charDropdown = CreateCustomDropdown(subFrameChar, 160, 24)
     charDropdown:SetPoint("LEFT", charLabel, "RIGHT", 8, 0)
 
     local btnCharBuffs = CreateFrame("Button", nil, subFrameChar, "UIPanelButtonTemplate")
-    btnCharBuffs:SetSize(185, 24)
+    btnCharBuffs:SetSize(165, 24)
     btnCharBuffs:SetPoint("LEFT", charDropdown, "RIGHT", 10, 0)
-    btnCharBuffs:SetText("Character Buffs & Utility")
+    btnCharBuffs:SetText("Buffs & Utility")
 
     local btnCharFails = CreateFrame("Button", nil, subFrameChar, "UIPanelButtonTemplate")
-    btnCharFails:SetSize(150, 24)
+    btnCharFails:SetSize(130, 24)
     btnCharFails:SetPoint("LEFT", btnCharBuffs, "RIGHT", 8, 0)
     btnCharFails:SetText("Character Fails")
 
+    -- Sub-Bar for Panel 3 (RAID FAILS - 3 Section Buttons + Limit Dropdown)
+    local subFrameFails = CreateFrame("Frame", nil, ReportFrame)
+    subFrameFails:SetSize(640, 28)
+    subFrameFails:SetPoint("TOPLEFT", ReportFrame, "TOPLEFT", 18, -62)
+    subFrameFails:Hide()
+
+    local btnFailEarly = CreateFrame("Button", nil, subFrameFails, "UIPanelButtonTemplate")
+    btnFailEarly:SetSize(95, 24)
+    btnFailEarly:SetPoint("LEFT", subFrameFails, "LEFT", 0, 0)
+    btnFailEarly:SetText("1. Early Deaths")
+
+    local btnFailSlack = CreateFrame("Button", nil, subFrameFails, "UIPanelButtonTemplate")
+    btnFailSlack:SetSize(100, 24)
+    btnFailSlack:SetPoint("LEFT", btnFailEarly, "RIGHT", 4, 0)
+    btnFailSlack:SetText("2. Slackers")
+
+    local btnFailCds = CreateFrame("Button", nil, subFrameFails, "UIPanelButtonTemplate")
+    btnFailCds:SetSize(95, 24)
+    btnFailCds:SetPoint("LEFT", btnFailSlack, "RIGHT", 4, 0)
+    btnFailCds:SetText("3. CD Fails")
+
+    local limitDropdown = CreateCustomDropdown(subFrameFails, 100, 24)
+    limitDropdown:SetPoint("LEFT", btnFailCds, "RIGHT", 10, 0)
+
+    limitDropdown.getItems = function()
+        return {
+            { text = "5 lines", checked = (failLineLimit == 5), func = function() failLineLimit = 5; GenerateReport() end },
+            { text = "10 lines", checked = (failLineLimit == 10), func = function() failLineLimit = 10; GenerateReport() end },
+            { text = "20 lines", checked = (failLineLimit == 20), func = function() failLineLimit = 20; GenerateReport() end },
+            { text = "All lines", checked = (failLineLimit == 9999), func = function() failLineLimit = 9999; GenerateReport() end },
+        }
+    end
+    limitDropdown:SetText(failLineLimit == 9999 and "All lines" or (failLineLimit .. " lines"))
+
+    -- Sub-Bar for Panel 4 (Suspicious Deaths Info Banner)
     local subFrameInfo = CreateFrame("Frame", nil, ReportFrame)
     subFrameInfo:SetSize(640, 28)
     subFrameInfo:SetPoint("TOPLEFT", ReportFrame, "TOPLEFT", 18, -62)
@@ -2827,6 +2882,7 @@ local function CreateReportFrame()
     local infoBannerText = subFrameInfo:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
     infoBannerText:SetPoint("LEFT", subFrameInfo, "LEFT", 4, 0)
 
+    -- Read-Only Preview Box
     local viewBox = CreateWhiteBorderViewBox(ReportFrame, -94, 46)
 
     local scrollFrame = CreateFrame("ScrollFrame", "RTReportScrollFrame", viewBox, "UIPanelScrollFrameTemplate")
@@ -2887,16 +2943,16 @@ local function CreateReportFrame()
         table.insert(rLines, "")
         table.insert(rLines, string.format("--- 1. Characters Present (%d) ---", #presentList))
         if #presentList == 0 then
-            table.insert(rLines, "  None")
+            table.insert(rLines, "None")
         else
             for _, pName in ipairs(presentList) do
-                table.insert(rLines, string.format("  - %s (%s)", pName, presentMap[pName] or "WARRIOR"))
+                table.insert(rLines, string.format("- %s (%s)", pName, presentMap[pName] or "WARRIOR"))
             end
         end
         table.insert(rLines, "")
         table.insert(rLines, string.format("--- 2. Deaths & Death Log (%d Total) ---", totalSegDeaths))
         if #deathPlayers == 0 then
-            table.insert(rLines, "  None")
+            table.insert(rLines, "None")
         else
             for _, dPlayer in ipairs(deathPlayers) do
                 local pName = dPlayer.name
@@ -2913,19 +2969,19 @@ local function CreateReportFrame()
                     local stamp = pullStr and string.format("%s into pull / %s", pullStr, timeStr) or timeStr
                     local dmgText = (amount > 0) and string.format("%d dmg", amount) or "Fatal Effect"
                     if overkill > 0 then dmgText = string.format("%d dmg (%d overkill)", amount, overkill) end
-                    table.insert(rLines, string.format("  - %d. [%s] Killed by %s / Ability: %s / Damage: %s", idx, stamp, killer, ability, dmgText))
+                    table.insert(rLines, string.format("- %d. [%s] Killed by %s / Ability: %s / Damage: %s", idx, stamp, killer, ability, dmgText))
                 end
             end
         end
         table.insert(rLines, "")
         table.insert(rLines, "--- 3. Potions & Buffs ---")
         if #potPlayers == 0 then
-            table.insert(rLines, "  None")
+            table.insert(rLines, "None")
         else
             for _, pName in ipairs(potPlayers) do
                 local pClass = presentMap[pName] or string.upper(seg.players[pName] or "WARRIOR")
                 table.insert(rLines, string.format("%s (%s)", pName, pClass))
-                for _, cLine in ipairs(BuildCondensedEntryLines(seg.potionsAndBuffs[pName], "  - ")) do
+                for _, cLine in ipairs(BuildCondensedEntryLines(seg.potionsAndBuffs[pName], "- ")) do
                     table.insert(rLines, cLine)
                 end
             end
@@ -2933,12 +2989,12 @@ local function CreateReportFrame()
         table.insert(rLines, "")
         table.insert(rLines, "--- 4. Raid Utility ---")
         if #utilPlayers == 0 then
-            table.insert(rLines, "  None")
+            table.insert(rLines, "None")
         else
             for _, pName in ipairs(utilPlayers) do
                 local pClass = presentMap[pName] or string.upper(seg.players[pName] or "WARRIOR")
                 table.insert(rLines, string.format("%s (%s)", pName, pClass))
-                for _, cLine in ipairs(BuildCondensedEntryLines(seg.raidUtility[pName], "  - ")) do
+                for _, cLine in ipairs(BuildCondensedEntryLines(seg.raidUtility[pName], "- ")) do
                     table.insert(rLines, cLine)
                 end
             end
@@ -2950,17 +3006,15 @@ local function CreateReportFrame()
         local fails = {}
         local hasFlask, hasFood, potCount = GetPlayerConsumableStatus(seg, pName)
         if not hasFlask then
-            table.insert(fails, "Missing Flask / Elixir")
+            table.insert(fails, { text = "Missing Flask / Elixir", severity = 3 })
         end
         if not hasFood then
-            table.insert(fails, "Missing Well Fed Food Buff")
+            table.insert(fails, { text = "Missing Well Fed Food Buff", severity = 3 })
         end
         if potCount == 0 then
-            table.insert(fails, "Combat Potions Used: 0 (No pre-pot or combat potion used)")
+            table.insert(fails, { text = "Combat Potions Used: 0 (No pre-pot or combat potion used)", severity = 4 })
         elseif potCount == 1 then
-            table.insert(fails, "Combat Potions Used: 1 (Only 1 potion used)")
-        else
-            table.insert(fails, string.format("Combat Potions Used: %d", potCount))
+            table.insert(fails, { text = "Combat Potions Used: 1 (Only 1 potion used)", severity = 2 })
         end
 
         local utilEntries = (seg.raidUtility and seg.raidUtility[pName]) or {}
@@ -2970,45 +3024,42 @@ local function CreateReportFrame()
         if pClass == "ROGUE" and maxPossible30s > 0 then
             local tricks = CountPlayerSpellUsage(utilEntries, "Tricks of the Trade")
             if tricks < maxPossible30s then
-                table.insert(fails, string.format("Class Duty (Tricks of the Trade): Cast %d in %s (%d possible on 30s CD)", tricks, FormatDurationShort(segDur), maxPossible30s))
+                table.insert(fails, { text = string.format("Class Duty (Tricks of the Trade): Cast %d in %s (%d possible on 30s CD)", tricks, FormatDurationShort(segDur), maxPossible30s), severity = 3 })
             end
         elseif pClass == "HUNTER" then
             local mdCasts = CountPlayerSpellUsage(utilEntries, "Misdirection")
             if maxPossible30s > 0 and mdCasts < math.max(1, math.floor(maxPossible30s / 2)) then
-                table.insert(fails, string.format("Class Duty (Misdirection): Cast %d in %s (%d possible on 30s CD)", mdCasts, FormatDurationShort(segDur), maxPossible30s))
+                table.insert(fails, { text = string.format("Class Duty (Misdirection): Cast %d in %s (%d possible on 30s CD)", mdCasts, FormatDurationShort(segDur), maxPossible30s), severity = 3 })
             elseif maxPossible30s == 0 and mdCasts == 0 then
-                table.insert(fails, "Class Duty (Misdirection): 0 casts recorded")
+                table.insert(fails, { text = "Class Duty (Misdirection): 0 casts recorded", severity = 3 })
             end
             local tranqCasts = CountPlayerSpellUsage(utilEntries, "Tranquilizing Shot")
             if totalEnrages > 0 and tranqCasts == 0 then
-                table.insert(fails, string.format("Class Duty (Tranquilizing Shot): 0 Tranquilizing Shots used (%s)", enrageStr))
+                table.insert(fails, { text = string.format("Class Duty (Tranquilizing Shot): 0 Tranquilizing Shots used (%s)", enrageStr), severity = 5 })
             end
         end
 
         if detectedTanks[pName] then
             local tankCDCount = CountMajorTankCooldowns(seg, pName)
             if tankCDCount == 0 then
-                table.insert(fails, "Tank Cooldown Fail: 0 major tank defensive cooldowns used")
+                table.insert(fails, { text = "Tank Cooldown Fail: 0 major tank defensive cooldowns used", severity = 5 })
             end
         end
 
         if totalUtilityCasts == 0 then
-            table.insert(fails, "Zero Total Utility: 0 utility spells cast across the entire segment")
+            table.insert(fails, { text = "Zero Total Utility: 0 utility spells cast across the entire segment", severity = 4 })
         end
 
-        -- Exclude Fury of Frostmourne deaths from suspicious/fail reporting
+        local allSegDeaths = {}
+        for _, dList in pairs(seg.deaths or {}) do
+            for _, d in ipairs(dList or {}) do table.insert(allSegDeaths, d) end
+        end
+
         local rawDeaths = (seg.deaths and seg.deaths[pName]) or {}
-        local pDeaths = {}
         for _, d in ipairs(rawDeaths) do
-            if not IsFuryOfFrostmourneDeath(d) then
-                table.insert(pDeaths, d)
-            end
-        end
-
-        if #pDeaths > 0 then
-            local unusedDef = GetUnusedPersonalDefensives(seg, pName, pClass)
-            local unusedStr = (#unusedDef > 0) and table.concat(unusedDef, ", ") or "None unused"
-            for idx, d in ipairs(pDeaths) do
+            if not IsWipeDeath(d, allSegDeaths) then
+                local unusedDef = GetUnusedPersonalDefensives(seg, pName, pClass)
+                local unusedStr = (#unusedDef > 0) and table.concat(unusedDef, ", ") or "None unused"
                 local pullStr = FormatPullTime(d.pullTime)
                 local timeLabel = pullStr and string.format("%s into pull (%s)", pullStr, d.time or "") or (d.time or "")
                 local killer = StripColorCodes(d.killer or "Unknown Mob")
@@ -3017,13 +3068,13 @@ local function CreateReportFrame()
                 local overkill = tonumber(d.overkill) or 0
                 local dmgText = (amount > 0) and string.format("%d dmg", amount) or "Fatal Effect"
                 if overkill > 0 then dmgText = string.format("%d dmg (%d overkill)", amount, overkill) end
-                table.insert(fails, string.format("Death #%d [%s]: Killed by %s (%s - %s) / Unused Defensives: %s", idx, timeLabel, killer, ability, dmgText, unusedStr))
+                table.insert(fails, { text = string.format("Death [%s]: Killed by %s (%s - %s) / Unused Defensives: %s", timeLabel, killer, ability, dmgText, unusedStr), severity = 5 })
             end
         end
         return fails
     end
 
-    local function GenerateReport()
+    GenerateReport = function()
         HideAllCustomDropdownMenus()
         local activeSession = GetActiveSession()
         local seg = (activeSession and activeSession.segments or {})[selectedSegmentIndex]
@@ -3034,6 +3085,7 @@ local function CreateReportFrame()
         btnPanelDeaths:UnlockHighlight()
         subFrameAll:Hide()
         subFrameChar:Hide()
+        subFrameFails:Hide()
         subFrameInfo:Hide()
 
         if activeReportPanel == "ALL" then
@@ -3051,12 +3103,18 @@ local function CreateReportFrame()
             end
         elseif activeReportPanel == "FAILS" then
             btnPanelFails:LockHighlight()
-            subFrameInfo:Show()
-            infoBannerText:SetText("|cffFF8800Viewing: Consolidated Raid Fails (Early Deaths, Consumables, Class Duties & Tank Cooldowns)|r")
+            subFrameFails:Show()
+            btnFailEarly:UnlockHighlight()
+            btnFailSlack:UnlockHighlight()
+            btnFailCds:UnlockHighlight()
+            if activeFailSubMode == "EARLY" then btnFailEarly:LockHighlight()
+            elseif activeFailSubMode == "SLACKERS" then btnFailSlack:LockHighlight()
+            else btnFailCds:LockHighlight() end
+            limitDropdown:SetText(failLineLimit == 9999 and "All lines" or (failLineLimit .. " lines"))
         elseif activeReportPanel == "DEATHS" then
             btnPanelDeaths:LockHighlight()
             subFrameInfo:Show()
-            infoBannerText:SetText("|cffFF4444Viewing: Chronological Suspicious Deaths Breakdown & Unused Personal Defensives|r")
+            infoBannerText:SetText("|cffFF4444Viewing: Chronological Suspicious Deaths Breakdown & Unused Defensives|r")
         end
 
         if not seg then
@@ -3246,29 +3304,29 @@ local function CreateReportFrame()
 
             elseif activeAllFormat == "DISCORD" then
                 local lines = {
-                    string.format("# === Raiders Tracker v%s by %s ===", GetAddonVersion(), AUTHOR),
+                    string.format("=== Raiders Tracker v%s by %s ===", GetAddonVersion(), AUTHOR),
                     GITHUB_URL,
-                    string.format("**Segment: %s (%s)**", segName, segDiff),
+                    string.format("Segment: %s (%s)", segName, segDiff),
                     "",
-                    string.format("## 1. Characters Present (%d)", #presentList)
+                    string.format("--- 1. Characters Present (%d) ---", #presentList)
                 }
                 if #presentList == 0 then
-                    table.insert(lines, "  None")
+                    table.insert(lines, "None")
                 else
                     for _, pName in ipairs(presentList) do
-                        table.insert(lines, string.format("  * **%s** (%s)", pName, presentMap[pName] or "WARRIOR"))
+                        table.insert(lines, string.format("- %s (%s)", pName, presentMap[pName] or "WARRIOR"))
                     end
                 end
                 table.insert(lines, "")
-                table.insert(lines, string.format("## 2. Deaths & Death Log (%d Total)", totalSegDeaths))
+                table.insert(lines, string.format("--- 2. Deaths & Death Log (%d Total) ---", totalSegDeaths))
                 if #deathPlayers == 0 then
-                    table.insert(lines, "  None")
+                    table.insert(lines, "None")
                 else
                     for _, dPlayer in ipairs(deathPlayers) do
                         local pName = dPlayer.name
                         local pClass = presentMap[pName] or string.upper(GetSafePlayerClass(pName))
                         local deathWord = (dPlayer.count == 1) and "Death" or "Deaths"
-                        table.insert(lines, string.format("**%s (%s) - %d %s**", pName, pClass, dPlayer.count, deathWord))
+                        table.insert(lines, string.format("%s (%s) - %d %s", pName, pClass, dPlayer.count, deathWord))
                         for idx, d in ipairs(dPlayer.list) do
                             local killer = StripColorCodes(d.killer or "Unknown Mob")
                             local ability = StripColorCodes(d.ability or "Unknown Attack")
@@ -3279,32 +3337,32 @@ local function CreateReportFrame()
                             local stamp = pullStr and string.format("%s into pull / %s", pullStr, timeStr) or timeStr
                             local dmgText = (amount > 0) and string.format("%d dmg", amount) or "Fatal Effect"
                             if overkill > 0 then dmgText = string.format("%d dmg (%d overkill)", amount, overkill) end
-                            table.insert(lines, string.format("  * %d. [%s] Killed by %s / Ability: %s / Damage: %s", idx, stamp, killer, ability, dmgText))
+                            table.insert(lines, string.format("- %d. [%s] Killed by %s / Ability: %s / Damage: %s", idx, stamp, killer, ability, dmgText))
                         end
                     end
                 end
                 table.insert(lines, "")
-                table.insert(lines, "## 3. Potions & Buffs")
+                table.insert(lines, "--- 3. Potions & Buffs ---")
                 if #potPlayers == 0 then
-                    table.insert(lines, "  None")
+                    table.insert(lines, "None")
                 else
                     for _, pName in ipairs(potPlayers) do
                         local pClass = presentMap[pName] or string.upper(seg.players[pName] or "WARRIOR")
-                        table.insert(lines, string.format("**%s (%s)**", pName, pClass))
-                        for _, cLine in ipairs(BuildCondensedEntryLines(seg.potionsAndBuffs[pName], "  * ")) do
+                        table.insert(lines, string.format("%s (%s)", pName, pClass))
+                        for _, cLine in ipairs(BuildCondensedEntryLines(seg.potionsAndBuffs[pName], "- ")) do
                             table.insert(lines, cLine)
                         end
                     end
                 end
                 table.insert(lines, "")
-                table.insert(lines, "## 4. Raid Utility")
+                table.insert(lines, "--- 4. Raid Utility ---")
                 if #utilPlayers == 0 then
-                    table.insert(lines, "  None")
+                    table.insert(lines, "None")
                 else
                     for _, pName in ipairs(utilPlayers) do
                         local pClass = presentMap[pName] or string.upper(seg.players[pName] or "WARRIOR")
-                        table.insert(lines, string.format("**%s (%s)**", pName, pClass))
-                        for _, cLine in ipairs(BuildCondensedEntryLines(seg.raidUtility[pName], "  * ")) do
+                        table.insert(lines, string.format("%s (%s)", pName, pClass))
+                        for _, cLine in ipairs(BuildCondensedEntryLines(seg.raidUtility[pName], "- ")) do
                             table.insert(lines, cLine)
                         end
                     end
@@ -3326,17 +3384,17 @@ local function CreateReportFrame()
                 local pClass = presentMap[pName] or string.upper(GetSafePlayerClass(pName))
                 if activeCharSubMode == "BUFFS" then
                     table.insert(lines, string.format("--- Character Buffs & Utility: %s (%s) ---", pName, pClass))
-                    local potLines = BuildCondensedEntryLines((seg.potionsAndBuffs or {})[pName], "  - ")
+                    local potLines = BuildCondensedEntryLines((seg.potionsAndBuffs or {})[pName], "- ")
                     table.insert(lines, "[Potions & Buffs]")
                     if #potLines == 0 then
-                        table.insert(lines, "  - None recorded")
+                        table.insert(lines, "- None recorded")
                     else
                         for _, l in ipairs(potLines) do table.insert(lines, l) end
                     end
-                    local utilLines = BuildCondensedEntryLines((seg.raidUtility or {})[pName], "  - ")
+                    local utilLines = BuildCondensedEntryLines((seg.raidUtility or {})[pName], "- ")
                     table.insert(lines, "[Raid Utility Used]")
                     if #utilLines == 0 then
-                        table.insert(lines, "  - None recorded")
+                        table.insert(lines, "- None recorded")
                     else
                         for _, l in ipairs(utilLines) do table.insert(lines, l) end
                     end
@@ -3344,10 +3402,10 @@ local function CreateReportFrame()
                     table.insert(lines, string.format("--- Character Fails Report: %s (%s) ---", pName, pClass))
                     local fails = BuildSingleCharacterFails(seg, pName, pClass, segDur, maxPossible30s, enrageStr, totalEnrages, detectedTanks)
                     if #fails == 0 then
-                        table.insert(lines, "  - No fails recorded for this player.")
+                        table.insert(lines, "- No fails recorded for this player.")
                     else
                         for _, f in ipairs(fails) do
-                            table.insert(lines, "  - " .. f)
+                            table.insert(lines, "- " .. f.text)
                         end
                     end
                 end
@@ -3356,161 +3414,152 @@ local function CreateReportFrame()
             currentPreviewText = table.concat(lines, "\n")
 
         -----------------------------------------------------------------------
-        -- PANEL 3: REPORT RAID FAILS
+        -- PANEL 3: REPORT RAID FAILS (Split into 3 Sections & Limited)
         -----------------------------------------------------------------------
         elseif activeReportPanel == "FAILS" then
             local lines = BuildStandardRaidHeaderLines(seg)
-            table.insert(lines, "--- Section A: Early & Suspicious Deaths ---")
-            local allDeaths = {}
-            for pName, dList in pairs(seg.deaths or {}) do
-                local pClass = presentMap[pName] or string.upper(GetSafePlayerClass(pName))
-                for _, d in ipairs(dList or {}) do
-                    if not IsFuryOfFrostmourneDeath(d) then
-                        table.insert(allDeaths, {
-                            name = pName,
-                            class = pClass,
-                            pullTime = d.pullTime,
-                            time = d.time or "",
-                            killer = StripColorCodes(d.killer or "Unknown Mob"),
-                            ability = StripColorCodes(d.ability or "Unknown Attack"),
-                            amount = tonumber(d.amount) or 0,
-                            overkill = tonumber(d.overkill) or 0
+            local allSegDeaths = {}
+            for _, dList in pairs(seg.deaths or {}) do
+                for _, d in ipairs(dList or {}) do table.insert(allSegDeaths, d) end
+            end
+
+            if activeFailSubMode == "EARLY" then
+                table.insert(lines, "--- Raid Fails: Early Deaths ---")
+                local maxTime = segDur * 0.75
+                local earlyDeaths = {}
+                for pName, dList in pairs(seg.deaths or {}) do
+                    local pClass = presentMap[pName] or string.upper(GetSafePlayerClass(pName))
+                    for _, d in ipairs(dList or {}) do
+                        local pTime = tonumber(d.pullTime) or 0
+                        if not IsWipeDeath(d, allSegDeaths) and (segDur <= 0 or pTime <= maxTime) then
+                            table.insert(earlyDeaths, {
+                                name = pName,
+                                class = pClass,
+                                pullTime = pTime,
+                                time = d.time or "",
+                                killer = StripColorCodes(d.killer or "Unknown Mob"),
+                                ability = StripColorCodes(d.ability or "Unknown Attack"),
+                                severity = 5
+                            })
+                        end
+                    end
+                end
+                table.sort(earlyDeaths, function(a, b)
+                    if a.pullTime ~= b.pullTime then return a.pullTime < b.pullTime end
+                    return a.name < b.name
+                end)
+
+                if #earlyDeaths == 0 then
+                    table.insert(lines, "None (No early deaths recorded)")
+                else
+                    local count = math.min(#earlyDeaths, failLineLimit)
+                    for idx = 1, count do
+                        local d = earlyDeaths[idx]
+                        local pullStr = FormatPullTime(d.pullTime)
+                        local timeTag = pullStr and string.format("%s into pull", pullStr) or d.time
+                        table.insert(lines, string.format("- [%s] %s (%s): Died to %s (%s)", timeTag, d.name, d.class, d.killer, d.ability))
+                    end
+                end
+
+            elseif activeFailSubMode == "SLACKERS" then
+                table.insert(lines, "--- Raid Fails: Consumable Slackers ---")
+                local slackers = {}
+                for _, pName in ipairs(presentList) do
+                    local pClass = presentMap[pName] or "WARRIOR"
+                    local hasFlask, hasFood, potCount = GetPlayerConsumableStatus(seg, pName)
+                    if not hasFlask or not hasFood or potCount < 2 then
+                        local issues = {}
+                        local sev = 1
+                        if not hasFlask then table.insert(issues, "Missing Flask"); sev = sev + 2 end
+                        if not hasFood then table.insert(issues, "Missing Food"); sev = sev + 2 end
+                        if potCount == 0 then table.insert(issues, "0 Potions"); sev = sev + 3
+                        elseif potCount == 1 then table.insert(issues, "1 Potion"); sev = sev + 1 end
+                        table.insert(slackers, {
+                            text = string.format("- %s (%s): %s", pName, pClass, table.concat(issues, " / ")),
+                            severity = sev
                         })
                     end
                 end
-            end
-            table.sort(allDeaths, function(a, b)
-                if a.pullTime and b.pullTime and a.pullTime ~= b.pullTime then
-                    return a.pullTime < b.pullTime
-                end
-                if a.time ~= b.time then return a.time < b.time end
-                return a.name < b.name
-            end)
+                table.sort(slackers, function(a, b) return a.severity > b.severity end)
 
-            if #allDeaths == 0 then
-                table.insert(lines, "  - None (0 suspicious deaths recorded in segment)")
-            else
-                for idx, d in ipairs(allDeaths) do
-                    local pullStr = FormatPullTime(d.pullTime)
-                    local timeTag = pullStr and string.format("%s into pull (%s)", pullStr, d.time) or d.time
-                    local dmgText = (d.amount > 0) and string.format("%d dmg", d.amount) or "Fatal Effect"
-                    if d.overkill > 0 then dmgText = string.format("%d dmg (%d overkill)", d.amount, d.overkill) end
-                    local unusedDef = GetUnusedPersonalDefensives(seg, d.name, d.class)
-                    local unusedStr = (#unusedDef > 0) and table.concat(unusedDef, ", ") or "None unused"
-                    table.insert(lines, string.format("  - %d. [%s] %s (%s): Killed by %s (%s - %s) / Unused Defensives: %s", idx, timeTag, d.name, d.class, d.killer, d.ability, dmgText, unusedStr))
-                end
-            end
-
-            table.insert(lines, "--- Section B: Consumable Slackers (Flask/Elixir, Food & Combat Potions) ---")
-            local slackerCount = 0
-            for _, pName in ipairs(presentList) do
-                local pClass = presentMap[pName] or "WARRIOR"
-                local hasFlask, hasFood, potCount = GetPlayerConsumableStatus(seg, pName)
-                if not hasFlask or not hasFood or potCount < 2 then
-                    slackerCount = slackerCount + 1
-                    local issues = {}
-                    if not hasFlask then table.insert(issues, "MISSING Flask/Elixir") end
-                    if not hasFood then table.insert(issues, "MISSING Well Fed Food") end
-                    if potCount == 0 then
-                        table.insert(issues, "0 Combat Potions used")
-                    elseif potCount == 1 then
-                        table.insert(issues, "1 Combat Potion used")
-                    else
-                        table.insert(issues, string.format("%d Combat Potions used", potCount))
+                if #slackers == 0 then
+                    table.insert(lines, "None (All raiders fully consumed)")
+                else
+                    local count = math.min(#slackers, failLineLimit)
+                    for idx = 1, count do
+                        table.insert(lines, slackers[idx].text)
                     end
-                    table.insert(lines, string.format("  - %s (%s): %s", pName, pClass, table.concat(issues, " / ")))
                 end
-            end
-            if slackerCount == 0 then
-                table.insert(lines, "  - None (All raiders had Flask, Well Fed & 2+ Combat Potions)")
-            end
 
-            table.insert(lines, "--- Section C: Critical Class Duty & Tank Cooldown Fails ---")
-            local durLabel = (segDur > 0) and FormatDurationShort(segDur) or "segment"
-            local dutyFailCount = 0
+            else -- CD Fails
+                table.insert(lines, "--- Raid Fails: Critical Cooldown & Duty Fails ---")
+                local cdFails = {}
+                local durLabel = (segDur > 0) and FormatDurationShort(segDur) or "segment"
 
-            for _, pName in ipairs(presentList) do
-                if presentMap[pName] == "ROGUE" then
+                for _, pName in ipairs(presentList) do
+                    local pClass = presentMap[pName]
                     local uEntries = (seg.raidUtility and seg.raidUtility[pName]) or {}
-                    local tricks = CountPlayerSpellUsage(uEntries, "Tricks of the Trade")
-                    if maxPossible30s > 0 then
-                        if tricks < maxPossible30s then
-                            dutyFailCount = dutyFailCount + 1
-                            table.insert(lines, string.format("  - %s (ROGUE): Cast %d Tricks of the Trade in %s (%d possible on 30s CD)", pName, tricks, durLabel, maxPossible30s))
+                    if pClass == "ROGUE" then
+                        local tricks = CountPlayerSpellUsage(uEntries, "Tricks of the Trade")
+                        if maxPossible30s > 0 and tricks < maxPossible30s then
+                            table.insert(cdFails, { text = string.format("- %s (ROGUE): Cast %d Tricks in %s (%d possible)", pName, tricks, durLabel, maxPossible30s), severity = 3 })
+                        elseif maxPossible30s == 0 and tricks == 0 then
+                            table.insert(cdFails, { text = string.format("- %s (ROGUE): Cast 0 Tricks", pName), severity = 3 })
                         end
-                    elseif tricks == 0 then
-                        dutyFailCount = dutyFailCount + 1
-                        table.insert(lines, string.format("  - %s (ROGUE): Cast 0 Tricks of the Trade", pName))
-                    end
-                end
-            end
-
-            for _, pName in ipairs(presentList) do
-                if presentMap[pName] == "HUNTER" then
-                    local uEntries = (seg.raidUtility and seg.raidUtility[pName]) or {}
-                    local mdCasts = CountPlayerSpellUsage(uEntries, "Misdirection")
-                    local tranqCasts = CountPlayerSpellUsage(uEntries, "Tranquilizing Shot")
-                    if maxPossible30s > 0 then
-                        if mdCasts < maxPossible30s then
-                            dutyFailCount = dutyFailCount + 1
-                            table.insert(lines, string.format("  - %s (HUNTER): Cast %d Misdirection in %s (%d possible on 30s CD)", pName, mdCasts, durLabel, maxPossible30s))
+                    elseif pClass == "HUNTER" then
+                        local mdCasts = CountPlayerSpellUsage(uEntries, "Misdirection")
+                        local tranqCasts = CountPlayerSpellUsage(uEntries, "Tranquilizing Shot")
+                        if maxPossible30s > 0 and mdCasts < math.max(1, math.floor(maxPossible30s / 2)) then
+                            table.insert(cdFails, { text = string.format("- %s (HUNTER): Cast %d Misdirection in %s", pName, mdCasts, durLabel), severity = 3 })
                         end
-                    elseif mdCasts == 0 then
-                        dutyFailCount = dutyFailCount + 1
-                        table.insert(lines, string.format("  - %s (HUNTER): Cast 0 Misdirection", pName))
+                        if totalEnrages > 0 and tranqCasts == 0 then
+                            table.insert(cdFails, { text = string.format("- %s (HUNTER): 0 Tranq Shots used (%s)", pName, enrageStr), severity = 5 })
+                        end
                     end
-                    if totalEnrages > 0 and tranqCasts == 0 then
-                        dutyFailCount = dutyFailCount + 1
-                        table.insert(lines, string.format("  - %s (HUNTER): 0 Tranquilizing Shots used (%s)", pName, enrageStr))
+                    if detectedTanks[pName] then
+                        local tankCDCount = CountMajorTankCooldowns(seg, pName)
+                        if tankCDCount == 0 then
+                            table.insert(cdFails, { text = string.format("- %s (%s - TANK): Used 0 major tank cooldowns", pName, pClass or "TANK"), severity = 5 })
+                        end
                     end
-                end
-            end
-
-            for _, pName in ipairs(presentList) do
-                if detectedTanks[pName] then
-                    local pClass = presentMap[pName] or "WARRIOR"
-                    local tankCDCount = CountMajorTankCooldowns(seg, pName)
-                    if tankCDCount == 0 then
-                        dutyFailCount = dutyFailCount + 1
-                        table.insert(lines, string.format("  - %s (%s - TANK): Used 0 major tank defensive cooldowns", pName, pClass))
+                    local totalU = 0
+                    for _, c in pairs(uEntries) do totalU = totalU + (tonumber(c) or 0) end
+                    if totalU == 0 then
+                        table.insert(cdFails, { text = string.format("- %s (%s): 0 total utility casts", pName, pClass or "RAIDER"), severity = 2 })
                     end
                 end
-            end
 
-            local zeroUtilPlayers = {}
-            for _, pName in ipairs(presentList) do
-                local uEntries = (seg.raidUtility and seg.raidUtility[pName]) or {}
-                local totalU = 0
-                for _, c in pairs(uEntries) do totalU = totalU + (tonumber(c) or 0) end
-                if totalU == 0 then
-                    table.insert(zeroUtilPlayers, string.format("%s (%s)", pName, presentMap[pName] or "WARRIOR"))
-                end
-            end
-            if #zeroUtilPlayers > 0 then
-                dutyFailCount = dutyFailCount + #zeroUtilPlayers
-                for _, zStr in ipairs(zeroUtilPlayers) do
-                    table.insert(lines, string.format("  - %s: 0 total utility spell casts across the encounter", zStr))
-                end
-            end
+                table.sort(cdFails, function(a, b) return a.severity > b.severity end)
 
-            if dutyFailCount == 0 then
-                table.insert(lines, "  - None")
+                if #cdFails == 0 then
+                    table.insert(lines, "None (No critical cooldown or duty fails recorded)")
+                else
+                    local count = math.min(#cdFails, failLineLimit)
+                    for idx = 1, count do
+                        table.insert(lines, cdFails[idx].text)
+                    end
+                end
             end
 
             currentRaidChatLines = lines
             currentPreviewText = table.concat(lines, "\n")
 
         -----------------------------------------------------------------------
-        -- PANEL 4: REPORT SUSPICIOUS DEATHS
+        -- PANEL 4: REPORT SUSPICIOUS DEATHS (Wipe Filtered)
         -----------------------------------------------------------------------
         elseif activeReportPanel == "DEATHS" then
             local lines = BuildStandardRaidHeaderLines(seg)
             table.insert(lines, "--- Chronological Suspicious Deaths Breakdown ---")
+            local allSegDeaths = {}
+            for _, dList in pairs(seg.deaths or {}) do
+                for _, d in ipairs(dList or {}) do table.insert(allSegDeaths, d) end
+            end
+
             local allDeaths = {}
             for pName, dList in pairs(seg.deaths or {}) do
                 local pClass = presentMap[pName] or string.upper(GetSafePlayerClass(pName))
                 for _, d in ipairs(dList or {}) do
-                    if not IsFuryOfFrostmourneDeath(d) then
+                    if not IsWipeDeath(d, allSegDeaths) then
                         table.insert(allDeaths, {
                             name = pName,
                             class = pClass,
@@ -3533,17 +3582,17 @@ local function CreateReportFrame()
             end)
 
             if #allDeaths == 0 then
-                table.insert(lines, "  - No suspicious player deaths recorded in this segment.")
+                table.insert(lines, "No suspicious player deaths recorded in this segment.")
             else
                 for idx, d in ipairs(allDeaths) do
                     local pullStr = FormatPullTime(d.pullTime)
                     local timeTag = pullStr and string.format("%s into pull / %s", pullStr, d.time) or d.time
-                    local dmgText = (d.amount > 0) and string.format("%d dmg", d.amount) or "Fatal Effect"
+                    local dmgText = (d.amount > 0) and string.format("%d dmg", amount) or "Fatal Effect"
                     if d.overkill > 0 then dmgText = string.format("%d dmg (%d overkill)", d.amount, d.overkill) end
                     local unusedDef = GetUnusedPersonalDefensives(seg, d.name, d.class)
                     local unusedStr = (#unusedDef > 0) and table.concat(unusedDef, ", ") or "None unused"
                     table.insert(lines, string.format(
-                        "  %d. [%s] %s (%s) -> Killed by %s / Ability: %s / Damage: %s / Unused Defensives: %s",
+                        "%d. [%s] %s (%s) -> Killed by %s / Ability: %s / Damage: %s / Unused Defensives: %s",
                         idx, timeTag, d.name, d.class, d.killer, d.ability, dmgText, unusedStr
                     ))
                 end
@@ -3565,6 +3614,10 @@ local function CreateReportFrame()
     btnPanelChar:SetScript("OnClick", function() activeReportPanel = "CHAR"; GenerateReport() end)
     btnPanelFails:SetScript("OnClick", function() activeReportPanel = "FAILS"; GenerateReport() end)
     btnPanelDeaths:SetScript("OnClick", function() activeReportPanel = "DEATHS"; GenerateReport() end)
+
+    btnFailEarly:SetScript("OnClick", function() activeFailSubMode = "EARLY"; GenerateReport() end)
+    btnFailSlack:SetScript("OnClick", function() activeFailSubMode = "SLACKERS"; GenerateReport() end)
+    btnFailCds:SetScript("OnClick", function() activeFailSubMode = "FAILS"; GenerateReport() end)
 
     chkPlain:SetScript("OnClick", function()
         activeAllFormat = "PLAIN"
