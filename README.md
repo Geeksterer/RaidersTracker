@@ -2,7 +2,7 @@
 
 **Raiders Tracker** (v1.2.2 by Copper) is an all-in-one raid performance, utility, consumable, fail-analysis, and death-tracking addon built specifically for **World of Warcraft: Wrath of the Lich King (3.3.5a)**.
 
-Leading a 10-man or 25-man raid takes enough focus without having to dig through raw combat logs mid-run to see who pre-potted, whether a tank used a defensive cooldown, which Rogue slacked on Tricks of the Trade, which Hunter missed a Tranquilizing Shot, or what actually killed someone on a wipe. **Raiders Tracker** automatically segments your raid into Trash and Boss pulls, snapshots your roster's buffs, and organizes potions, procs, class utility, raid fails, and detailed death logs into clean in-game panels—complete with a 4-panel **Report Segment Hub** featuring throttled **Raid Chat** broadcasting, **Discord Markdown**, and **HTML Export**.
+Leading a 10-man or 25-man raid takes enough focus without having to dig through raw combat logs mid-run to see who pre-potted, whether a tank used a defensive cooldown, which Rogue slacked on Tricks of the Trade, which Hunter missed a Tranquilizing Shot, or what actually killed someone on a wipe. **Raiders Tracker** automatically segments your raid into Trash and Boss pulls, snapshots your roster's buffs, and organizes potions, procs, class utility, raid fails, and detailed death logs into clean in-game panels—complete with a 4-panel **Report Segment Hub** featuring throttled **Raid Chat** broadcasting, **Discord Markdown**, and **HTML Export**, plus an advanced **Player Blacklist System** with permanent character ID fingerprinting.
 
 ---
 
@@ -11,24 +11,44 @@ Leading a 10-man or 25-man raid takes enough focus without having to dig through
 ### 1. Potions, Consumables, Buffs & Procs (`1. Potions and Buffs`)
 See exactly who is showing up prepared and maximizing their character on every pull:
 - **Pre-Pots & Combat Consumables:** Tracks Potion of Speed, Potion of Wild Magic, Indestructible Potion, Haste Potion, Destruction Potion, Insane Strength Potion, Powerful Rejuvenation Potion, Flame Cap, Thistle Tea, Runic Mana/Healing Potions & Injectors, Fel/Master Healthstones, and Mana Sapphires/Emeralds.
+
 - **Automatic Boss Pull Buff Snapshotting:** The moment a boss is engaged, the addon scans the raid and snapshots persistent Flasks (Frost Wyrm, Endless Rage, Stoneblood, Pure Mojo, Lesser Flask of Toughness, Flask of the North SP/AP/STR, Distilled Wisdom), Battle & Guardian Elixirs, and Well Fed food buffs (including Fish Feasts).
+
 - **5-Second Pre-Pull Capture:** Any potions, buffs, or utility spells used within **5 seconds before boss engage** are automatically migrated out of the `TRASH` segment and credited directly to the Boss encounter segment.
+
 - **External Buffs Received (with Caster Attribution):** Displays who received Bloodlust, Heroism, Power Infusion, Hysteria, Tricks of the Trade (+15% Dmg), Innervate, Focus Magic, Pain Suppression, Guardian Spirit, Hand of Sacrifice, Hand of Protection, Hand of Salvation, Hand of Freedom, Divine Sacrifice, Divine Guardian, Aura Mastery, and Fear Ward—along with the class-colored name of the player who cast it on them.
+
 - **Trinket, Ring, Profession & Enchant Procs:** Tracks procs from ICC Ashen Band rings, Engineering/Tailoring tinkers (Hyperspeed Accelerators, Flexweave Underlay, Lightweave/Swordguard/Darkglow Embroidery), weapon enchants (Berserking, Black Magic, Blade Ward, Blood Draining, Mongoose, Executioner), and Normal/Heroic WotLK raid trinkets—including all 6 distinct **Deathbringer's Will (N/HC)** transformation buffs, DFO, Phylactery, CTS, STS, Twilight Scales, Whispering Fanged Skull, Tiny Abomination, Death's Choice/Verdict, Satrina's/Juggernaut's Vitality, Talisman of Resurgence, Comet's Trail, Greatness, Mjolnir Runestone, Grim Toll, Flare of the Heavens, Pandora's Plea, Eye of the Broodmother, Muradin's Spyglass, Purified Lunar Dust, Althor's Abacus, Trauma, and Needle-Encrusted Scorpion.
+
 
 ### 2. Raid Utility, Cooldowns & Interrupts (`2. Raid Utility`)
 Verify whether your raiders are using their class toolkit to help the group survive mechanics:
 - **Full 10-Class Utility Coverage:** Tracks tank and personal defensive cooldowns (Shield Wall, Last Stand, Enraged Regeneration, Icebound Fortitude, Vampiric Blood, Unbreakable Armor, Bone Shield, Anti-Magic Shell/Zone, Divine Protection, Divine Shield, Barkskin, Survival Instincts, Frenzied Regeneration, Dispersion, Fade, Ice Block, Deterrence, Feign Death, Cloak of Shadows, Feint, Evasion, Shamanistic Rage), raid cooldowns (Divine Sacrifice, Divine Guardian, Aura Mastery, Tranquility, Divine Hymn, Hymn of Hope, Mana Tide Totem), interrupts (Kick, Pummel, Shield Bash, Mind Freeze, Strangulate, Wind Shear, Counterspell, Spell Lock), dispels/cleanses, taunts, and threat drops.
+
 - **Targeted Utility Attribution:** When a raider casts an external spell on another member—such as **Rebirth**, **Soulstone Resurrection**, **Raise Ally**, **Tricks of the Trade**, **Misdirection**, **Innervate**, **Hand of Protection/Salvation/Freedom/Sacrifice**, **Lay on Hands**, **Sacred Shield**, **Pain Suppression**, **Guardian Spirit**, **Power Infusion**, **Hysteria**, **Fear Ward**, **Focus Magic**, **Vigilance**, **Intervene**, **Master's Call**, **Roar of Sacrifice**, **Slow Fall**, **Power Word: Shield**, or dispels/cleanses—the log shows the exact class-colored target they cast it on.
+
 - **Engineering Explosives & Utility:** Tracks Global Thermal Sapper Charges, Saronite Bombs, Frag Belt, and Nitro Boosts.
+
 
 ### 3. Raid Deaths & Detailed Death Logs (`Deaths` & `Death Log`)
 Stop guessing what caused a wipe or why a player died:
 - **Session or Segment Death Rankings:** View a ranked list of player deaths sorted from highest to lowest across either **All Session Segments** or the **Selected Segment** (automatically ignoring Hunter Feign Death).
+
 - **Combat-Elapsed Pull Timestamps & Overkill Tracking:** Click **Death Log** next to any player's name to see the exact combat-elapsed pull time (e.g., `+00:48 into pull`) alongside wall-clock time, segment name, killer (mob or environment), ability name, fatal damage amount, and overkill damage.
+
 - **Smart Lich King RP Filtering:** Automatically recognizes The Lich King's 10% **Fury of Frostmourne** scripted raid wipe so mandatory RP deaths are never flagged as player mistakes in suspicious death or raid fail reports.
 
-### 4. Multi-Panel Reporting Hub & Anti-Spam Raid Chat Queue (`Report Seg`)
+
+### 4. Player Blacklist & Character ID Fingerprinting (`Blacklist` & `Characters`)
+Track and screen problem raiders across name changes:
+- **Persistent Character ID Fingerprinting:** The addon extracts the unique numeric character ID component from player GUIDs. Because this ID stays permanently tied to the character across realm transfers and renames, blacklisting a player tracks them regardless of any future name changes.
+- **Multi-Name & Class History:** The blacklist database records all known names encountered for a given character ID (displaying them as a comma-separated history list, e.g., *Names: Distordark, Kittyscratch*), alongside their character class, category reason, and timestamp.
+- **Categorized Blacklist Reasons:** When blacklisting any raider from the **Characters** panel, you can specify one of seven strict moderation categories: **`leaver`**, **`bad dps`**, **`unskilled`**, **`ninja`**, **`ninja pulls`**, **`low gs`**, or **`afk bot`**.
+- **Real-Time Group Join Warnings:** Whenever you join a party or raid, or when roster changes occur, the addon automatically scans group members against your blacklist and posts an immediate warning alert directly to your default chat box if a blacklisted player is detected.
+- **Dedicated Blacklist Management Panel:** Access the Blacklist hub directly from the Main Tracker window to review all blacklisted character IDs, alias histories, classes, and reasons, with a one-click **Remove** button.
+
+
+### 5. Multi-Panel Reporting Hub & Anti-Spam Raid Chat Queue (`Report Seg`)
 Click **`Report Seg`** to open the 4-view Reporting Hub. Every view includes a read-only preview box and a **`Send to Raid`** button powered by an anti-spam message queue (`~0.20s` per line, auto-stripping color codes and wrapping lines over 255 characters so you never get disconnected for chat flooding):
 
 1. **`1. Report ALL Data` Panel:**
@@ -51,12 +71,17 @@ Click **`Report Seg`** to open the 4-view Reporting Hub. Every view includes a r
 4. **`4. Suspicious Deaths` Panel:**
    - Generates a dedicated chronological death breakdown for raid chat showing pull-elapsed timestamp, clock time, player name + class, killing mob, ability, fatal damage + overkill, and unused personal defensive cooldowns.
 
-### 5. Automatic WotLK Boss Detection, Session Archiving & Roster Tools
+### 6. Automatic WotLK Boss Detection, Session Archiving & Roster Tools
 - **All WotLK Raids Supported:** Built-in boss engage and victory detection (via Boss Yells/Emotes and Combat Log verification) for **Icecrown Citadel (ICC)** (including Valithria Dreamwalker 100% heal detection and full Lich King 10% Tirion Fordring RP support), **The Ruby Sanctum (RS)** (Halion plus mini-bosses Baltharus, Saviana, and Zarithrian), **Trial of the Crusader / ToGC** (including Northrend Beasts and all 28 Horde/Alliance Faction Champions), **Ulduar**, **Naxxramas**, **Vault of Archavon (VoA)**, **The Eye of Eternity**, **The Obsidian Sanctuary**, and **Onyxia's Lair**.
+
 - **Dynamic Difficulty & Duration Labels:** Automatically detects **10N, 10HC, 25N, 25HC, 5N, and 5HC** difficulties in real time, numbers each pull (`[Attempt 1]`), stores exact fight durations, and updates the segment with the final outcome (`[Victory - 4m 12s]` or `[Wipe 1 - 2m 45s]`).
+
 - **False-Pull Protection:** Non-victory boss pulls or resets that end in under 25 seconds or before combat starts are automatically purged to keep your segment dropdown clean.
-- **Group Join Refresh Prompt & Session Archiving:** Joining a new party or raid prompts you to refresh the **Live Current Session** while preserving all of your **Saved Sessions** until you explicitly click **Delete All Sessions** in Config.
-- **Session Characters & Quick Whisper (`Characters`):** View an alphabetical, class-colored list of every player recorded in the active session with a one-click **Whisper** button beside each name.
+
+- **Group Join Refresh Prompt & Session Archiving:** Joining a new party or raid prompts you to refresh the **Live Current Session** while preserving all of your **Saved Sessions** and your persistent **Player Blacklist** until you explicitly click **Delete All Sessions** (which preserves the blacklist) or **Clear Blacklist** in Config[cite: 1, 6].
+
+- **Session Characters & Quick Whisper (`Characters`):** View an alphabetical, class-colored list of every player recorded in the active session with one-click **Blacklist** and **Whisper** buttons beside each name.
+
 
 ---
 
@@ -67,14 +92,14 @@ You can download **Raiders Tracker** in one of two ways from this GitHub reposit
 
 - **Option A — From the Releases Section (Recommended):**
   1. Look for the **Releases** section on the right-hand sidebar of this GitHub page.
-  2. Click on the latest release (`v1.2.0`) and download the attached `.zip` file.
+  2. Click on the latest release (`v1.2.2`) and download the attached `.zip` file.
 - **Option B — Using the Green Code Button:**
   1. Click the green **`<> Code`** button near the top-right of this page.
   2. Select **Download ZIP** from the dropdown menu.
 
 ### 2. Install in Your WoW AddOns Folder
 1. Open the downloaded `.zip` file and extract the addon folder.
-2. Make sure the folder is named **`RaidersTracker`** (if you downloaded via the green **Code** button, GitHub appends `-main` or `-master` to the folder name— there is a folder inside the zip that has the addon name - place that in your AddOns folder).
+2. Make sure the folder is named **`RaidersTracker`** (if you downloaded via the green **Code** button, GitHub appends `-main` or `-master` to the folder name—extract the inner folder and rename it to `RaidersTracker`).
 3. Move the folder into your World of Warcraft 3.3.5a `AddOns` directory:
    ```text
    World of Warcraft\Interface\AddOns\RaidersTracker
@@ -88,7 +113,7 @@ You can download **Raiders Tracker** in one of two ways from this GitHub reposit
 
 - **Minimap Button:**
   * **Left-Click:** Toggle the Main Tracker window.
-  * **Right-Click:** Toggle the Config window (enable/disable recording, reset panel positions, or delete all saved sessions).
+  * **Right-Click:** Toggle the Config window (enable/disable recording, reset panel positions, delete session data [which preserves the blacklist], or clear blacklist)[cite: 1, 6].
   * **Left-Click + Drag:** Move the minimap icon around the edge of your minimap.
 - **Chat Slash Commands:**
   * **`/rt`** or **`/raiderstracker`** — Toggle the Main Tracker window.
@@ -101,4 +126,5 @@ You can download **Raiders Tracker** in one of two ways from this GitHub reposit
 **Raiders Tracker** is actively maintained for the 3.3.5a raiding community, and feedback from Raid Leaders, officers, and raiders is always welcome!
 
 - **Found a Bug?** If an encounter transition, consumable, proc, fail check, or death log entry doesn't record as expected—or if you run into a Lua error—please open an issue in the **[Issues](../../issues)** tab at the top of this page. Let us know what raid/difficulty you were in and what happened.
+
 - **Have an Idea to Improve the Addon?** If there is a specific spell, trinket proc, consumable, or raid-leading feature you'd like to see added in a future update, submit a feature request in the **[Issues](../../issues)** tab!
