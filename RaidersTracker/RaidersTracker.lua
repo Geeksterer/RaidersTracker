@@ -7,7 +7,7 @@ local AUTHOR = "Copper"
 local GITHUB_URL = "https://github.com/Geeksterer/RaidersTracker/"
 
 local function GetAddonVersion()
-    return GetAddOnMetadata("RaidersTracker", "Version") or ""
+    return GetAddOnMetadata("RaidersTracker", "Version") or "1.2.0"
 end
 
 local function GetFooterText()
@@ -21,7 +21,8 @@ local defaultDB = {
     enabled = true,
     minimapPos = 45,
     savedSessions = {},
-    liveSession = { name = "Live Current Session", segments = {}, players = {} }
+    liveSession = { name = "Live Current Session", segments = {}, players = {} },
+    blacklist = {} -- [charID] = { names = {["Name"] = true}, class = string, reason = string, timestamp = string }
 }
 
 RaidersTrackerDB = RaidersTrackerDB or {}
@@ -113,11 +114,14 @@ local function InitializeDB()
         if RaidersTrackerDB[k] == nil then
             if k == "liveSession" then
                 RaidersTrackerDB.liveSession = { name = "Live Current Session", segments = {}, players = {} }
+            elseif k == "blacklist" then
+                RaidersTrackerDB.blacklist = {}
             else
                 RaidersTrackerDB[k] = DeepCopyTable(v)
             end
         end
     end
+    RaidersTrackerDB.blacklist = RaidersTrackerDB.blacklist or {}
     RaidersTrackerDB.lastCharacter = nil
     currentSession = RaidersTrackerDB.liveSession
     currentSession.players = currentSession.players or {}
@@ -275,6 +279,7 @@ end
 local groupMembers = {}
 local groupClasses = {}
 local groupGUIDs = {}
+local groupGUIDToName = {}
 
 local function IsPlayerGUID(guid)
     if not guid or type(guid) ~= "string" then return true end
@@ -282,14 +287,36 @@ local function IsPlayerGUID(guid)
     return true
 end
 
+local function ExtractCharacterID(guid)
+    if not guid or type(guid) ~= "string" then return nil end
+    local clean = guid:gsub("^0[xX]", "")
+    if #clean >= 12 then
+        local idHex = clean:sub(-8)
+        local num = tonumber(idHex, 16)
+        if num then return tostring(num) end
+    end
+    local numDec = tonumber(clean, 16)
+    if numDec then return tostring(numDec) end
+    return guid
+end
+
 local function UpdateGroupCache()
     table.wipe(groupMembers)
     table.wipe(groupGUIDs)
+    table.wipe(groupGUIDToName)
     local pName = UnitName("player")
     if pName and pName ~= UNKNOWN then
         groupMembers[pName] = true
         local pGUID = UnitGUID("player")
-        if pGUID then groupGUIDs[pGUID] = pName end
+        if pGUID then
+            local charID = ExtractCharacterID(pGUID)
+            if charID then
+                groupGUIDs[charID] = pName
+                groupGUIDToName[charID] = pName
+            end
+            groupGUIDs[pGUID] = pName
+            groupGUIDToName[pGUID] = pName
+        end
         local _, engClass = UnitClass("player")
         if engClass then groupClasses[pName] = engClass end
     end
@@ -301,7 +328,15 @@ local function UpdateGroupCache()
             if name and name ~= UNKNOWN then
                 groupMembers[name] = true
                 local uGUID = UnitGUID(unit)
-                if uGUID then groupGUIDs[uGUID] = name end
+                if uGUID then
+                    local charID = ExtractCharacterID(uGUID)
+                    if charID then
+                        groupGUIDs[charID] = name
+                        groupGUIDToName[charID] = name
+                    end
+                    groupGUIDs[uGUID] = name
+                    groupGUIDToName[uGUID] = name
+                end
                 local _, engClass = UnitClass(unit)
                 if engClass then groupClasses[name] = engClass end
             end
@@ -315,7 +350,15 @@ local function UpdateGroupCache()
                 if name and name ~= UNKNOWN then
                     groupMembers[name] = true
                     local uGUID = UnitGUID(unit)
-                    if uGUID then groupGUIDs[uGUID] = name end
+                    if uGUID then
+                        local charID = ExtractCharacterID(uGUID)
+                        if charID then
+                            groupGUIDs[charID] = name
+                            groupGUIDToName[charID] = name
+                        end
+                        groupGUIDs[uGUID] = name
+                        groupGUIDToName[uGUID] = name
+                    end
                     local _, engClass = UnitClass(unit)
                     if engClass then groupClasses[name] = engClass end
                 end
@@ -327,6 +370,11 @@ end
 local function IsGroupMember(name, guid)
     if not name or not IsPlayerGUID(guid) then return false end
     if groupMembers[name] then return true end
+    local charID = ExtractCharacterID(guid)
+    if charID and groupGUIDs[charID] then
+        groupMembers[name] = true
+        return true
+    end
     if guid and groupGUIDs[guid] then
         groupMembers[name] = true
         return true
@@ -376,7 +424,7 @@ local function IsRaidInCombat()
 end
 
 local function GetNPCIDFromGUID(guid)
-    if not guid or type(guid) ~= "string" or #guid < 12 then return nil end
+    if not guid or type(guid) ~= "string" #guid < 12 then return nil end
     local prefix = guid:sub(1, 5):upper()
     if prefix == "0XF13" or prefix == "0XF15" or prefix == "0XF53" or prefix == "0XF55" then
         return tonumber(guid:sub(7, 12), 16)
@@ -407,6 +455,38 @@ end
 local function GetPlayerClassColor(className)
     if not className then return "FFFFFF" end
     return CLASS_COLORS[string.upper(className)] or "FFFFFF"
+end
+
+-------------------------------------------------------------------------------
+-- Blacklist & Character ID History Engine
+-------------------------------------------------------------------------------
+local sessionWarnedIDs = {}
+
+local function CheckGroupBlacklist()
+    if not RaidersTrackerDB or not RaidersTrackerDB.blacklist then return end
+    UpdateGroupCache()
+    for idKey, name in pairs(groupGUIDToName) do
+        if RaidersTrackerDB.blacklist[idKey] then
+            local entry = RaidersTrackerDB.blacklist[idKey]
+            -- Track newly encountered names under this ID
+            if name and name ~= "" then
+                entry.names = entry.names or {}
+                entry.names[name] = true
+            end
+            if not sessionWarnedIDs[idKey] then
+                sessionWarnedIDs[idKey] = true
+                local nameList = {}
+                for n in pairs(entry.names or {}) do table.insert(nameList, n) end
+                table.sort(nameList)
+                local namesStr = table.concat(nameList, ", ")
+                local classStr = entry.class and (" (" .. entry.class .. ")") or ""
+                local warnMsg = string.format("[Raiders Tracker] WARNING: Blacklisted player joined group! [ID: %s] Names: %s%s - Reason: %s", idKey, namesStr, classStr, entry.reason or "Unknown")
+                if DEFAULT_CHAT_FRAME then
+                    DEFAULT_CHAT_FRAME:AddMessage("|cffFF0000" .. warnMsg .. "|r")
+                end
+            end
+        end
+    end
 end
 
 -------------------------------------------------------------------------------
@@ -1767,6 +1847,7 @@ local CharacterFrame = nil
 local ReportFrame = nil
 local DeathsFrame = nil
 local DeathLogFrame = nil
+local BlacklistFrame = nil
 local MinimapButton = nil
 local activeCustomMenus = {}
 
@@ -1780,6 +1861,7 @@ local selectedDeathPlayer = nil
 local RefreshDeathsView = function() end
 local RefreshDeathLogView = function() end
 local RefreshCharactersView = function() end
+local RefreshBlacklistView = function() end
 
 local function WipeLiveSessionOnly()
     selectedSessionIndex = 0
@@ -1791,6 +1873,7 @@ local function WipeLiveSessionOnly()
     RefreshCharactersView()
     RefreshDeathsView()
     RefreshDeathLogView()
+    RefreshBlacklistView()
     AnnounceLocalChat("Live Current Session refreshed (Saved Sessions preserved).")
 end
 
@@ -1805,7 +1888,8 @@ local function WipeAllSessionsAndData()
     RefreshCharactersView()
     RefreshDeathsView()
     RefreshDeathLogView()
-    AnnounceLocalChat("All sessions (saved and live), deaths, and saved characters cleared.")
+    RefreshBlacklistView()
+    AnnounceLocalChat("All encounter sessions and recorded data cleared (Blacklist preserved).")
 end
 
 local function HideAllCustomDropdownMenus()
@@ -1829,10 +1913,11 @@ local function CloseAllPanels()
     if ReportFrame then ReportFrame:Hide() end
     if DeathsFrame then DeathsFrame:Hide() end
     if DeathLogFrame then DeathLogFrame:Hide() end
+    if BlacklistFrame then BlacklistFrame:Hide() end
 end
 
 local function ResetAllPanelPositions()
-    local panels = { MainTrackerFrame, ConfigFrame, CharacterFrame, ReportFrame, DeathsFrame, DeathLogFrame }
+    local panels = { MainTrackerFrame, ConfigFrame, CharacterFrame, ReportFrame, DeathsFrame, DeathLogFrame, BlacklistFrame }
     for _, frame in ipairs(panels) do
         if frame then
             frame:ClearAllPoints()
@@ -2203,36 +2288,42 @@ local function CreateMainTrackerFrame()
     btnNextPage:SetText(">")
 
     local btnReport = CreateFrame("Button", nil, MainTrackerFrame, "UIPanelButtonTemplate")
-    btnReport:SetSize(105, 24)
+    btnReport:SetSize(90, 24)
     btnReport:SetPoint("LEFT", btnNextPage, "RIGHT", 10, 0)
     btnReport:SetText("Report Seg")
     btnReport:SetScript("OnClick", function() CloseAllPanels(); ReportFrame:Show() end)
 
+    local btnBlacklistHub = CreateFrame("Button", nil, MainTrackerFrame, "UIPanelButtonTemplate")
+    btnBlacklistHub:SetSize(85, 24)
+    btnBlacklistHub:SetPoint("LEFT", btnReport, "RIGHT", 6, 0)
+    btnBlacklistHub:SetText("Blacklist")
+    btnBlacklistHub:SetScript("OnClick", function() CloseAllPanels(); BlacklistFrame:Show() end)
+
     local btnCharacters = CreateFrame("Button", nil, MainTrackerFrame, "UIPanelButtonTemplate")
-    btnCharacters:SetSize(110, 22)
+    btnCharacters:SetSize(100, 22)
     btnCharacters:SetPoint("TOPLEFT", MainTrackerFrame, "TOPLEFT", 18, -103)
     btnCharacters:SetText("Characters")
     btnCharacters:SetScript("OnClick", function() CloseAllPanels(); CharacterFrame:Show() end)
 
     local btnSaveSession = CreateFrame("Button", nil, MainTrackerFrame, "UIPanelButtonTemplate")
-    btnSaveSession:SetSize(110, 22)
-    btnSaveSession:SetPoint("LEFT", btnCharacters, "RIGHT", 8, 0)
+    btnSaveSession:SetSize(100, 22)
+    btnSaveSession:SetPoint("LEFT", btnCharacters, "RIGHT", 6, 0)
     btnSaveSession:SetText("Save Session")
 
     local btnDeleteSeg = CreateFrame("Button", nil, MainTrackerFrame, "UIPanelButtonTemplate")
-    btnDeleteSeg:SetSize(100, 22)
-    btnDeleteSeg:SetPoint("LEFT", btnSaveSession, "RIGHT", 8, 0)
+    btnDeleteSeg:SetSize(90, 22)
+    btnDeleteSeg:SetPoint("LEFT", btnSaveSession, "RIGHT", 6, 0)
     btnDeleteSeg:SetText("Delete Seg")
 
     local btnConfig = CreateFrame("Button", nil, MainTrackerFrame, "UIPanelButtonTemplate")
-    btnConfig:SetSize(95, 22)
-    btnConfig:SetPoint("LEFT", btnDeleteSeg, "RIGHT", 8, 0)
+    btnConfig:SetSize(85, 22)
+    btnConfig:SetPoint("LEFT", btnDeleteSeg, "RIGHT", 6, 0)
     btnConfig:SetText("Config")
     btnConfig:SetScript("OnClick", function() CloseAllPanels(); ConfigFrame:Show() end)
 
     local btnDeaths = CreateFrame("Button", nil, MainTrackerFrame, "UIPanelButtonTemplate")
-    btnDeaths:SetSize(95, 22)
-    btnDeaths:SetPoint("LEFT", btnConfig, "RIGHT", 8, 0)
+    btnDeaths:SetSize(85, 22)
+    btnDeaths:SetPoint("LEFT", btnConfig, "RIGHT", 6, 0)
     btnDeaths:SetText("Deaths")
     btnDeaths:SetScript("OnClick", function() CloseAllPanels(); DeathsFrame:Show() end)
 
@@ -2421,6 +2512,111 @@ local function CreateMainTrackerFrame()
         EnsureTrashSegment()
         RefreshMainView()
     end)
+end
+
+-------------------------------------------------------------------------------
+-- Blacklist Panel Implementation (With ID Fingerprint & Name History)
+-------------------------------------------------------------------------------
+local function CreateBlacklistFrame()
+    BlacklistFrame = CreateRUTPanel("RTBlacklistFrame", 620, 480, "Player Blacklist")
+
+    local btnBack = CreateFrame("Button", nil, BlacklistFrame, "UIPanelButtonTemplate")
+    btnBack:SetSize(130, 24)
+    btnBack:SetPoint("BOTTOM", BlacklistFrame, "BOTTOM", 0, 14)
+    btnBack:SetText("Back to Tracker")
+    btnBack:SetScript("OnClick", function() CloseAllPanels(); MainTrackerFrame:Show() end)
+
+    local viewBox = CreateWhiteBorderViewBox(BlacklistFrame, -42, 46)
+
+    local scrollFrame = CreateFrame("ScrollFrame", "RTBlacklistScrollFrame", viewBox, "UIPanelScrollFrameTemplate")
+    scrollFrame:SetPoint("TOPLEFT", viewBox, "TOPLEFT", 8, -8)
+    scrollFrame:SetPoint("BOTTOMRIGHT", viewBox, "BOTTOMRIGHT", -28, 8)
+
+    local scrollContent = CreateFrame("Frame", nil, scrollFrame)
+    scrollContent:SetSize(540, 350)
+    scrollFrame:SetScrollChild(scrollContent)
+
+    local emptyLabel = scrollContent:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    emptyLabel:SetPoint("TOPLEFT", scrollContent, "TOPLEFT", 8, -8)
+    emptyLabel:SetText("|cff999999No players currently blacklisted.|r")
+    emptyLabel:Hide()
+
+    local rows = {}
+    for i = 1, 100 do
+        local row = CreateFrame("Frame", nil, scrollContent)
+        row:SetSize(540, 42)
+        row:SetPoint("TOPLEFT", scrollContent, "TOPLEFT", 4, -((i - 1) * 42) - 4)
+
+        local text = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+        text:SetPoint("TOPLEFT", row, "TOPLEFT", 6, -2)
+        text:SetPoint("RIGHT", row, "RIGHT", -90, 0)
+        text:SetJustifyH("LEFT")
+        text:SetWordWrap(true)
+
+        local btnRemove = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
+        btnRemove:SetSize(75, 22)
+        btnRemove:SetPoint("RIGHT", row, "RIGHT", -6, 0)
+        btnRemove:SetText("Remove")
+        btnRemove:RegisterForClicks("LeftButtonUp")
+        btnRemove:SetScript("OnClick", function(self)
+            if self.targetID and RaidersTrackerDB.blacklist then
+                RaidersTrackerDB.blacklist[self.targetID] = nil
+                AnnounceLocalChat("Removed player from blacklist.")
+                RefreshBlacklistView()
+            end
+        end)
+
+        row.text = text
+        row.btnRemove = btnRemove
+        row:Hide()
+        rows[i] = row
+    end
+
+    RefreshBlacklistView = function()
+        if not BlacklistFrame or not BlacklistFrame:IsShown() then return end
+        RaidersTrackerDB.blacklist = RaidersTrackerDB.blacklist or {}
+
+        local list = {}
+        for charID, info in pairs(RaidersTrackerDB.blacklist) do
+            local nameList = {}
+            if info.names then
+                for n in pairs(info.names) do table.insert(nameList, n) end
+                table.sort(nameList)
+            elseif info.name then
+                table.insert(nameList, info.name)
+            end
+            local namesStr = (#nameList > 0) and table.concat(nameList, ", ") or "Unknown"
+            local classStr = info.class and (" (" .. info.class .. ")") or ""
+            table.insert(list, {
+                id = charID,
+                namesStr = namesStr,
+                classStr = classStr,
+                reason = info.reason or "Unspecified",
+                date = info.timestamp or ""
+            })
+        end
+        table.sort(list, function(a, b) return a.namesStr < b.namesStr end)
+
+        if #list == 0 then
+            for i = 1, 100 do rows[i]:Hide() end
+            emptyLabel:Show()
+            scrollContent:SetHeight(340)
+            return
+        end
+
+        emptyLabel:Hide()
+        local shownCount = math.min(#list, 100)
+        for idx = 1, shownCount do
+            local item = list[idx]
+            rows[idx].text:SetText(string.format("ID: |cff00FF00[%s]|r Names: |cffFF4444%s|r%s\nReason: |cffFFD100%s|r (%s)", item.id, item.namesStr, item.classStr, item.reason, item.date))
+            rows[idx].btnRemove.targetID = item.id
+            if not rows[idx]:IsShown() then rows[idx]:Show() end
+        end
+        for idx = shownCount + 1, 100 do rows[idx]:Hide() end
+        scrollContent:SetHeight(math.max(340, shownCount * 42 + 12))
+    end
+
+    BlacklistFrame:SetScript("OnShow", RefreshBlacklistView)
 end
 
 -------------------------------------------------------------------------------
@@ -2654,10 +2850,10 @@ local function CreateDeathLogFrame()
 end
 
 -------------------------------------------------------------------------------
--- Character Panel Implementation
+-- Character Panel Implementation (With Multi-Name History & Class Blacklisting)
 -------------------------------------------------------------------------------
 local function CreateCharacterFrame()
-    CharacterFrame = CreateRUTPanel("RTCharacterFrame", 500, 440, "Session Characters")
+    CharacterFrame = CreateRUTPanel("RTCharacterFrame", 580, 440, "Session Characters")
 
     local btnBack = CreateFrame("Button", nil, CharacterFrame, "UIPanelButtonTemplate")
     btnBack:SetSize(130, 24)
@@ -2672,7 +2868,7 @@ local function CreateCharacterFrame()
     scrollFrame:SetPoint("BOTTOMRIGHT", viewBox, "BOTTOMRIGHT", -28, 8)
 
     local scrollContent = CreateFrame("Frame", nil, scrollFrame)
-    scrollContent:SetSize(420, 340)
+    scrollContent:SetSize(500, 340)
     scrollFrame:SetScrollChild(scrollContent)
 
     local emptyLabel = scrollContent:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
@@ -2680,10 +2876,74 @@ local function CreateCharacterFrame()
     emptyLabel:SetText("|cff999999No characters recorded in this session yet.|r")
     emptyLabel:Hide()
 
+    -- Context menu for blacklist reasons
+    local blacklistMenu = CreateFrame("Frame", "RTBlacklistContextMenu", UIParent)
+    blacklistMenu:SetSize(160, 150)
+    blacklistMenu:SetFrameStrata("FULLSCREEN_DIALOG")
+    blacklistMenu:SetFrameLevel(100)
+    blacklistMenu:SetBackdrop({
+        bgFile = "Interface\\Buttons\\WHITE8X8",
+        edgeFile = "Interface\\Buttons\\WHITE8X8",
+        tile = false, edgeSize = 1,
+        insets = { left = 1, right = 1, top = 1, bottom = 1 }
+    })
+    blacklistMenu:SetBackdropColor(0.06, 0.06, 0.09, 0.98)
+    blacklistMenu:SetBackdropBorderColor(1.0, 1.0, 1.0, 0.95)
+    blacklistMenu:EnableMouse(true)
+    blacklistMenu:Hide()
+
+    table.insert(activeCustomMenus, blacklistMenu)
+
+    local menuButtons = {}
+    local reasons = { "leaver", "bad dps", "unskilled", "ninja", "ninja pulls", "low gs", "afk bot" }
+    for i, reason in ipairs(reasons) do
+        local mBtn = CreateFrame("Button", nil, blacklistMenu)
+        mBtn:SetHeight(18)
+        mBtn:SetPoint("TOPLEFT", blacklistMenu, "TOPLEFT", 4, -((i - 1) * 18) - 4)
+        mBtn:SetPoint("TOPRIGHT", blacklistMenu, "TOPRIGHT", -4, -((i - 1) * 18) - 4)
+
+        local hl = mBtn:CreateTexture(nil, "HIGHLIGHT")
+        hl:SetAllPoints(mBtn)
+        hl:SetTexture("Interface\\Buttons\\WHITE8X8")
+        hl:SetVertexColor(1.0, 1.0, 1.0, 0.20)
+
+        local txt = mBtn:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+        txt:SetPoint("LEFT", mBtn, "LEFT", 4, 0)
+        txt:SetText(reason)
+
+        mBtn.reason = reason
+        mBtn:SetScript("OnClick", function(self)
+            if blacklistMenu.targetName then
+                RaidersTrackerDB.blacklist = RaidersTrackerDB.blacklist or {}
+                local tName = blacklistMenu.targetName
+                local tClass = blacklistMenu.targetClass or "WARRIOR"
+                local tGUID = blacklistMenu.targetGUID
+                local charID = ExtractCharacterID(tGUID) or ("NAME:" .. tName)
+
+                RaidersTrackerDB.blacklist[charID] = RaidersTrackerDB.blacklist[charID] or {
+                    names = {},
+                    class = tClass,
+                    timestamp = date("%Y-%m-%d %H:%M")
+                }
+                RaidersTrackerDB.blacklist[charID].names[tName] = true
+                RaidersTrackerDB.blacklist[charID].reason = self.reason
+                RaidersTrackerDB.blacklist[charID].class = tClass
+
+                AnnounceLocalChat(string.format("Blacklisted %s (ID: %s) for: %s", tName, charID, self.reason))
+                if BlacklistFrame and BlacklistFrame:IsShown() then
+                    RefreshBlacklistView()
+                end
+            end
+            blacklistMenu:Hide()
+        end)
+        menuButtons[i] = mBtn
+    end
+    blacklistMenu:SetHeight(#reasons * 18 + 8)
+
     local rows = {}
     for i = 1, 100 do
         local row = CreateFrame("Frame", nil, scrollContent)
-        row:SetSize(420, 22)
+        row:SetSize(500, 22)
         row:SetPoint("TOPLEFT", scrollContent, "TOPLEFT", 4, -((i - 1) * 22) - 4)
 
         local text = row:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
@@ -2691,7 +2951,7 @@ local function CreateCharacterFrame()
 
         local btnWhisper = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
         btnWhisper:SetSize(65, 20)
-        btnWhisper:SetPoint("RIGHT", row, "RIGHT", -10, 0)
+        btnWhisper:SetPoint("RIGHT", row, "RIGHT", -6, 0)
         btnWhisper:SetText("Whisper")
         btnWhisper:RegisterForClicks("LeftButtonUp")
         btnWhisper:SetScript("OnClick", function(self)
@@ -2704,8 +2964,26 @@ local function CreateCharacterFrame()
             end
         end)
 
+        local btnBlacklist = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
+        btnBlacklist:SetSize(75, 20)
+        btnBlacklist:SetPoint("RIGHT", btnWhisper, "LEFT", -4, 0)
+        btnBlacklist:SetText("Blacklist")
+        btnBlacklist:RegisterForClicks("LeftButtonUp")
+        btnBlacklist:SetScript("OnClick", function(self)
+            if self.playerName then
+                blacklistMenu.targetName = self.playerName
+                blacklistMenu.targetClass = self.playerClass
+                blacklistMenu.targetGUID = self.playerGUID
+                HideAllCustomDropdownMenus()
+                blacklistMenu:ClearAllPoints()
+                blacklistMenu:SetPoint("TOPLEFT", self, "BOTTOMLEFT", 0, -2)
+                blacklistMenu:Show()
+            end
+        end)
+
         row.text = text
         row.btnWhisper = btnWhisper
+        row.btnBlacklist = btnBlacklist
         row:Hide()
         rows[i] = row
     end
@@ -2738,10 +3016,13 @@ local function CreateCharacterFrame()
         local shownCount = math.min(#sortedPlayers, 100)
         for idx = 1, shownCount do
             local pName = sortedPlayers[idx]
-            local pClass = playerMap[pName]
+            local pClass = playerMap[pName] or "WARRIOR"
             local hexColor = GetPlayerClassColor(pClass)
             rows[idx].text:SetText(string.format("%s |cff888888(%s)|r", ColorizeText(pName, hexColor), pClass))
             rows[idx].btnWhisper.playerName = pName
+            rows[idx].btnBlacklist.playerName = pName
+            rows[idx].btnBlacklist.playerClass = pClass
+            rows[idx].btnBlacklist.playerGUID = groupGUIDs and groupGUIDs[pName] or nil
             if not rows[idx]:IsShown() then rows[idx]:Show() end
         end
         for idx = shownCount + 1, 100 do rows[idx]:Hide() end
@@ -2749,6 +3030,7 @@ local function CreateCharacterFrame()
     end
 
     CharacterFrame:SetScript("OnShow", RefreshCharactersView)
+    CharacterFrame:SetScript("OnHide", function() blacklistMenu:Hide() end)
 end
 
 -------------------------------------------------------------------------------
@@ -3348,7 +3630,7 @@ local function CreateReportFrame()
                 else
                     for _, pName in ipairs(potPlayers) do
                         local pClass = presentMap[pName] or string.upper(seg.players[pName] or "WARRIOR")
-                        table.insert(lines, string.format("%s (%s)", pName, pClass))
+                        table.insert(lines, string.format("**%s (%s)**", pName, pClass))
                         for _, cLine in ipairs(BuildCondensedEntryLines(seg.potionsAndBuffs[pName], "- ")) do
                             table.insert(lines, cLine)
                         end
@@ -3545,7 +3827,7 @@ local function CreateReportFrame()
             currentPreviewText = table.concat(lines, "\n")
 
         -----------------------------------------------------------------------
-        -- PANEL 4: REPORT SUSPICIOUS DEATHS (Wipe Filtered)
+        -- PANEL 4: REPORT SUSPICIOUS DEATHS (Wipe Filtered & Safe Number Coercion)
         -----------------------------------------------------------------------
         elseif activeReportPanel == "DEATHS" then
             local lines = BuildStandardRaidHeaderLines(seg)
@@ -3587,8 +3869,10 @@ local function CreateReportFrame()
                 for idx, d in ipairs(allDeaths) do
                     local pullStr = FormatPullTime(d.pullTime)
                     local timeTag = pullStr and string.format("%s into pull / %s", pullStr, d.time) or d.time
-                    local dmgText = (d.amount > 0) and string.format("%d dmg", amount) or "Fatal Effect"
-                    if d.overkill > 0 then dmgText = string.format("%d dmg (%d overkill)", d.amount, d.overkill) end
+                    local amt = tonumber(d.amount) or 0
+                    local ovk = tonumber(d.overkill) or 0
+                    local dmgText = (amt > 0) and string.format("%d dmg", amt) or "Fatal Effect"
+                    if ovk > 0 then dmgText = string.format("%d dmg (%d overkill)", amt, ovk) end
                     local unusedDef = GetUnusedPersonalDefensives(seg, d.name, d.class)
                     local unusedStr = (#unusedDef > 0) and table.concat(unusedDef, ", ") or "None unused"
                     table.insert(lines, string.format(
@@ -3657,10 +3941,10 @@ local function CreateReportFrame()
 end
 
 -------------------------------------------------------------------------------
--- Config Panel Implementation
+-- Config Panel Implementation (With Clear Blacklist Button)
 -------------------------------------------------------------------------------
 local function CreateConfigFrame()
-    ConfigFrame = CreateRUTPanel("RTConfigFrame", 420, 290, "Raiders Tracker Config")
+    ConfigFrame = CreateRUTPanel("RTConfigFrame", 420, 340, "Raiders Tracker Config")
 
     local viewBox = CreateWhiteBorderViewBox(ConfigFrame, -42, 46)
 
@@ -3677,14 +3961,19 @@ local function CreateConfigFrame()
 
     local btnResetPositions = CreateFrame("Button", nil, viewBox, "UIPanelButtonTemplate")
     btnResetPositions:SetSize(200, 26)
-    btnResetPositions:SetPoint("CENTER", viewBox, "CENTER", 0, -2)
+    btnResetPositions:SetPoint("CENTER", viewBox, "CENTER", 0, 16)
     btnResetPositions:SetText("Reset Panel Positions")
     btnResetPositions:SetScript("OnClick", function() ResetAllPanelPositions() end)
 
     local btnDeleteAll = CreateFrame("Button", nil, viewBox, "UIPanelButtonTemplate")
     btnDeleteAll:SetSize(200, 26)
-    btnDeleteAll:SetPoint("TOP", btnResetPositions, "BOTTOM", 0, -12)
+    btnDeleteAll:SetPoint("TOP", btnResetPositions, "BOTTOM", 0, -8)
     btnDeleteAll:SetText("Delete All Sessions")
+
+    local btnClearBlacklist = CreateFrame("Button", nil, viewBox, "UIPanelButtonTemplate")
+    btnClearBlacklist:SetSize(200, 26)
+    btnClearBlacklist:SetPoint("TOP", btnDeleteAll, "BOTTOM", 0, -8)
+    btnClearBlacklist:SetText("Clear Blacklist")
 
     local btnBack = CreateFrame("Button", nil, ConfigFrame, "UIPanelButtonTemplate")
     btnBack:SetSize(130, 24)
@@ -3693,7 +3982,7 @@ local function CreateConfigFrame()
     btnBack:SetScript("OnClick", function() CloseAllPanels(); MainTrackerFrame:Show() end)
 
     StaticPopupDialogs["RT_DELETE_ALL_SESSIONS"] = {
-        text = "Really delete all sessions (saved and live), recorded deaths, death logs, and character lists?",
+        text = "Really delete all encounter sessions, recorded deaths, death logs, and character lists? (Your Blacklist will be preserved).",
         button1 = "Yes",
         button2 = "No",
         OnAccept = function() WipeAllSessionsAndData() end,
@@ -3702,7 +3991,24 @@ local function CreateConfigFrame()
         hideOnEscape = true,
     }
 
+    StaticPopupDialogs["RT_CLEAR_BLACKLIST"] = {
+        text = "Really clear the entire player blacklist? This cannot be undone.",
+        button1 = "Yes",
+        button2 = "No",
+        OnAccept = function()
+            RaidersTrackerDB.blacklist = {}
+            if BlacklistFrame and BlacklistFrame:IsShown() then
+                RefreshBlacklistView()
+            end
+            AnnounceLocalChat("Player blacklist cleared.")
+        end,
+        timeout = 0,
+        whileDead = true,
+        hideOnEscape = true,
+    }
+
     btnDeleteAll:SetScript("OnClick", function() StaticPopup_Show("RT_DELETE_ALL_SESSIONS") end)
+    btnClearBlacklist:SetScript("OnClick", function() StaticPopup_Show("RT_CLEAR_BLACKLIST") end)
 end
 
 -------------------------------------------------------------------------------
@@ -3740,10 +4046,12 @@ local function CheckGroupJoinPrompt()
     if not groupStateInitialized then
         wasInGroup = currentlyInGroup
         groupStateInitialized = true
+        CheckGroupBlacklist()
         return
     end
     if currentlyInGroup and not wasInGroup then
         wasInGroup = true
+        CheckGroupBlacklist()
         StaticPopup_Show("RT_REFRESH_ON_GROUP_JOIN")
     elseif not currentlyInGroup and wasInGroup then
         wasInGroup = false
@@ -3756,6 +4064,7 @@ local function ScheduleLoadMessage(delay)
         totalElapsed = totalElapsed + elapsed
         if totalElapsed >= (delay or 2.0) then
             self:SetScript("OnUpdate", nil)
+            CheckGroupBlacklist()
             if not hasPrintedLoadMsg then
                 hasPrintedLoadMsg = true
                 local version = GetAddonVersion()
@@ -3796,7 +4105,7 @@ local function RecordProc(sourceName, sourceGUID, destName, destGUID, category, 
             pName, pClass = sourceName, srcClass
         else
             if not dstIsMember then return end
-            pName, pClass = destName, dstClass
+            pName, pClass = destName, destClass
         end
 
         targetSegment.players[pName] = pClass
@@ -3993,6 +4302,7 @@ eventHandler:SetScript("OnEvent", function(self, event, ...)
             CreateConfigFrame()
             CreateDeathsFrame()
             CreateDeathLogFrame()
+            CreateBlacklistFrame()
             UpdateGroupCache()
             EnsureTrashSegment()
         end
@@ -4004,6 +4314,7 @@ eventHandler:SetScript("OnEvent", function(self, event, ...)
         wasInGroup = IsPlayerInGroup()
         groupStateInitialized = true
         HandleZoneOrDifficultyUpdate(false)
+        CheckGroupBlacklist()
         if not hasPrintedLoadMsg then ScheduleLoadMessage(2.0) end
         return
     end
@@ -4022,6 +4333,7 @@ eventHandler:SetScript("OnEvent", function(self, event, ...)
     if event == "PARTY_MEMBERS_CHANGED" or event == "RAID_ROSTER_UPDATE" then
         UpdateGroupCache()
         CheckGroupJoinPrompt()
+        CheckGroupBlacklist()
         HandleZoneOrDifficultyUpdate(false)
         return
     end
