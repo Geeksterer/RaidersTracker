@@ -21,7 +21,7 @@ local defaultDB = {
     enabled = true,
     minimapPos = 45,
     savedSessions = {},
-    liveSession = { name = "Live Current Session", segments = {}, players = {} },
+    liveSession = { name = "Live Current Session", segments = {}, players = {}, playerIDs = {} },
     blacklist = {} -- [charID] = { names = {["Name"] = true}, class = string, reason = string, timestamp = string }
 }
 
@@ -46,6 +46,10 @@ local function MergeSegmentDataInto(targetSeg, sourceSeg)
     targetSeg.players = targetSeg.players or {}
     for pName, pClass in pairs(sourceSeg.players or {}) do
         targetSeg.players[pName] = pClass
+    end
+    targetSeg.playerIDs = targetSeg.playerIDs or {}
+    for pName, cID in pairs(sourceSeg.playerIDs or {}) do
+        targetSeg.playerIDs[pName] = cID
     end
     targetSeg.potionsAndBuffs = targetSeg.potionsAndBuffs or {}
     for pName, entries in pairs(sourceSeg.potionsAndBuffs or {}) do
@@ -113,7 +117,7 @@ local function InitializeDB()
     for k, v in pairs(defaultDB) do
         if RaidersTrackerDB[k] == nil then
             if k == "liveSession" then
-                RaidersTrackerDB.liveSession = { name = "Live Current Session", segments = {}, players = {} }
+                RaidersTrackerDB.liveSession = { name = "Live Current Session", segments = {}, players = {}, playerIDs = {} }
             elseif k == "blacklist" then
                 RaidersTrackerDB.blacklist = {}
             else
@@ -125,26 +129,37 @@ local function InitializeDB()
     RaidersTrackerDB.lastCharacter = nil
     currentSession = RaidersTrackerDB.liveSession
     currentSession.players = currentSession.players or {}
+    currentSession.playerIDs = currentSession.playerIDs or {}
     if #currentSession.segments > 0 then
         for _, seg in ipairs(currentSession.segments) do
             seg.deaths = seg.deaths or {}
             seg.players = seg.players or {}
+            seg.playerIDs = seg.playerIDs or {}
             seg.potionsAndBuffs = seg.potionsAndBuffs or {}
             seg.raidUtility = seg.raidUtility or {}
             seg.enrages = seg.enrages or {}
             seg.tanks = seg.tanks or {}
+            for pName, cID in pairs(seg.playerIDs) do
+                currentSession.playerIDs[pName] = currentSession.playerIDs[pName] or cID
+            end
         end
         RepairSplitLichKingSegments(currentSession)
         currentSegment = currentSession.segments[1]
     end
     for _, savedSess in ipairs(RaidersTrackerDB.savedSessions or {}) do
+        savedSess.players = savedSess.players or {}
+        savedSess.playerIDs = savedSess.playerIDs or {}
         for _, seg in ipairs(savedSess.segments or {}) do
             seg.deaths = seg.deaths or {}
             seg.players = seg.players or {}
+            seg.playerIDs = seg.playerIDs or {}
             seg.potionsAndBuffs = seg.potionsAndBuffs or {}
             seg.raidUtility = seg.raidUtility or {}
             seg.enrages = seg.enrages or {}
             seg.tanks = seg.tanks or {}
+            for pName, cID in pairs(seg.playerIDs) do
+                savedSess.playerIDs[pName] = savedSess.playerIDs[pName] or cID
+            end
         end
         RepairSplitLichKingSegments(savedSess)
     end
@@ -164,9 +179,7 @@ end
 local function SanitizeForChat(str)
     if not str then return "" end
     local clean = StripColorCodes(tostring(str))
-    clean = clean:gsub("|T.-|t", "")
-    clean = clean:gsub("%s*|%s*", " / ")
-    clean = clean:gsub("[\r\n]", " ")
+    clean = clean:gsub("|T.-|t", ""):gsub("%s*|%s*", " / "):gsub("[\r\n]", " ")
     return clean
 end
 
@@ -196,12 +209,8 @@ local function OnChatQueueUpdate(self, elapsed)
     if chatQueueElapsed >= 0.20 then
         chatQueueElapsed = 0
         local nextLine = table.remove(chatQueue, 1)
-        if nextLine then
-            SendSingleOutboundLine(nextLine)
-        end
-        if #chatQueue == 0 then
-            self:SetScript("OnUpdate", nil)
-        end
+        if nextLine then SendSingleOutboundLine(nextLine) end
+        if #chatQueue == 0 then self:SetScript("OnUpdate", nil) end
     end
 end
 
@@ -216,9 +225,7 @@ local function EnqueueRaidChatLines(rawLines)
                 table.insert(chatQueue, clean:sub(1, splitPos))
                 clean = clean:sub(splitPos + 1):gsub("^%s+", "")
             end
-            if clean ~= "" then
-                table.insert(chatQueue, clean)
-            end
+            if clean ~= "" then table.insert(chatQueue, clean) end
         end
     end
     if #chatQueue > 0 and not chatQueueFrame:GetScript("OnUpdate") then
@@ -280,6 +287,9 @@ local groupMembers = {}
 local groupClasses = {}
 local groupGUIDs = {}
 local groupGUIDToName = {}
+local nameToCharID = {}
+local guidToCharID = {}
+local charIDToName = {}
 
 local function IsPlayerGUID(guid)
     if not guid or type(guid) ~= "string" then return true end
@@ -289,98 +299,97 @@ end
 
 local function ExtractCharacterID(guid)
     if not guid or type(guid) ~= "string" then return nil end
+    if guid:find("^NAME:") then return nil end
+    if guid:match("^%d+$") then return guid end
+    if guid:sub(1, 3):upper() == "0XF" then return nil end
     local clean = guid:gsub("^0[xX]", "")
     if #clean >= 12 then
         local idHex = clean:sub(-8)
         local num = tonumber(idHex, 16)
-        if num then return tostring(num) end
+        if num and num > 0 then return tostring(num) end
     end
     local numDec = tonumber(clean, 16)
-    if numDec then return tostring(numDec) end
-    return guid
+    if numDec and numDec > 0 then return tostring(numDec) end
+    return nil
+end
+
+local function CachePlayerCharID(name, guid, targetSegment)
+    if not name or name == "" or name == UNKNOWN then return nil end
+    if guid and not IsPlayerGUID(guid) then return nil end
+    local charID = (guid and guidToCharID[guid]) or ExtractCharacterID(guid) or nameToCharID[name]
+    if not charID then return nil end
+    nameToCharID[name] = charID
+    charIDToName[charID] = name
+    groupGUIDs[charID] = name
+    groupGUIDToName[charID] = name
+    if guid and type(guid) == "string" and guid ~= charID then
+        guidToCharID[guid] = charID
+        groupGUIDs[guid] = name
+        groupGUIDToName[guid] = name
+    end
+    if currentSession then
+        currentSession.playerIDs = currentSession.playerIDs or {}
+        currentSession.playerIDs[name] = charID
+    end
+    local seg = targetSegment or (currentSession and currentSession.segments and currentSession.segments[1])
+    if seg then
+        seg.playerIDs = seg.playerIDs or {}
+        seg.playerIDs[name] = charID
+    end
+    return charID
 end
 
 local function UpdateGroupCache()
     table.wipe(groupMembers)
     table.wipe(groupGUIDs)
     table.wipe(groupGUIDToName)
-    local pName = UnitName("player")
-    if pName and pName ~= UNKNOWN then
-        groupMembers[pName] = true
-        local pGUID = UnitGUID("player")
-        if pGUID then
-            local charID = ExtractCharacterID(pGUID)
-            if charID then
-                groupGUIDs[charID] = pName
-                groupGUIDToName[charID] = pName
+    local function CacheUnit(unit)
+        local name = UnitName(unit)
+        if name and name ~= UNKNOWN then
+            groupMembers[name] = true
+            local uGUID = UnitGUID(unit)
+            if uGUID then
+                CachePlayerCharID(name, uGUID)
+            elseif nameToCharID[name] then
+                local cID = nameToCharID[name]
+                charIDToName[cID] = name
+                groupGUIDs[cID] = name
+                groupGUIDToName[cID] = name
             end
-            groupGUIDs[pGUID] = pName
-            groupGUIDToName[pGUID] = pName
+            local _, engClass = UnitClass(unit)
+            if engClass then groupClasses[name] = engClass end
         end
-        local _, engClass = UnitClass("player")
-        if engClass then groupClasses[pName] = engClass end
     end
+    CacheUnit("player")
     local numRaid = GetNumRaidMembers()
     if numRaid > 0 then
-        for i = 1, numRaid do
-            local unit = "raid" .. i
-            local name = UnitName(unit)
-            if name and name ~= UNKNOWN then
-                groupMembers[name] = true
-                local uGUID = UnitGUID(unit)
-                if uGUID then
-                    local charID = ExtractCharacterID(uGUID)
-                    if charID then
-                        groupGUIDs[charID] = name
-                        groupGUIDToName[charID] = name
-                    end
-                    groupGUIDs[uGUID] = name
-                    groupGUIDToName[uGUID] = name
-                end
-                local _, engClass = UnitClass(unit)
-                if engClass then groupClasses[name] = engClass end
-            end
-        end
+        for i = 1, numRaid do CacheUnit("raid" .. i) end
     else
         local numParty = GetNumPartyMembers()
-        if numParty > 0 then
-            for i = 1, numParty do
-                local unit = "party" .. i
-                local name = UnitName(unit)
-                if name and name ~= UNKNOWN then
-                    groupMembers[name] = true
-                    local uGUID = UnitGUID(unit)
-                    if uGUID then
-                        local charID = ExtractCharacterID(uGUID)
-                        if charID then
-                            groupGUIDs[charID] = name
-                            groupGUIDToName[charID] = name
-                        end
-                        groupGUIDs[uGUID] = name
-                        groupGUIDToName[uGUID] = name
-                    end
-                    local _, engClass = UnitClass(unit)
-                    if engClass then groupClasses[name] = engClass end
-                end
-            end
-        end
+        for i = 1, numParty do CacheUnit("party" .. i) end
     end
 end
 
 local function IsGroupMember(name, guid)
     if not name or not IsPlayerGUID(guid) then return false end
-    if groupMembers[name] then return true end
+    if groupMembers[name] then
+        if guid then CachePlayerCharID(name, guid) end
+        return true
+    end
     local charID = ExtractCharacterID(guid)
-    if charID and groupGUIDs[charID] then
+    if charID and (groupGUIDs[charID] or charIDToName[charID]) then
         groupMembers[name] = true
+        CachePlayerCharID(name, guid)
         return true
     end
     if guid and groupGUIDs[guid] then
         groupMembers[name] = true
+        CachePlayerCharID(name, guid)
         return true
     end
     if UnitInRaid(name) or UnitInParty(name) or name == UnitName("player") then
         UpdateGroupCache()
+        if groupMembers[name] and guid then CachePlayerCharID(name, guid) end
         return groupMembers[name] == true
     end
     return false
@@ -436,16 +445,9 @@ end
 -- Class Colors & Helpers
 -------------------------------------------------------------------------------
 local CLASS_COLORS = {
-    ["WARRIOR"]     = "C79C6E",
-    ["PALADIN"]     = "F58CBA",
-    ["HUNTER"]      = "ABD473",
-    ["ROGUE"]       = "FFF569",
-    ["PRIEST"]      = "FFFFFF",
-    ["DEATHKNIGHT"] = "C41F3B",
-    ["SHAMAN"]      = "0070DE",
-    ["MAGE"]        = "69CCF0",
-    ["WARLOCK"]     = "9482C9",
-    ["DRUID"]       = "FF7D0A",
+    ["WARRIOR"] = "C79C6E", ["PALADIN"] = "F58CBA", ["HUNTER"] = "ABD473",
+    ["ROGUE"] = "FFF569", ["PRIEST"] = "FFFFFF", ["DEATHKNIGHT"] = "C41F3B",
+    ["SHAMAN"] = "0070DE", ["MAGE"] = "69CCF0", ["WARLOCK"] = "9482C9", ["DRUID"] = "FF7D0A",
 }
 
 local function ColorizeText(text, hexColor)
@@ -466,20 +468,32 @@ local function CheckGroupBlacklist()
     if not RaidersTrackerDB or not RaidersTrackerDB.blacklist then return end
     UpdateGroupCache()
     for idKey, name in pairs(groupGUIDToName) do
-        if RaidersTrackerDB.blacklist[idKey] then
-            local entry = RaidersTrackerDB.blacklist[idKey]
+        local blKey = RaidersTrackerDB.blacklist[idKey] and idKey or (name and RaidersTrackerDB.blacklist["NAME:" .. name] and ("NAME:" .. name)) or nil
+        if blKey then
+            local entry = RaidersTrackerDB.blacklist[blKey]
+            local charID = ExtractCharacterID(idKey) or nameToCharID[name]
+            if charID and blKey ~= charID then
+                RaidersTrackerDB.blacklist[charID] = RaidersTrackerDB.blacklist[charID] or entry
+                if RaidersTrackerDB.blacklist[charID] ~= entry then
+                    RaidersTrackerDB.blacklist[charID].names = RaidersTrackerDB.blacklist[charID].names or {}
+                    for n in pairs(entry.names or {}) do RaidersTrackerDB.blacklist[charID].names[n] = true end
+                end
+                RaidersTrackerDB.blacklist[blKey] = nil
+                entry = RaidersTrackerDB.blacklist[charID]
+                blKey = charID
+            end
             if name and name ~= "" then
                 entry.names = entry.names or {}
                 entry.names[name] = true
             end
-            if not sessionWarnedIDs[idKey] then
-                sessionWarnedIDs[idKey] = true
+            if not sessionWarnedIDs[blKey] then
+                sessionWarnedIDs[blKey] = true
                 local nameList = {}
                 for n in pairs(entry.names or {}) do table.insert(nameList, n) end
                 table.sort(nameList)
                 local namesStr = table.concat(nameList, ", ")
                 local classStr = entry.class and (" (" .. entry.class .. ")") or ""
-                local warnMsg = string.format("[Raiders Tracker] WARNING: Blacklisted player joined group! [ID: %s] Names: %s%s - Reason: %s", idKey, namesStr, classStr, entry.reason or "Unknown")
+                local warnMsg = string.format("[Raiders Tracker] WARNING: Blacklisted player joined group! [ID: %s] Names: %s%s - Reason: %s", blKey, namesStr, classStr, entry.reason or "Unknown")
                 if DEFAULT_CHAT_FRAME then
                     DEFAULT_CHAT_FRAME:AddMessage("|cffFF0000" .. warnMsg .. "|r")
                 end
@@ -580,10 +594,9 @@ local WOTLK_BOSS_DB = {
 }
 
 local FACTION_CHAMPION_NPC_IDS = {
-    34441, 34444, 34445, 34447, 34448, 34449, 34450,
-    34451, 34453, 34454, 34455, 34456, 34458, 34459,
-    34460, 34461, 34463, 34465, 34466, 34467, 34468,
-    34469, 34470, 34471, 34472, 34473, 34474, 34475
+    34441, 34444, 34445, 34447, 34448, 34449, 34450, 34451, 34453, 34454,
+    34455, 34456, 34458, 34459, 34460, 34461, 34463, 34465, 34466, 34467,
+    34468, 34469, 34470, 34471, 34472, 34473, 34474, 34475
 }
 for _, fcID in ipairs(FACTION_CHAMPION_NPC_IDS) do
     WOTLK_BOSS_DB[fcID] = { name = "Faction Champions", isFactionChamp = true }
@@ -735,27 +748,19 @@ local BOSS_DEFEAT_SPEECH = {
 }
 
 local LICH_KING_RP_SPEECH = {
-    "no questions remain unanswered",
-    "greatest champions",
-    "light, grant me one final blessing",
-    "shatter this prison",
-    "no more, arthas",
-    "now i stand, the lion",
-    "they cannot fear"
+    "no questions remain unanswered", "greatest champions", "light, grant me one final blessing",
+    "shatter this prison", "no more, arthas", "now i stand, the lion", "they cannot fear"
 }
 
 local WOTLK_BOSS_INITIATORS = {
-    [69076] = "Lord Marrowgar", [69057] = "Lord Marrowgar",
-    [70867] = "Lady Deathwhisper", [69680] = "Icecrown Gunship Battle",
-    [72293] = "Deathbringer Saurfang", [72219] = "Festergut", [69674] = "Rotface",
-    [70351] = "Professor Putricide", [71807] = "Blood Prince Council", [70877] = "Blood-Queen Lana'thel",
-    [71741] = "Valithria Dreamwalker", [70123] = "Sindragosa",
-    [72262] = "The Lich King", [70337] = "The Lich King",
-    [74505] = "Baltharus the Warborn", [74509] = "Baltharus the Warborn",
-    [74403] = "Saviana Ragefire", [74452] = "Saviana Ragefire", [78722] = "Saviana Ragefire",
-    [74367] = "General Zarithrian", [74384] = "General Zarithrian",
-    [74562] = "Halion",
-    [66331] = "Northrend Beasts", [66532] = "Lord Jaraxxus",
+    [69076] = "Lord Marrowgar", [69057] = "Lord Marrowgar", [70867] = "Lady Deathwhisper",
+    [69680] = "Icecrown Gunship Battle", [72293] = "Deathbringer Saurfang", [72219] = "Festergut",
+    [69674] = "Rotface", [70351] = "Professor Putricide", [71807] = "Blood Prince Council",
+    [70877] = "Blood-Queen Lana'thel", [71741] = "Valithria Dreamwalker", [70123] = "Sindragosa",
+    [72262] = "The Lich King", [70337] = "The Lich King", [74505] = "Baltharus the Warborn",
+    [74509] = "Baltharus the Warborn", [74403] = "Saviana Ragefire", [74452] = "Saviana Ragefire",
+    [78722] = "Saviana Ragefire", [74367] = "General Zarithrian", [74384] = "General Zarithrian",
+    [74562] = "Halion", [66331] = "Northrend Beasts", [66532] = "Lord Jaraxxus",
     [65875] = "Twin Val'kyr", [65876] = "Twin Val'kyr", [66013] = "Anub'arak",
     [62374] = "Flame Leviathan", [62680] = "Ignis the Furnace Master", [64021] = "Razorscale",
     [62776] = "XT-002 Deconstructor", [61888] = "Assembly of Iron", [63356] = "Kologarn",
@@ -764,92 +769,50 @@ local WOTLK_BOSS_INITIATORS = {
 }
 
 local ENEMY_ENRAGE_SPELLS = {
-    [28371] = "Frenzy",
-    [72143] = "Enrage",
-    [72146] = "Enrage",
-    [78722] = "Enrage",
-    [74452] = "Enrage",
-    [66759] = "Frothing Rage",
-    [54427] = "Enrage",
-    [59828] = "Frenzy",
-    [28747] = "Frenzy",
-    [54123] = "Frenzy",
-    [48138] = "Frenzy",
-    [63848] = "Frenzy",
+    [28371] = "Frenzy", [72143] = "Enrage", [72146] = "Enrage", [78722] = "Enrage",
+    [74452] = "Enrage", [66759] = "Frothing Rage", [54427] = "Enrage", [59828] = "Frenzy",
+    [28747] = "Frenzy", [54123] = "Frenzy", [48138] = "Frenzy", [63848] = "Frenzy",
 }
 
 -------------------------------------------------------------------------------
 -- Potions, Consumables, Raid Buffs, Rings, Enchants & Trinkets Database
 -------------------------------------------------------------------------------
 local POTIONS_AND_BUFFS = {
-    [53908] = "Potion of Speed",
-    [53909] = "Potion of Wild Magic",
-    [28494] = "Insane Strength Potion",
-    [28507] = "Haste Potion",
-    [28508] = "Destruction Potion",
-    [53762] = "Indestructible Potion",
-    [53753] = "Indestructible Potion",
-    [54117] = "Indestructible Potion",
-    [53761] = "Powerful Rejuvenation Potion",
-    [28714] = "Flame Cap",
-    [9512]  = "Thistle Tea", [9513] = "Thistle Tea", [18160] = "Thistle Tea",
+    [53908] = "Potion of Speed", [53909] = "Potion of Wild Magic", [28494] = "Insane Strength Potion",
+    [28507] = "Haste Potion", [28508] = "Destruction Potion", [53762] = "Indestructible Potion",
+    [53753] = "Indestructible Potion", [54117] = "Indestructible Potion",
+    [53761] = "Powerful Rejuvenation Potion", [28714] = "Flame Cap",
+    [9512] = "Thistle Tea", [9513] = "Thistle Tea", [18160] = "Thistle Tea",
     [43186] = "Runic Mana Potion", [53942] = "Runic Mana Injector",
     [43185] = "Runic Healing Potion", [53934] = "Runic Healing Injector",
     [47878] = "Fel Healthstone", [47871] = "Fel Healthstone", [47875] = "Fel Healthstone", [27230] = "Master Healthstone",
     [42985] = "Mana Sapphire", [33312] = "Mana Emerald", [42984] = "Mana Sapphire",
-    [53755] = "Flask of the Frost Wyrm",
-    [53760] = "Flask of Endless Rage",
-    [53758] = "Flask of Stoneblood",
-    [54212] = "Flask of Pure Mojo",
-    [53752] = "Lesser Flask of Toughness",
-    [67016] = "Flask of the North (SP)",
-    [67017] = "Flask of the North (AP)",
-    [67018] = "Flask of the North (STR)",
-    [17627] = "Flask of Distilled Wisdom",
-    [53747] = "Elixir of Spirit",
-    [53748] = "Elixir of Mighty Strength",
-    [53746] = "Wrath Elixir",
-    [53749] = "Guru's Elixir",
-    [53763] = "Elixir of Protection",
-    [53764] = "Elixir of Mighty Mageblood",
-    [60347] = "Elixir of Mighty Thoughts",
-    [60346] = "Elixir of Lightning Speed",
-    [60345] = "Elixir of Armor Piercing",
-    [60344] = "Elixir of Expertise",
-    [60341] = "Elixir of Deadly Strikes",
-    [60340] = "Elixir of Accuracy",
-    [28497] = "Elixir of Mighty Agility",
-    [57399] = "Fish Feast (Well Fed)",
-    [57329] = "Well Fed (Crit/Sta)",
-    [57325] = "Well Fed (AP/Sta)",
-    [57327] = "Well Fed (SP/Sta)",
-    [57332] = "Well Fed (Haste/Sta)",
-    [57334] = "Well Fed (MP5/Sta)",
-    [57356] = "Well Fed (Exp/Sta)",
-    [57358] = "Well Fed (ArP/Sta)",
-    [57360] = "Well Fed (Hit/Sta)",
-    [57367] = "Well Fed (Agi/Sta)",
-    [57371] = "Well Fed (Str/Sta)",
-    [57365] = "Well Fed (Spi/Sta)",
-    [54758] = "Hyperspeed Accelerators",
-    [55002] = "Flexweave Underlay",
-    [55637] = "Lightweave Embroidery",
-    [55775] = "Swordguard Embroidery",
-    [55777] = "Darkglow Embroidery",
-    [59626] = "Black Magic Proc",
-    [59620] = "Berserking Proc",
-    [59625] = "Blade Ward Proc",
-    [64441] = "Blood Draining Proc",
-    [28093] = "Mongoose Proc",
-    [42976] = "Executioner Proc",
-    [72416] = "Ashen Caster Ring Proc",
-    [72418] = "Ashen Healer Ring Proc",
-    [72412] = "Ashen Melee Ring Proc",
-    [72414] = "Ashen Tank Ring Proc",
-    [71605] = "Phylactery Proc (N)",
-    [71636] = "Phylactery Proc (HC)",
-    [71601] = "DFO Proc (N)",
-    [71644] = "DFO Proc (HC)",
+    [53755] = "Flask of the Frost Wyrm", [53760] = "Flask of Endless Rage",
+    [53758] = "Flask of Stoneblood", [54212] = "Flask of Pure Mojo",
+    [53752] = "Lesser Flask of Toughness", [67016] = "Flask of the North (SP)",
+    [67017] = "Flask of the North (AP)", [67018] = "Flask of the North (STR)",
+    [17627] = "Flask of Distilled Wisdom", [53747] = "Elixir of Spirit",
+    [53748] = "Elixir of Mighty Strength", [53746] = "Wrath Elixir",
+    [53749] = "Guru's Elixir", [53763] = "Elixir of Protection",
+    [53764] = "Elixir of Mighty Mageblood", [60347] = "Elixir of Mighty Thoughts",
+    [60346] = "Elixir of Lightning Speed", [60345] = "Elixir of Armor Piercing",
+    [60344] = "Elixir of Expertise", [60341] = "Elixir of Deadly Strikes",
+    [60340] = "Elixir of Accuracy", [28497] = "Elixir of Mighty Agility",
+    [57399] = "Fish Feast (Well Fed)", [57329] = "Well Fed (Crit/Sta)",
+    [57325] = "Well Fed (AP/Sta)", [57327] = "Well Fed (SP/Sta)",
+    [57332] = "Well Fed (Haste/Sta)", [57334] = "Well Fed (MP5/Sta)",
+    [57356] = "Well Fed (Exp/Sta)", [57358] = "Well Fed (ArP/Sta)",
+    [57360] = "Well Fed (Hit/Sta)", [57367] = "Well Fed (Agi/Sta)",
+    [57371] = "Well Fed (Str/Sta)", [57365] = "Well Fed (Spi/Sta)",
+    [54758] = "Hyperspeed Accelerators", [55002] = "Flexweave Underlay",
+    [55637] = "Lightweave Embroidery", [55775] = "Swordguard Embroidery",
+    [55777] = "Darkglow Embroidery", [59626] = "Black Magic Proc",
+    [59620] = "Berserking Proc", [59625] = "Blade Ward Proc",
+    [64441] = "Blood Draining Proc", [28093] = "Mongoose Proc",
+    [42976] = "Executioner Proc", [72416] = "Ashen Caster Ring Proc",
+    [72418] = "Ashen Healer Ring Proc", [72412] = "Ashen Melee Ring Proc",
+    [72414] = "Ashen Tank Ring Proc", [71605] = "Phylactery Proc (N)",
+    [71636] = "Phylactery Proc (HC)", [71601] = "DFO Proc (N)", [71644] = "DFO Proc (HC)",
     [71484] = "DBW: Strength of the Taunka (+600 Str)",
     [71485] = "DBW: Agility of the Vrykul (+600 Agi)",
     [71486] = "DBW: Power of the Taunka (+1200 AP)",
@@ -862,66 +825,39 @@ local POTIONS_AND_BUFFS = {
     [71557] = "DBW HC: Precision of the Iron Dwarves (+700 ArP)",
     [71559] = "DBW HC: Aim of the Iron Dwarves (+700 Crit)",
     [71560] = "DBW HC: Speed of the Vrykul (+600 Haste)",
-    [71635] = "CTS Organ/Coin Proc (N)",
-    [71646] = "CTS Organ/Coin Proc (HC)",
-    [75458] = "STS Proc (N)",
-    [75456] = "STS Proc (HC)",
-    [75466] = "Charred Twilight Scale (N)",
-    [75473] = "Charred Twilight Scale (HC)",
-    [75490] = "Glowing Twilight Scale (N)",
-    [75495] = "Glowing Twilight Scale (HC)",
-    [75477] = "Petrified Twilight Scale (N)",
-    [75481] = "Petrified Twilight Scale (HC)",
-    [71401] = "Whispering Fanged Skull (N)",
-    [71541] = "Whispering Fanged Skull (HC)",
-    [71633] = "Tiny Abomination Proc",
-    [71403] = "Needle-Encrusted Scorpion",
-    [67703] = "Death's Choice/Verdict Str (N)",
-    [67772] = "Death's Choice/Verdict Str (HC)",
-    [67708] = "Death's Choice/Verdict Agi (N)",
-    [67773] = "Death's Choice/Verdict Agi (HC)",
-    [67695] = "Talisman of Resurgence",
-    [67753] = "Satrina's / Juggernaut Vitality (N)",
-    [67751] = "Satrina's / Juggernaut Vitality (HC)",
-    [64772] = "Comet's Trail Proc",
-    [60229] = "Greatness Proc (Str)",
-    [60233] = "Greatness Proc (Agi)",
-    [60234] = "Greatness Proc (Int)",
-    [60235] = "Greatness Proc (Spi)",
-    [65008] = "Mjolnir Runestone Proc",
-    [65019] = "Grim Toll Proc",
-    [64713] = "Flare of the Heavens Proc",
-    [64741] = "Pandora's Plea Proc",
-    [65006] = "Eye of the Broodmother",
-    [71570] = "Muradin's Spyglass (N)",
-    [71572] = "Muradin's Spyglass (HC)",
-    [71584] = "Purified Lunar Dust",
-    [71610] = "Althor's Abacus Proc",
-    [71880] = "Trauma Proc",
-    [2825]  = "Bloodlust",
-    [32182] = "Heroism",
-    [10060] = "Power Infusion",
-    [49016] = "Hysteria",
-    [57933] = "Tricks of the Trade (+15% Dmg)",
-    [29166] = "Innervate",
-    [54648] = "Focus Magic Proc",
-    [33206] = "Pain Suppression",
-    [47788] = "Guardian Spirit",
-    [6940]  = "Hand of Sacrifice",
+    [71635] = "CTS Organ/Coin Proc (N)", [71646] = "CTS Organ/Coin Proc (HC)",
+    [75458] = "STS Proc (N)", [75456] = "STS Proc (HC)",
+    [75466] = "Charred Twilight Scale (N)", [75473] = "Charred Twilight Scale (HC)",
+    [75490] = "Glowing Twilight Scale (N)", [75495] = "Glowing Twilight Scale (HC)",
+    [75477] = "Petrified Twilight Scale (N)", [75481] = "Petrified Twilight Scale (HC)",
+    [71401] = "Whispering Fanged Skull (N)", [71541] = "Whispering Fanged Skull (HC)",
+    [71633] = "Tiny Abomination Proc", [71403] = "Needle-Encrusted Scorpion",
+    [67703] = "Death's Choice/Verdict Str (N)", [67772] = "Death's Choice/Verdict Str (HC)",
+    [67708] = "Death's Choice/Verdict Agi (N)", [67773] = "Death's Choice/Verdict Agi (HC)",
+    [67695] = "Talisman of Resurgence", [67753] = "Satrina's / Juggernaut Vitality (N)",
+    [67751] = "Satrina's / Juggernaut Vitality (HC)", [64772] = "Comet's Trail Proc",
+    [60229] = "Greatness Proc (Str)", [60233] = "Greatness Proc (Agi)",
+    [60234] = "Greatness Proc (Int)", [60235] = "Greatness Proc (Spi)",
+    [65008] = "Mjolnir Runestone Proc", [65019] = "Grim Toll Proc",
+    [64713] = "Flare of the Heavens Proc", [64741] = "Pandora's Plea Proc",
+    [65006] = "Eye of the Broodmother", [71570] = "Muradin's Spyglass (N)",
+    [71572] = "Muradin's Spyglass (HC)", [71584] = "Purified Lunar Dust",
+    [71610] = "Althor's Abacus Proc", [71880] = "Trauma Proc",
+    [2825] = "Bloodlust", [32182] = "Heroism", [10060] = "Power Infusion",
+    [49016] = "Hysteria", [57933] = "Tricks of the Trade (+15% Dmg)",
+    [29166] = "Innervate", [54648] = "Focus Magic Proc", [33206] = "Pain Suppression",
+    [47788] = "Guardian Spirit", [6940] = "Hand of Sacrifice",
     [10278] = "Hand of Protection", [1022] = "Hand of Protection", [5599] = "Hand of Protection",
-    [1038]  = "Hand of Salvation",
-    [1044]  = "Hand of Freedom",
-    [64205] = "Divine Sacrifice",
-    [70940] = "Divine Guardian",
-    [31821] = "Aura Mastery",
-    [6346]  = "Fear Ward"
+    [1038] = "Hand of Salvation", [1044] = "Hand of Freedom",
+    [64205] = "Divine Sacrifice", [70940] = "Divine Guardian",
+    [31821] = "Aura Mastery", [6346] = "Fear Ward"
 }
 
 local ALLOW_REFRESH_BUFFS = {
     [53908] = true, [53909] = true, [28494] = true, [28507] = true, [28508] = true,
     [53762] = true, [53753] = true, [54117] = true, [28714] = true,
     [57933] = true, [10060] = true, [49016] = true, [29166] = true,
-    [33206] = true, [47788] = true, [6940]  = true, [1038]  = true, [1044] = true,
+    [33206] = true, [47788] = true, [6940] = true, [1038] = true, [1044] = true,
     [71484] = true, [71485] = true, [71486] = true, [71487] = true, [71491] = true, [71492] = true,
     [71561] = true, [71556] = true, [71558] = true, [71557] = true, [71559] = true, [71560] = true,
 }
@@ -954,127 +890,58 @@ local TANK_STANCE_BUFFS = {
 -------------------------------------------------------------------------------
 local RAID_UTILITY = {
     [54861] = "Nitro Boosts", [55016] = "Nitro Boosts",
-    [56488] = "Global Thermal Sapper Charge",
-    [56350] = "Saronite Bomb",
-    [67890] = "Frag Belt",
-    [1966]  = "Feint", [6768] = "Feint", [8637] = "Feint", [11303] = "Feint",
+    [56488] = "Global Thermal Sapper Charge", [56350] = "Saronite Bomb", [67890] = "Frag Belt",
+    [1966] = "Feint", [6768] = "Feint", [8637] = "Feint", [11303] = "Feint",
     [25302] = "Feint", [27448] = "Feint", [48658] = "Feint", [48659] = "Feint",
     [57934] = "Tricks of the Trade",
-    [2983]  = "Sprint", [8696] = "Sprint", [11305] = "Sprint",
-    [1856]  = "Vanish", [1857] = "Vanish", [26889] = "Vanish",
-    [31224] = "Cloak of Shadows",
-    [51722] = "Dismantle",
-    [1766]  = "Kick",
-    [2094]  = "Blind",
-    [5277]  = "Evasion", [26669] = "Evasion",
-    [1022]  = "Hand of Protection", [5599] = "Hand of Protection", [10278] = "Hand of Protection",
-    [633]   = "Lay on Hands", [2800] = "Lay on Hands", [10310] = "Lay on Hands", [27154] = "Lay on Hands", [48788] = "Lay on Hands",
-    [1038]  = "Hand of Salvation",
-    [1044]  = "Hand of Freedom",
-    [6940]  = "Hand of Sacrifice",
-    [64205] = "Divine Sacrifice",
-    [70940] = "Divine Guardian",
-    [31821] = "Aura Mastery",
-    [53601] = "Sacred Shield",
-    [642]   = "Divine Shield",
-    [498]   = "Divine Protection",
-    [10308] = "Hammer of Justice", [853] = "Hammer of Justice",
-    [4987]  = "Cleanse",
-    [31789] = "Righteous Defense",
-    [62124] = "Hand of Reckoning",
+    [2983] = "Sprint", [8696] = "Sprint", [11305] = "Sprint",
+    [1856] = "Vanish", [1857] = "Vanish", [26889] = "Vanish",
+    [31224] = "Cloak of Shadows", [51722] = "Dismantle", [1766] = "Kick", [2094] = "Blind",
+    [5277] = "Evasion", [26669] = "Evasion",
+    [1022] = "Hand of Protection", [5599] = "Hand of Protection", [10278] = "Hand of Protection",
+    [633] = "Lay on Hands", [2800] = "Lay on Hands", [10310] = "Lay on Hands", [27154] = "Lay on Hands", [48788] = "Lay on Hands",
+    [1038] = "Hand of Salvation", [1044] = "Hand of Freedom", [6940] = "Hand of Sacrifice",
+    [64205] = "Divine Sacrifice", [70940] = "Divine Guardian", [31821] = "Aura Mastery",
+    [53601] = "Sacred Shield", [642] = "Divine Shield", [498] = "Divine Protection",
+    [10308] = "Hammer of Justice", [853] = "Hammer of Justice", [4987] = "Cleanse",
+    [31789] = "Righteous Defense", [62124] = "Hand of Reckoning",
     [20484] = "Rebirth", [20739] = "Rebirth", [20742] = "Rebirth", [20747] = "Rebirth", [20748] = "Rebirth", [26994] = "Rebirth", [48477] = "Rebirth",
-    [740]   = "Tranquility", [8918] = "Tranquility", [9862] = "Tranquility", [9863] = "Tranquility", [26983] = "Tranquility", [48446] = "Tranquility", [48447] = "Tranquility",
-    [29166] = "Innervate",
-    [22812] = "Barkskin",
-    [61336] = "Survival Instincts",
-    [22842] = "Frenzied Regeneration",
-    [2782]  = "Remove Curse",
-    [2893]  = "Abolish Poison",
-    [33786] = "Cyclone",
-    [6795]  = "Growl",
-    [5209]  = "Challenging Roar",
+    [740] = "Tranquility", [8918] = "Tranquility", [9862] = "Tranquility", [9863] = "Tranquility", [26983] = "Tranquility", [48446] = "Tranquility", [48447] = "Tranquility",
+    [29166] = "Innervate", [22812] = "Barkskin", [61336] = "Survival Instincts",
+    [22842] = "Frenzied Regeneration", [2782] = "Remove Curse", [2893] = "Abolish Poison",
+    [33786] = "Cyclone", [6795] = "Growl", [5209] = "Challenging Roar",
     [20707] = "Soulstone Resurrection", [20762] = "Soulstone Resurrection", [20763] = "Soulstone Resurrection",
     [20764] = "Soulstone Resurrection", [20765] = "Soulstone Resurrection", [27239] = "Soulstone Resurrection", [47883] = "Soulstone Resurrection",
-    [47241] = "Metamorphosis",
-    [698]   = "Ritual of Summoning",
+    [47241] = "Metamorphosis", [698] = "Ritual of Summoning",
     [29893] = "Ritual of Souls", [58887] = "Ritual of Souls",
-    [48020] = "Demonic Circle: Teleport",
-    [29858] = "Soulshatter",
-    [47847] = "Shadowfury",
-    [19647] = "Spell Lock",
-    [42650] = "Army of the Dead",
-    [51052] = "Anti-Magic Zone",
-    [48707] = "Anti-Magic Shell",
-    [48792] = "Icebound Fortitude",
-    [55233] = "Vampiric Blood",
-    [51271] = "Unbreakable Armor",
-    [49222] = "Bone Shield",
-    [61999] = "Raise Ally",
-    [47568] = "Empower Rune Weapon",
-    [49576] = "Death Grip",
-    [47528] = "Mind Freeze",
-    [47476] = "Strangulate",
-    [56222] = "Dark Command",
-    [49016] = "Hysteria",
-    [17]    = "Power Word: Shield", [48065] = "Power Word: Shield", [48066] = "Power Word: Shield",
-    [33206] = "Pain Suppression",
-    [47788] = "Guardian Spirit",
-    [10060] = "Power Infusion",
-    [64843] = "Divine Hymn",
-    [64901] = "Hymn of Hope",
-    [6346]  = "Fear Ward",
-    [586]   = "Fade",
-    [47585] = "Dispersion",
-    [32375] = "Mass Dispel",
-    [988]   = "Dispel Magic", [527] = "Dispel Magic",
-    [528]   = "Cure Disease", [552] = "Abolish Disease",
-    [10955] = "Shackle Undead",
-    [32182] = "Heroism",
-    [2825]  = "Bloodlust",
-    [16190] = "Mana Tide Totem",
-    [8143]  = "Tremor Totem",
-    [8177]  = "Grounding Totem",
-    [8170]  = "Cleansing Totem",
-    [2062]  = "Earth Elemental Totem",
-    [2894]  = "Fire Elemental Totem",
-    [57994] = "Wind Shear",
-    [8012]  = "Purge", [370] = "Purge",
-    [51886] = "Cleanse Spirit",
-    [526]   = "Cure Toxins",
-    [51514] = "Hex",
-    [30823] = "Shamanistic Rage",
-    [34477] = "Misdirection",
-    [5384]  = "Feign Death",
-    [19263] = "Deterrence",
-    [19801] = "Tranquilizing Shot",
-    [20736] = "Distracting Shot",
-    [13809] = "Frost Trap",
-    [14311] = "Freezing Trap",
-    [60192] = "Freezing Arrow",
-    [53271] = "Master's Call",
-    [53480] = "Roar of Sacrifice",
-    [781]   = "Disengage",
-    [64382] = "Shattering Throw",
-    [871]   = "Shield Wall",
-    [12975] = "Last Stand",
-    [55694] = "Enraged Regeneration",
-    [3411]  = "Intervene",
-    [50720] = "Vigilance",
-    [676]   = "Disarm",
-    [6552]  = "Pummel",
-    [72]    = "Shield Bash",
-    [23920] = "Spell Reflection",
-    [1161]  = "Challenging Shout",
-    [1719]  = "Recklessness",
-    [66]    = "Invisibility",
-    [45438] = "Ice Block",
-    [12051] = "Evocation",
-    [2139]  = "Counterspell",
-    [30449] = "Spellsteal",
-    [475]   = "Remove Curse",
-    [54646] = "Focus Magic",
-    [55342] = "Mirror Image",
-    [130]   = "Slow Fall"
+    [48020] = "Demonic Circle: Teleport", [29858] = "Soulshatter", [47847] = "Shadowfury", [19647] = "Spell Lock",
+    [42650] = "Army of the Dead", [51052] = "Anti-Magic Zone", [48707] = "Anti-Magic Shell",
+    [48792] = "Icebound Fortitude", [55233] = "Vampiric Blood", [51271] = "Unbreakable Armor",
+    [49222] = "Bone Shield", [61999] = "Raise Ally", [47568] = "Empower Rune Weapon",
+    [49576] = "Death Grip", [47528] = "Mind Freeze", [47476] = "Strangulate",
+    [56222] = "Dark Command", [49016] = "Hysteria",
+    [17] = "Power Word: Shield", [48065] = "Power Word: Shield", [48066] = "Power Word: Shield",
+    [33206] = "Pain Suppression", [47788] = "Guardian Spirit", [10060] = "Power Infusion",
+    [64843] = "Divine Hymn", [64901] = "Hymn of Hope", [6346] = "Fear Ward",
+    [586] = "Fade", [47585] = "Dispersion", [32375] = "Mass Dispel",
+    [988] = "Dispel Magic", [527] = "Dispel Magic",
+    [528] = "Cure Disease", [552] = "Abolish Disease", [10955] = "Shackle Undead",
+    [32182] = "Heroism", [2825] = "Bloodlust", [16190] = "Mana Tide Totem",
+    [8143] = "Tremor Totem", [8177] = "Grounding Totem", [8170] = "Cleansing Totem",
+    [2062] = "Earth Elemental Totem", [2894] = "Fire Elemental Totem", [57994] = "Wind Shear",
+    [8012] = "Purge", [370] = "Purge", [51886] = "Cleanse Spirit",
+    [526] = "Cure Toxins", [51514] = "Hex", [30823] = "Shamanistic Rage",
+    [34477] = "Misdirection", [5384] = "Feign Death", [19263] = "Deterrence",
+    [19801] = "Tranquilizing Shot", [20736] = "Distracting Shot", [13809] = "Frost Trap",
+    [14311] = "Freezing Trap", [60192] = "Freezing Arrow", [53271] = "Master's Call",
+    [53480] = "Roar of Sacrifice", [781] = "Disengage",
+    [64382] = "Shattering Throw", [871] = "Shield Wall", [12975] = "Last Stand",
+    [55694] = "Enraged Regeneration", [3411] = "Intervene", [50720] = "Vigilance",
+    [676] = "Disarm", [6552] = "Pummel", [72] = "Shield Bash",
+    [23920] = "Spell Reflection", [1161] = "Challenging Shout", [1719] = "Recklessness",
+    [66] = "Invisibility", [45438] = "Ice Block", [12051] = "Evocation",
+    [2139] = "Counterspell", [30449] = "Spellsteal", [475] = "Remove Curse",
+    [54646] = "Focus Magic", [55342] = "Mirror Image", [130] = "Slow Fall"
 }
 
 local UTILITY_CLASS_FILTER = {
@@ -1112,7 +979,7 @@ local INSTANT_CONSUMABLES = {
     [43186] = true, [53942] = true, [43185] = true, [53934] = true,
     [47878] = true, [47871] = true, [47875] = true, [27230] = true,
     [42985] = true, [33312] = true, [42984] = true,
-    [9512]  = true, [9513]  = true, [18160] = true,
+    [9512] = true, [9513] = true, [18160] = true,
 }
 
 local PERSONAL_DEFENSIVES_BY_CLASS = {
@@ -1195,6 +1062,7 @@ local function GetNewSegment(name, isBoss, bossID, bossName, attempt)
         raidUtility = {},
         deaths = {},
         players = {},
+        playerIDs = {},
         enrages = {},
         tanks = {}
     }
@@ -1227,6 +1095,7 @@ local function EnsureTrashSegment()
         topSeg.difficulty = currentDiff
         topSeg.deaths = topSeg.deaths or {}
         topSeg.players = topSeg.players or {}
+        topSeg.playerIDs = topSeg.playerIDs or {}
         topSeg.enrages = topSeg.enrages or {}
         topSeg.tanks = topSeg.tanks or {}
         currentSegment = topSeg
@@ -1247,7 +1116,7 @@ local function EnsureTrashSegment()
 end
 
 local function ResetLiveSessionState()
-    RaidersTrackerDB.liveSession = { name = "Live Current Session", segments = {}, players = {} }
+    RaidersTrackerDB.liveSession = { name = "Live Current Session", segments = {}, players = {}, playerIDs = {} }
     currentSession = RaidersTrackerDB.liveSession
     currentSegment = nil
     inCombatState = false
@@ -1284,7 +1153,8 @@ local function SaveCurrentLiveSession(startFreshAfterSave)
     local savedCopy = {
         name = "Session " .. stamp,
         segments = cleanedSegments,
-        players = DeepCopyTable(currentSession.players or {})
+        players = DeepCopyTable(currentSession.players or {}),
+        playerIDs = DeepCopyTable(currentSession.playerIDs or {})
     }
     table.insert(RaidersTrackerDB.savedSessions, 1, savedCopy)
     AnnounceLocalChat("Current session saved as: " .. savedCopy.name)
@@ -1327,6 +1197,7 @@ end
 
 local function SnapshotRaidActiveBuffs(bossSegment)
     bossSegment.tanks = bossSegment.tanks or {}
+    bossSegment.playerIDs = bossSegment.playerIDs or {}
     local function ScanUnit(unit)
         if not UnitExists(unit) then return end
         local name = UnitName(unit)
@@ -1334,6 +1205,11 @@ local function SnapshotRaidActiveBuffs(bossSegment)
         local _, engClass = UnitClass(unit)
         local pClass = engClass or GetSafePlayerClass(name)
         bossSegment.players[name] = pClass
+        if currentSession then
+            currentSession.players = currentSession.players or {}
+            currentSession.players[name] = pClass
+        end
+        CachePlayerCharID(name, UnitGUID(unit), bossSegment)
 
         for i = 1, 40 do
             local buffName, _, _, _, _, _, _, _, _, _, spellID = UnitBuff(unit, i)
@@ -1402,8 +1278,10 @@ local function StartEncounter(bossID, bossName, overrideData, fromSpeech)
     for _, ev in ipairs(recentPrePullEvents) do
         if (now - ev.ts) <= 5.0 then
             newBossSeg.players[ev.pName] = ev.pClass
+            if ev.pCharID then newBossSeg.playerIDs[ev.pName] = ev.pCharID end
             if ev.extraPlayer and ev.extraClass then
                 newBossSeg.players[ev.extraPlayer] = ev.extraClass
+                if ev.extraCharID then newBossSeg.playerIDs[ev.extraPlayer] = ev.extraCharID end
             end
             if ev.isTankPlayer then
                 newBossSeg.tanks[ev.isTankPlayer] = true
@@ -2875,7 +2753,6 @@ local function CreateCharacterFrame()
     emptyLabel:SetText("|cff999999No characters recorded in this session yet.|r")
     emptyLabel:Hide()
 
-    -- Context menu for blacklist reasons
     local blacklistMenu = CreateFrame("Frame", "RTBlacklistContextMenu", UIParent)
     blacklistMenu:SetSize(160, 150)
     blacklistMenu:SetFrameStrata("FULLSCREEN_DIALOG")
@@ -2916,17 +2793,38 @@ local function CreateCharacterFrame()
                 RaidersTrackerDB.blacklist = RaidersTrackerDB.blacklist or {}
                 local tName = blacklistMenu.targetName
                 local tClass = blacklistMenu.targetClass or "WARRIOR"
-                local tGUID = blacklistMenu.targetGUID
-                local charID = ExtractCharacterID(tGUID) or ("NAME:" .. tName)
+                local activeSession = GetActiveSession()
+                local resolvedID = ExtractCharacterID(blacklistMenu.targetCharID)
+                    or ExtractCharacterID(blacklistMenu.targetGUID)
+                    or (activeSession and activeSession.playerIDs and activeSession.playerIDs[tName])
+                    or (currentSession and currentSession.playerIDs and currentSession.playerIDs[tName])
+                    or nameToCharID[tName]
+                    or ExtractCharacterID(UnitGUID(tName))
+                local charID = resolvedID or ("NAME:" .. tName)
+
+                if resolvedID and RaidersTrackerDB.blacklist["NAME:" .. tName] then
+                    local oldFallback = RaidersTrackerDB.blacklist["NAME:" .. tName]
+                    RaidersTrackerDB.blacklist[charID] = RaidersTrackerDB.blacklist[charID] or {
+                        names = {},
+                        class = tClass,
+                        timestamp = oldFallback.timestamp or date("%Y-%m-%d %H:%M")
+                    }
+                    for n in pairs(oldFallback.names or {}) do
+                        RaidersTrackerDB.blacklist[charID].names[n] = true
+                    end
+                    RaidersTrackerDB.blacklist["NAME:" .. tName] = nil
+                end
 
                 RaidersTrackerDB.blacklist[charID] = RaidersTrackerDB.blacklist[charID] or {
                     names = {},
                     class = tClass,
                     timestamp = date("%Y-%m-%d %H:%M")
                 }
+                RaidersTrackerDB.blacklist[charID].names = RaidersTrackerDB.blacklist[charID].names or {}
                 RaidersTrackerDB.blacklist[charID].names[tName] = true
                 RaidersTrackerDB.blacklist[charID].reason = self.reason
                 RaidersTrackerDB.blacklist[charID].class = tClass
+                RaidersTrackerDB.blacklist[charID].timestamp = date("%Y-%m-%d %H:%M")
 
                 AnnounceLocalChat(string.format("Blacklisted %s (ID: %s) for: %s", tName, charID, self.reason))
                 if BlacklistFrame and BlacklistFrame:IsShown() then
@@ -2972,6 +2870,7 @@ local function CreateCharacterFrame()
             if self.playerName then
                 blacklistMenu.targetName = self.playerName
                 blacklistMenu.targetClass = self.playerClass
+                blacklistMenu.targetCharID = self.playerCharID
                 blacklistMenu.targetGUID = self.playerGUID
                 HideAllCustomDropdownMenus()
                 blacklistMenu:ClearAllPoints()
@@ -2989,14 +2888,22 @@ local function CreateCharacterFrame()
 
     RefreshCharactersView = function()
         if not CharacterFrame or not CharacterFrame:IsShown() then return end
+        UpdateGroupCache()
         local activeSession = GetActiveSession()
         local playerMap = {}
+        local playerIDMap = {}
         for pName, pClass in pairs((activeSession and activeSession.players) or {}) do
             playerMap[pName] = pClass
+        end
+        for pName, cID in pairs((activeSession and activeSession.playerIDs) or {}) do
+            playerIDMap[pName] = cID
         end
         for _, seg in ipairs((activeSession and activeSession.segments) or {}) do
             for pName, pClass in pairs(seg.players or {}) do
                 playerMap[pName] = pClass
+            end
+            for pName, cID in pairs(seg.playerIDs or {}) do
+                playerIDMap[pName] = playerIDMap[pName] or cID
             end
         end
 
@@ -3017,11 +2924,21 @@ local function CreateCharacterFrame()
             local pName = sortedPlayers[idx]
             local pClass = playerMap[pName] or "WARRIOR"
             local hexColor = GetPlayerClassColor(pClass)
+            local pCharID = (activeSession and activeSession.playerIDs and activeSession.playerIDs[pName])
+                or playerIDMap[pName]
+                or nameToCharID[pName]
+                or ExtractCharacterID(UnitGUID(pName))
+            if pCharID and activeSession then
+                activeSession.playerIDs = activeSession.playerIDs or {}
+                activeSession.playerIDs[pName] = pCharID
+                nameToCharID[pName] = pCharID
+            end
             rows[idx].text:SetText(string.format("%s |cff888888(%s)|r", ColorizeText(pName, hexColor), pClass))
             rows[idx].btnWhisper.playerName = pName
             rows[idx].btnBlacklist.playerName = pName
             rows[idx].btnBlacklist.playerClass = pClass
-            rows[idx].btnBlacklist.playerGUID = groupGUIDs and groupGUIDs[pName] or nil
+            rows[idx].btnBlacklist.playerCharID = pCharID
+            rows[idx].btnBlacklist.playerGUID = pCharID
             if not rows[idx]:IsShown() then rows[idx]:Show() end
         end
         for idx = shownCount + 1, 100 do rows[idx]:Hide() end
@@ -3038,16 +2955,16 @@ end
 local function CreateReportFrame()
     ReportFrame = CreateRUTPanel("RTReportFrame", 680, 540, "Report Segment Hub")
 
-    local activeReportPanel = "ALL"        -- "ALL", "CHAR", "FAILS", "DEATHS"
-    local activeAllFormat = "PLAIN"        -- "PLAIN", "DISCORD", "HTML"
-    local activeCharSubMode = "BUFFS"      -- "BUFFS", "FAILS"
-    local activeFailSubMode = "EARLY"      -- "EARLY", "SLACKERS", "FAILS"
-    local failLineLimit = 10               -- 5, 10, 20, 9999 (All)
+    local activeReportPanel = "ALL"
+    local activeAllFormat = "PLAIN"
+    local activeCharSubMode = "BUFFS"
+    local activeFailSubMode = "EARLY"
+    local failLineLimit = 10
     local selectedReportChar = nil
     local currentPreviewText = ""
     local currentRaidChatLines = {}
 
-    local GenerateReport -- Forward declaration
+    local GenerateReport
 
     local btnPanelAll = CreateFrame("Button", nil, ReportFrame, "UIPanelButtonTemplate")
     btnPanelAll:SetSize(130, 24)
@@ -3069,7 +2986,6 @@ local function CreateReportFrame()
     btnPanelDeaths:SetPoint("LEFT", btnPanelFails, "RIGHT", 6, 0)
     btnPanelDeaths:SetText("4. Suspicious Deaths")
 
-    -- Sub-Bar for Panel 1 (ALL Data)
     local subFrameAll = CreateFrame("Frame", nil, ReportFrame)
     subFrameAll:SetSize(640, 28)
     subFrameAll:SetPoint("TOPLEFT", ReportFrame, "TOPLEFT", 18, -62)
@@ -3097,7 +3013,6 @@ local function CreateReportFrame()
     copyHint:SetPoint("LEFT", chkHTML.text, "RIGHT", 14, 0)
     copyHint:SetText("|cff888888(Ctrl+A, Ctrl+C to copy)|r")
 
-    -- Sub-Bar for Panel 2 (CHARACTER Data)
     local subFrameChar = CreateFrame("Frame", nil, ReportFrame)
     subFrameChar:SetSize(640, 28)
     subFrameChar:SetPoint("TOPLEFT", ReportFrame, "TOPLEFT", 18, -62)
@@ -3120,7 +3035,6 @@ local function CreateReportFrame()
     btnCharFails:SetPoint("LEFT", btnCharBuffs, "RIGHT", 8, 0)
     btnCharFails:SetText("Character Fails")
 
-    -- Sub-Bar for Panel 3 (RAID FAILS - 3 Section Buttons + Limit Dropdown)
     local subFrameFails = CreateFrame("Frame", nil, ReportFrame)
     subFrameFails:SetSize(640, 28)
     subFrameFails:SetPoint("TOPLEFT", ReportFrame, "TOPLEFT", 18, -62)
@@ -3154,7 +3068,6 @@ local function CreateReportFrame()
     end
     limitDropdown:SetText(failLineLimit == 9999 and "All lines" or (failLineLimit .. " lines"))
 
-    -- Sub-Bar for Panel 4 (Suspicious Deaths Info Banner)
     local subFrameInfo = CreateFrame("Frame", nil, ReportFrame)
     subFrameInfo:SetSize(640, 28)
     subFrameInfo:SetPoint("TOPLEFT", ReportFrame, "TOPLEFT", 18, -62)
@@ -3163,7 +3076,6 @@ local function CreateReportFrame()
     local infoBannerText = subFrameInfo:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
     infoBannerText:SetPoint("LEFT", subFrameInfo, "LEFT", 4, 0)
 
-    -- Read-Only Preview Box
     local viewBox = CreateWhiteBorderViewBox(ReportFrame, -94, 46)
 
     local scrollFrame = CreateFrame("ScrollFrame", "RTReportScrollFrame", viewBox, "UIPanelScrollFrameTemplate")
@@ -3286,12 +3198,8 @@ local function CreateReportFrame()
     local function BuildSingleCharacterFails(seg, pName, pClass, segDur, maxPossible30s, enrageStr, totalEnrages, detectedTanks)
         local fails = {}
         local hasFlask, hasFood, potCount = GetPlayerConsumableStatus(seg, pName)
-        if not hasFlask then
-            table.insert(fails, { text = "Missing Flask / Elixir", severity = 3 })
-        end
-        if not hasFood then
-            table.insert(fails, { text = "Missing Well Fed Food Buff", severity = 3 })
-        end
+        if not hasFlask then table.insert(fails, { text = "Missing Flask / Elixir", severity = 3 }) end
+        if not hasFood then table.insert(fails, { text = "Missing Well Fed Food Buff", severity = 3 }) end
         if potCount == 0 then
             table.insert(fails, { text = "Combat Potions Used: 0 (No pre-pot or combat potion used)", severity = 4 })
         elseif potCount == 1 then
@@ -3437,9 +3345,6 @@ local function CreateReportFrame()
         local enrageStr, totalEnrages = GetEnrageSummaryString(seg)
         local detectedTanks = DetectSegmentTanks(seg, presentMap)
 
-        -----------------------------------------------------------------------
-        -- PANEL 1: REPORT ALL DATA
-        -----------------------------------------------------------------------
         if activeReportPanel == "ALL" then
             local deathPlayers = {}
             local totalSegDeaths = 0
@@ -3474,20 +3379,17 @@ local function CreateReportFrame()
             local header = string.format("[%s %s] - %s (Full Segment Report)", segZone, segDiff, segName)
 
             if activeAllFormat == "HTML" then
-                local lines = {}
-                table.insert(lines, "<!DOCTYPE html>")
-                table.insert(lines, "<html>")
-                table.insert(lines, "<head>")
-                table.insert(lines, '  <meta charset="UTF-8">')
-                table.insert(lines, "  <title>Raiders Tracker by Copper - " .. EscapeHTML(header) .. "</title>")
-                table.insert(lines, "</head>")
-                table.insert(lines, '<body style="background-color: #141419; color: #E0E0E0; font-family: Arial, Helvetica, sans-serif; line-height: 1.5; padding: 20px;">')
-                table.insert(lines, '  <h1 style="color: #00FF00; margin-bottom: 4px;">Raiders Tracker by Copper</h1>')
-                table.insert(lines, string.format('  <p style="margin-top: 0; margin-bottom: 18px;">Version %s &mdash; <a href="%s" target="_blank" style="color: #69CCF0; text-decoration: underline;">%s</a></p>', EscapeHTML(GetAddonVersion()), GITHUB_URL, GITHUB_URL))
-                table.insert(lines, string.format('  <h1 style="color: #FFFFFF; border-bottom: 1px solid #444444; padding-bottom: 6px;">%s</h1>', EscapeHTML(header)))
-
-                table.insert(lines, string.format('  <h1 style="color: #FFD100; font-size: 1.35em; margin-top: 24px;">1. Characters Present (%d)</h1>', #presentList))
-                table.insert(lines, "  <ul>")
+                local lines = {
+                    "<!DOCTYPE html>", "<html>", "<head>", '  <meta charset="UTF-8">',
+                    "  <title>Raiders Tracker by Copper - " .. EscapeHTML(header) .. "</title>",
+                    "</head>",
+                    '<body style="background-color: #141419; color: #E0E0E0; font-family: Arial, Helvetica, sans-serif; line-height: 1.5; padding: 20px;">',
+                    '  <h1 style="color: #00FF00; margin-bottom: 4px;">Raiders Tracker by Copper</h1>',
+                    string.format('  <p style="margin-top: 0; margin-bottom: 18px;">Version %s &mdash; <a href="%s" target="_blank" style="color: #69CCF0; text-decoration: underline;">%s</a></p>', EscapeHTML(GetAddonVersion()), GITHUB_URL, GITHUB_URL),
+                    string.format('  <h1 style="color: #FFFFFF; border-bottom: 1px solid #444444; padding-bottom: 6px;">%s</h1>', EscapeHTML(header)),
+                    string.format('  <h1 style="color: #FFD100; font-size: 1.35em; margin-top: 24px;">1. Characters Present (%d)</h1>', #presentList),
+                    "  <ul>"
+                }
                 if #presentList == 0 then
                     table.insert(lines, "    <li>None</li>")
                 else
@@ -3498,7 +3400,6 @@ local function CreateReportFrame()
                     end
                 end
                 table.insert(lines, "  </ul>")
-
                 table.insert(lines, string.format('  <h1 style="color: #FFD100; font-size: 1.35em; margin-top: 24px;">2. Deaths &amp; Death Log (%d Total)</h1>', totalSegDeaths))
                 table.insert(lines, "  <ul>")
                 if #deathPlayers == 0 then
@@ -3531,7 +3432,6 @@ local function CreateReportFrame()
                     end
                 end
                 table.insert(lines, "  </ul>")
-
                 table.insert(lines, '  <h1 style="color: #FFD100; font-size: 1.35em; margin-top: 24px;">3. Potions &amp; Buffs</h1>')
                 table.insert(lines, "  <ul>")
                 if #potPlayers == 0 then
@@ -3555,7 +3455,6 @@ local function CreateReportFrame()
                     end
                 end
                 table.insert(lines, "  </ul>")
-
                 table.insert(lines, '  <h1 style="color: #FFD100; font-size: 1.35em; margin-top: 24px;">4. Raid Utility</h1>')
                 table.insert(lines, "  <ul>")
                 if #utilPlayers == 0 then
@@ -3653,9 +3552,6 @@ local function CreateReportFrame()
                 currentPreviewText = table.concat(currentRaidChatLines, "\n")
             end
 
-        -----------------------------------------------------------------------
-        -- PANEL 2: REPORT CHARACTER DATA
-        -----------------------------------------------------------------------
         elseif activeReportPanel == "CHAR" then
             local lines = BuildStandardRaidHeaderLines(seg)
             if not selectedReportChar then
@@ -3694,9 +3590,6 @@ local function CreateReportFrame()
             currentRaidChatLines = lines
             currentPreviewText = table.concat(lines, "\n")
 
-        -----------------------------------------------------------------------
-        -- PANEL 3: REPORT RAID FAILS (Split into 3 Sections & Limited)
-        -----------------------------------------------------------------------
         elseif activeReportPanel == "FAILS" then
             local lines = BuildStandardRaidHeaderLines(seg)
             local allSegDeaths = {}
@@ -3772,7 +3665,7 @@ local function CreateReportFrame()
                     end
                 end
 
-            else -- CD Fails
+            else
                 table.insert(lines, "--- Raid Fails: Critical Cooldown & Duty Fails ---")
                 local cdFails = {}
                 local durLabel = (segDur > 0) and FormatDurationShort(segDur) or "segment"
@@ -3825,9 +3718,6 @@ local function CreateReportFrame()
             currentRaidChatLines = lines
             currentPreviewText = table.concat(lines, "\n")
 
-        -----------------------------------------------------------------------
-        -- PANEL 4: REPORT SUSPICIOUS DEATHS (Wipe Filtered & Safe Number Coercion)
-        -----------------------------------------------------------------------
         elseif activeReportPanel == "DEATHS" then
             local lines = BuildStandardRaidHeaderLines(seg)
             table.insert(lines, "--- Chronological Suspicious Deaths Breakdown ---")
@@ -3904,37 +3794,24 @@ local function CreateReportFrame()
 
     chkPlain:SetScript("OnClick", function()
         activeAllFormat = "PLAIN"
-        chkPlain:SetChecked(true)
-        chkDiscord:SetChecked(false)
-        chkHTML:SetChecked(false)
+        chkPlain:SetChecked(true); chkDiscord:SetChecked(false); chkHTML:SetChecked(false)
         GenerateReport()
     end)
 
     chkDiscord:SetScript("OnClick", function()
         activeAllFormat = "DISCORD"
-        chkPlain:SetChecked(false)
-        chkDiscord:SetChecked(true)
-        chkHTML:SetChecked(false)
+        chkPlain:SetChecked(false); chkDiscord:SetChecked(true); chkHTML:SetChecked(false)
         GenerateReport()
     end)
 
     chkHTML:SetScript("OnClick", function()
         activeAllFormat = "HTML"
-        chkPlain:SetChecked(false)
-        chkDiscord:SetChecked(false)
-        chkHTML:SetChecked(true)
+        chkPlain:SetChecked(false); chkDiscord:SetChecked(false); chkHTML:SetChecked(true)
         GenerateReport()
     end)
 
-    btnCharBuffs:SetScript("OnClick", function()
-        activeCharSubMode = "BUFFS"
-        GenerateReport()
-    end)
-
-    btnCharFails:SetScript("OnClick", function()
-        activeCharSubMode = "FAILS"
-        GenerateReport()
-    end)
+    btnCharBuffs:SetScript("OnClick", function() activeCharSubMode = "BUFFS"; GenerateReport() end)
+    btnCharFails:SetScript("OnClick", function() activeCharSubMode = "FAILS"; GenerateReport() end)
 
     ReportFrame:SetScript("OnShow", GenerateReport)
 end
@@ -4089,22 +3966,25 @@ local function RecordProc(sourceName, sourceGUID, destName, destGUID, category, 
     local targetSegment = currentSession.segments[1]
     if not targetSegment then return end
     targetSegment.tanks = targetSegment.tanks or {}
+    targetSegment.playerIDs = targetSegment.playerIDs or {}
 
     local srcIsMember = IsGroupMember(sourceName, sourceGUID)
     local dstIsMember = IsGroupMember(destName, destGUID)
     local srcClass = GetSafePlayerClass(sourceName, sourceGUID)
     local dstClass = GetSafePlayerClass(destName, destGUID)
+    local srcCharID = srcIsMember and CachePlayerCharID(sourceName, sourceGUID, targetSegment) or nil
+    local dstCharID = dstIsMember and CachePlayerCharID(destName, destGUID, targetSegment) or nil
     local addedNewSessionPlayer = false
     local markedTankPlayer = nil
 
     if category == "POTIONS" then
-        local pName, pClass = nil, nil
+        local pName, pClass, pCharID = nil, nil, nil
         if isInstantCast then
             if not srcIsMember then return end
-            pName, pClass = sourceName, srcClass
+            pName, pClass, pCharID = sourceName, srcClass, srcCharID
         else
             if not dstIsMember then return end
-            pName, pClass = destName, dstClass
+            pName, pClass, pCharID = destName, dstClass, dstCharID
         end
 
         targetSegment.players[pName] = pClass
@@ -4122,13 +4002,13 @@ local function RecordProc(sourceName, sourceGUID, destName, destGUID, category, 
         end
 
         local entryName = baseBuffName
-        local extraPlayer, extraClass = nil, nil
+        local extraPlayer, extraClass, extraCharID = nil, nil, nil
 
         if not isInstantCast and srcIsMember and sourceName ~= pName then
             targetSegment.players[sourceName] = srcClass
             if not currentSession.players[sourceName] then addedNewSessionPlayer = true end
             currentSession.players[sourceName] = srcClass
-            extraPlayer, extraClass = sourceName, srcClass
+            extraPlayer, extraClass, extraCharID = sourceName, srcClass, srcCharID
             local coloredGiver = ColorizeText(sourceName, GetPlayerClassColor(srcClass))
             entryName = string.format("%s [%s]", baseBuffName, coloredGiver)
         end
@@ -4141,8 +4021,10 @@ local function RecordProc(sourceName, sourceGUID, destName, destGUID, category, 
                 category = "POTIONS",
                 pName = pName,
                 pClass = pClass,
+                pCharID = pCharID,
                 extraPlayer = extraPlayer,
                 extraClass = extraClass,
+                extraCharID = extraCharID,
                 isTankPlayer = markedTankPlayer,
                 entryName = entryName,
                 ts = GetTime()
@@ -4167,13 +4049,13 @@ local function RecordProc(sourceName, sourceGUID, destName, destGUID, category, 
         end
 
         local entryName = baseName
-        local extraPlayer, extraClass = nil, nil
+        local extraPlayer, extraClass, extraCharID = nil, nil, nil
 
         if dstIsMember and EXTERNAL_TARGETED_UTILITY[baseName] then
             targetSegment.players[destName] = dstClass
             if not currentSession.players[destName] then addedNewSessionPlayer = true end
             currentSession.players[destName] = dstClass
-            extraPlayer, extraClass = destName, dstClass
+            extraPlayer, extraClass, extraCharID = destName, dstClass, dstCharID
             local coloredTarget = ColorizeText(destName, GetPlayerClassColor(dstClass))
             entryName = string.format("%s [%s]", baseName, coloredTarget)
 
@@ -4191,8 +4073,10 @@ local function RecordProc(sourceName, sourceGUID, destName, destGUID, category, 
                 category = "UTILITY",
                 pName = sourceName,
                 pClass = srcClass,
+                pCharID = srcCharID,
                 extraPlayer = extraPlayer,
                 extraClass = extraClass,
+                extraCharID = extraCharID,
                 isTankPlayer = markedTankPlayer,
                 entryName = entryName,
                 ts = GetTime()
@@ -4226,6 +4110,7 @@ local function RecordPlayerDeath(destName, destGUID)
     targetSegment.players[destName] = dstClass
     currentSession.players = currentSession.players or {}
     currentSession.players[destName] = dstClass
+    CachePlayerCharID(destName, destGUID, targetSegment)
 
     targetSegment.deaths = targetSegment.deaths or {}
     targetSegment.deaths[destName] = targetSegment.deaths[destName] or {}
@@ -4390,7 +4275,13 @@ eventHandler:SetScript("OnEvent", function(self, event, ...)
     if event == "COMBAT_LOG_EVENT_UNFILTERED" then
         local timestamp, subevent, sourceGUID, sourceName, sourceFlags, destGUID, destName, destFlags, arg9, arg10, arg11, arg12, arg13 = ...
 
-        -- A. Track Incoming Damage to Raid Members for Detailed Death Logs
+        if sourceName and sourceGUID and IsGroupMember(sourceName, sourceGUID) then
+            CachePlayerCharID(sourceName, sourceGUID)
+        end
+        if destName and destGUID and IsGroupMember(destName, destGUID) then
+            CachePlayerCharID(destName, destGUID)
+        end
+
         if destName and IsGroupMember(destName, destGUID) then
             if subevent == "SWING_DAMAGE" then
                 local amount, overkill = arg9, arg10
@@ -4435,7 +4326,6 @@ eventHandler:SetScript("OnEvent", function(self, event, ...)
 
         local spellID, spellName = arg9, arg10
 
-        -- B. Special Encounter State Triggers & Enemy Enrage/Frenzy Tracking
         if type(spellID) == "number" then
             if inCombatState then
                 if activeBossName == "Valithria Dreamwalker" and spellID == 71189 then
@@ -4449,7 +4339,6 @@ eventHandler:SetScript("OnEvent", function(self, event, ...)
                 end
             end
 
-            -- Track Hostile Mob Enrage / Frenzy Effects
             if ENEMY_ENRAGE_SPELLS[spellID] and (subevent == "SPELL_AURA_APPLIED" or subevent == "SPELL_AURA_REFRESH" or subevent == "SPELL_CAST_SUCCESS") then
                 local mobName = (subevent == "SPELL_CAST_SUCCESS") and sourceName or destName
                 local mobGUID = (subevent == "SPELL_CAST_SUCCESS") and sourceGUID or destGUID
@@ -4467,7 +4356,6 @@ eventHandler:SetScript("OnEvent", function(self, event, ...)
                 end
             end
 
-            -- Dynamic Tank Stance Buff Detection
             if TANK_STANCE_BUFFS[spellID] and (subevent == "SPELL_AURA_APPLIED" or subevent == "SPELL_AURA_REFRESH") and destName and IsGroupMember(destName, destGUID) then
                 local targetSegment = currentSession and currentSession.segments[1]
                 if targetSegment then
@@ -4477,7 +4365,6 @@ eventHandler:SetScript("OnEvent", function(self, event, ...)
             end
         end
 
-        -- C. Secondary Boss Engage Detection
         if not inCombatState and IsRaidInCombat() then
             local srcID = GetNPCIDFromGUID(sourceGUID)
             local dstID = GetNPCIDFromGUID(destGUID)
@@ -4496,7 +4383,6 @@ eventHandler:SetScript("OnEvent", function(self, event, ...)
             end
         end
 
-        -- D. UNIT_DIED Handling
         if subevent == "UNIT_DIED" then
             if destName and IsGroupMember(destName, destGUID) then
                 RecordPlayerDeath(destName, destGUID)
@@ -4534,7 +4420,6 @@ eventHandler:SetScript("OnEvent", function(self, event, ...)
             return
         end
 
-        -- E. Buffs/Potions Received (View 1) & Raid Utility Used (View 2)
         if type(spellID) == "number" then
             local isAuraApplied = (subevent == "SPELL_AURA_APPLIED" and POTIONS_AND_BUFFS[spellID] ~= nil)
             local isAllowedRefresh = (subevent == "SPELL_AURA_REFRESH" and ALLOW_REFRESH_BUFFS[spellID] == true and POTIONS_AND_BUFFS[spellID] ~= nil)
