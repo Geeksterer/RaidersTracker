@@ -6,12 +6,41 @@ local ADDON_NAME = "Raiders Tracker"
 local AUTHOR = "Copper"
 local GITHUB_URL = "https://github.com/Geeksterer/RaidersTracker/"
 
+local RTExt = {}
+RTExt.MIN_BOSS_PULL_DURATION = 35
+RTExt.DEMONIC_PACT_BUFF_IDS = {
+    [47240] = true, -- Demonic Pact (3.3.5a raid buff)
+    [53646] = true, -- Demonic Pact (alternate 3.3.5a buff ID)
+    [48090] = true, -- Demonic Pact (proc trigger spell)
+}
+RTExt.POTIONS_SUMMARY_EXTRA = {
+    ["Flame Cap"] = true,
+    ["Thistle Tea"] = true,
+    ["Dark Rune"] = true,
+    ["Demonic Rune"] = true,
+}
+RTExt.petGUIDToOwner = {}
+RTExt.petUnitToOwner = {}
+RTExt.petNameToOwner = {}
+RTExt.playerGUIDToUnit = {}
+RTExt.playerNameToUnit = {}
+RTExt.recentDemonicPact = {}
+RTExt.pendingDemonicPacts = {}
+
 local function GetAddonVersion()
-    return GetAddOnMetadata("RaidersTracker", "Version") or "1.2.0"
+    return GetAddOnMetadata("RaidersTracker", "Version") or ""
+end
+
+function RTExt.GetVersionTag()
+    local ver = GetAddonVersion()
+    if ver ~= "" then
+        return " v" .. ver
+    end
+    return ""
 end
 
 local function GetFooterText()
-    return ADDON_NAME .. " v" .. GetAddonVersion() .. " by " .. AUTHOR
+    return ADDON_NAME .. RTExt.GetVersionTag() .. " by " .. AUTHOR
 end
 
 -------------------------------------------------------------------------------
@@ -21,7 +50,7 @@ local defaultDB = {
     enabled = true,
     minimapPos = 45,
     savedSessions = {},
-    liveSession = { name = "Live Current Session", segments = {}, players = {}, playerIDs = {} },
+    liveSession = { name = "Live Current Session", segments = {}, players = {}, playerIDs = {}, zoneTimes = {} },
     blacklist = {} -- [charID] = { names = {["Name"] = true}, class = string, reason = string, timestamp = string }
 }
 
@@ -65,6 +94,15 @@ local function MergeSegmentDataInto(targetSeg, sourceSeg)
             targetSeg.raidUtility[pName][uName] = (targetSeg.raidUtility[pName][uName] or 0) + count
         end
     end
+    targetSeg.demonicPactValues = targetSeg.demonicPactValues or {}
+    for pName, dpList in pairs(sourceSeg.demonicPactValues or {}) do
+        if type(dpList) == "table" and #dpList > 0 then
+            targetSeg.demonicPactValues[pName] = targetSeg.demonicPactValues[pName] or {}
+            for _, spVal in ipairs(dpList) do
+                table.insert(targetSeg.demonicPactValues[pName], spVal)
+            end
+        end
+    end
     targetSeg.deaths = targetSeg.deaths or {}
     for pName, dList in pairs(sourceSeg.deaths or {}) do
         if type(dList) == "table" and #dList > 0 then
@@ -82,7 +120,12 @@ local function MergeSegmentDataInto(targetSeg, sourceSeg)
     for tName, isTank in pairs(sourceSeg.tanks or {}) do
         if isTank then targetSeg.tanks[tName] = true end
     end
-    if sourceSeg.duration and sourceSeg.duration > 0 then
+    if targetSeg.lkFuryDuration and targetSeg.lkFuryDuration > 0 then
+        targetSeg.duration = targetSeg.lkFuryDuration
+    elseif sourceSeg.lkFuryDuration and sourceSeg.lkFuryDuration > 0 then
+        targetSeg.lkFuryDuration = sourceSeg.lkFuryDuration
+        targetSeg.duration = sourceSeg.lkFuryDuration
+    elseif sourceSeg.duration and sourceSeg.duration > 0 then
         targetSeg.duration = math.max(targetSeg.duration or 0, sourceSeg.duration)
     end
 end
@@ -117,7 +160,7 @@ local function InitializeDB()
     for k, v in pairs(defaultDB) do
         if RaidersTrackerDB[k] == nil then
             if k == "liveSession" then
-                RaidersTrackerDB.liveSession = { name = "Live Current Session", segments = {}, players = {}, playerIDs = {} }
+                RaidersTrackerDB.liveSession = { name = "Live Current Session", segments = {}, players = {}, playerIDs = {}, zoneTimes = {} }
             elseif k == "blacklist" then
                 RaidersTrackerDB.blacklist = {}
             else
@@ -130,6 +173,7 @@ local function InitializeDB()
     currentSession = RaidersTrackerDB.liveSession
     currentSession.players = currentSession.players or {}
     currentSession.playerIDs = currentSession.playerIDs or {}
+    currentSession.zoneTimes = currentSession.zoneTimes or {}
     if #currentSession.segments > 0 then
         for _, seg in ipairs(currentSession.segments) do
             seg.deaths = seg.deaths or {}
@@ -137,6 +181,7 @@ local function InitializeDB()
             seg.playerIDs = seg.playerIDs or {}
             seg.potionsAndBuffs = seg.potionsAndBuffs or {}
             seg.raidUtility = seg.raidUtility or {}
+            seg.demonicPactValues = seg.demonicPactValues or {}
             seg.enrages = seg.enrages or {}
             seg.tanks = seg.tanks or {}
             for pName, cID in pairs(seg.playerIDs) do
@@ -149,12 +194,14 @@ local function InitializeDB()
     for _, savedSess in ipairs(RaidersTrackerDB.savedSessions or {}) do
         savedSess.players = savedSess.players or {}
         savedSess.playerIDs = savedSess.playerIDs or {}
+        savedSess.zoneTimes = savedSess.zoneTimes or {}
         for _, seg in ipairs(savedSess.segments or {}) do
             seg.deaths = seg.deaths or {}
             seg.players = seg.players or {}
             seg.playerIDs = seg.playerIDs or {}
             seg.potionsAndBuffs = seg.potionsAndBuffs or {}
             seg.raidUtility = seg.raidUtility or {}
+            seg.demonicPactValues = seg.demonicPactValues or {}
             seg.enrages = seg.enrages or {}
             seg.tanks = seg.tanks or {}
             for pName, cID in pairs(seg.playerIDs) do
@@ -343,12 +390,19 @@ local function UpdateGroupCache()
     table.wipe(groupMembers)
     table.wipe(groupGUIDs)
     table.wipe(groupGUIDToName)
-    local function CacheUnit(unit)
+    table.wipe(RTExt.petGUIDToOwner)
+    table.wipe(RTExt.petUnitToOwner)
+    table.wipe(RTExt.petNameToOwner)
+    table.wipe(RTExt.playerGUIDToUnit)
+    table.wipe(RTExt.playerNameToUnit)
+    local function CacheUnit(unit, petUnit)
         local name = UnitName(unit)
         if name and name ~= UNKNOWN then
             groupMembers[name] = true
+            RTExt.playerNameToUnit[name] = unit
             local uGUID = UnitGUID(unit)
             if uGUID then
+                RTExt.playerGUIDToUnit[uGUID] = unit
                 CachePlayerCharID(name, uGUID)
             elseif nameToCharID[name] then
                 local cID = nameToCharID[name]
@@ -358,15 +412,33 @@ local function UpdateGroupCache()
             end
             local _, engClass = UnitClass(unit)
             if engClass then groupClasses[name] = engClass end
+            if petUnit and UnitExists(petUnit) then
+                local petGUID = UnitGUID(petUnit)
+                local petName = UnitName(petUnit)
+                local ownerInfo = {
+                    name = name,
+                    guid = uGUID,
+                    class = engClass or groupClasses[name],
+                    unit = unit,
+                    petUnit = petUnit,
+                }
+                RTExt.petUnitToOwner[petUnit] = ownerInfo
+                if petGUID then
+                    RTExt.petGUIDToOwner[petGUID] = ownerInfo
+                end
+                if petName and petName ~= UNKNOWN then
+                    RTExt.petNameToOwner[petName] = ownerInfo
+                end
+            end
         end
     end
-    CacheUnit("player")
+    CacheUnit("player", "pet")
     local numRaid = GetNumRaidMembers()
     if numRaid > 0 then
-        for i = 1, numRaid do CacheUnit("raid" .. i) end
+        for i = 1, numRaid do CacheUnit("raid" .. i, "raidpet" .. i) end
     else
         local numParty = GetNumPartyMembers()
-        for i = 1, numParty do CacheUnit("party" .. i) end
+        for i = 1, numParty do CacheUnit("party" .. i, "partypet" .. i) end
     end
 end
 
@@ -495,11 +567,562 @@ local function CheckGroupBlacklist()
                 local classStr = entry.class and (" (" .. entry.class .. ")") or ""
                 local warnMsg = string.format("[Raiders Tracker] WARNING: Blacklisted player joined group! [ID: %s] Names: %s%s - Reason: %s", blKey, namesStr, classStr, entry.reason or "Unknown")
                 if DEFAULT_CHAT_FRAME then
-                    DEFAULT_CHAT_FRAME:AddMessage("|cffFF0000" .. warnMsg .. "|r")
+                    DEFAULT_CHAT_FRAME:AddMessage("|cffFFFF00" .. warnMsg .. "|r")
                 end
             end
         end
     end
+end
+
+
+-------------------------------------------------------------------------------
+-- Blacklist Base64 / Secure XML Import & Export Engine
+-------------------------------------------------------------------------------
+RTExt.BASE64_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+RTExt.BASE64_DECODE_MAP = {}
+for i = 1, #RTExt.BASE64_CHARS do
+    RTExt.BASE64_DECODE_MAP[RTExt.BASE64_CHARS:sub(i, i)] = i - 1
+end
+
+RTExt.VALID_BLACKLIST_CLASSES = {
+    ["WARRIOR"] = true, ["PALADIN"] = true, ["HUNTER"] = true,
+    ["ROGUE"] = true, ["PRIEST"] = true, ["DEATHKNIGHT"] = true,
+    ["SHAMAN"] = true, ["MAGE"] = true, ["WARLOCK"] = true,
+    ["DRUID"] = true, ["UNKNOWN"] = true,
+}
+
+RTExt.MAX_IMPORT_B64_LEN = 262144
+RTExt.MAX_IMPORT_ENTRIES = 2000
+RTExt.MAX_IMPORT_NAMES_PER_ENTRY = 50
+
+function RTExt.Base64Encode(data)
+    if type(data) ~= "string" then return "" end
+    local chars = RTExt.BASE64_CHARS
+    local out = {}
+    local len = #data
+    local i = 1
+    while i <= len do
+        local b1 = string.byte(data, i) or 0
+        local b2 = string.byte(data, i + 1)
+        local b3 = string.byte(data, i + 2)
+
+        local n1 = math.floor(b1 / 4)
+        local n2 = (b1 % 4) * 16 + math.floor((b2 or 0) / 16)
+        local n3 = ((b2 or 0) % 16) * 4 + math.floor((b3 or 0) / 64)
+        local n4 = (b3 or 0) % 64
+
+        out[#out + 1] = chars:sub(n1 + 1, n1 + 1)
+        out[#out + 1] = chars:sub(n2 + 1, n2 + 1)
+        if b2 then
+            out[#out + 1] = chars:sub(n3 + 1, n3 + 1)
+        else
+            out[#out + 1] = "="
+        end
+        if b3 then
+            out[#out + 1] = chars:sub(n4 + 1, n4 + 1)
+        else
+            out[#out + 1] = "="
+        end
+        i = i + 3
+    end
+    return table.concat(out)
+end
+
+function RTExt.Base64DecodeStrict(raw)
+    if type(raw) ~= "string" then
+        return nil, "Import data is missing or not text."
+    end
+    local clean = raw:gsub("[%s]", "")
+    local len = #clean
+    if len == 0 then
+        return nil, "Import data is empty."
+    end
+    if len > RTExt.MAX_IMPORT_B64_LEN then
+        return nil, "Import data exceeds maximum allowed size."
+    end
+    if (len % 4) ~= 0 then
+        return nil, "Corrupt Base64 data (invalid length)."
+    end
+
+    local dmap = RTExt.BASE64_DECODE_MAP
+    local out = {}
+    local i = 1
+    while i <= len do
+        local c1 = clean:sub(i, i)
+        local c2 = clean:sub(i + 1, i + 1)
+        local c3 = clean:sub(i + 2, i + 2)
+        local c4 = clean:sub(i + 3, i + 3)
+
+        local v1 = dmap[c1]
+        local v2 = dmap[c2]
+        if not v1 or not v2 then
+            return nil, "Corrupt Base64 data (invalid character detected)."
+        end
+
+        local pad3 = (c3 == "=")
+        local pad4 = (c4 == "=")
+
+        if pad3 and not pad4 then
+            return nil, "Corrupt Base64 data (invalid padding)."
+        end
+        if (pad3 or pad4) and (i + 3 < len) then
+            return nil, "Corrupt Base64 data (unexpected padding before end)."
+        end
+
+        local v3 = pad3 and 0 or dmap[c3]
+        local v4 = pad4 and 0 or dmap[c4]
+        if not v3 or not v4 then
+            return nil, "Corrupt Base64 data (invalid character detected)."
+        end
+
+        if pad3 and (v2 % 16) ~= 0 then
+            return nil, "Corrupt Base64 data (invalid trailing bits)."
+        end
+        if pad4 and not pad3 and (v3 % 4) ~= 0 then
+            return nil, "Corrupt Base64 data (invalid trailing bits)."
+        end
+
+        local b1 = v1 * 4 + math.floor(v2 / 16)
+        local b2 = (v2 % 16) * 16 + math.floor(v3 / 4)
+        local b3 = (v3 % 4) * 64 + v4
+
+        out[#out + 1] = string.char(b1)
+        if not pad3 then
+            out[#out + 1] = string.char(b2)
+        end
+        if not pad4 then
+            out[#out + 1] = string.char(b3)
+        end
+        i = i + 4
+    end
+
+    local decoded = table.concat(out)
+    if decoded:find("[%z\1-\8\11\12\14-\31\127]") then
+        return nil, "Corrupt data (illegal binary or control characters detected)."
+    end
+    return decoded, nil
+end
+
+function RTExt.SanitizeForXMLField(str)
+    if str == nil then return "" end
+    local s = StripColorCodes(tostring(str))
+    s = s:gsub("|T.-|t", ""):gsub("|H.-|h(.-)|h", "%1"):gsub("|", "")
+    s = s:gsub("[<>\\`]", " ")
+    s = s:gsub("[%z\1-\31\127]", " ")
+    s = s:gsub("^%s+", ""):gsub("%s+$", "")
+    return s
+end
+
+function RTExt.EscapeXML(str)
+    local s = RTExt.SanitizeForXMLField(str)
+    s = s:gsub("&", "&amp;")
+    s = s:gsub("<", "&lt;")
+    s = s:gsub(">", "&gt;")
+    s = s:gsub('"', "&quot;")
+    s = s:gsub("'", "&apos;")
+    return s
+end
+
+function RTExt.UnescapeXMLStrict(str)
+    if type(str) ~= "string" then return nil end
+    if str:find("[|<>%z\1-\31\127]") then
+        return nil
+    end
+    local pos = 1
+    while true do
+        local ampPos = str:find("&", pos, true)
+        if not ampPos then break end
+        local entity = str:match("^(&[a-zA-Z]+;)", ampPos)
+        if entity ~= "&amp;" and entity ~= "&lt;" and entity ~= "&gt;" and entity ~= "&quot;" and entity ~= "&apos;" then
+            return nil
+        end
+        pos = ampPos + #entity
+    end
+    local out = str
+    out = out:gsub("&lt;", "<")
+    out = out:gsub("&gt;", ">")
+    out = out:gsub("&quot;", '"')
+    out = out:gsub("&apos;", "'")
+    out = out:gsub("&amp;", "&")
+    if out:find("[|%z\1-\31\127]") then
+        return nil
+    end
+    return out
+end
+
+function RTExt.IsValidBlacklistCharName(name)
+    if type(name) ~= "string" then return false end
+    if #name < 2 or #name > 36 then return false end
+    if name:find("[|%s<>\"'\\&;%z\1-\31\127]") then return false end
+    if not name:match("^[%a\128-\244]+$") then return false end
+    return true
+end
+
+function RTExt.IsValidBlacklistCharID(id)
+    if type(id) ~= "string" or #id == 0 or #id > 44 then return false end
+    if id:find("[|%s<>\"'\\&;%z\1-\31\127]") then return false end
+    if id:match("^%d+$") then
+        return (#id <= 20)
+    end
+    local fallbackName = id:match("^NAME:(.+)$")
+    if fallbackName and RTExt.IsValidBlacklistCharName(fallbackName) then
+        return true
+    end
+    return false
+end
+
+function RTExt.IsValidBlacklistReason(reason)
+    if type(reason) ~= "string" or #reason == 0 or #reason > 80 then return false end
+    if reason:find("[|<>\\`%z\1-\31\127]") then return false end
+    return true
+end
+
+function RTExt.IsValidBlacklistTimestamp(ts)
+    if type(ts) ~= "string" then return false end
+    if ts == "" then return true end
+    if ts:match("^%d%d%d%d%-%d%d%-%d%d %d%d:%d%d$") then return true end
+    if ts:match("^%d%d%d%d%-%d%d%-%d%d$") then return true end
+    return false
+end
+
+function RTExt.CollectSortedBlacklistItems()
+    RaidersTrackerDB.blacklist = RaidersTrackerDB.blacklist or {}
+    local list = {}
+    for charID, info in pairs(RaidersTrackerDB.blacklist) do
+        local nameList = {}
+        local seenLower = {}
+        if type(info.names) == "table" then
+            for n in pairs(info.names) do
+                if type(n) == "string" and n ~= "" and not seenLower[n:lower()] then
+                    seenLower[n:lower()] = true
+                    table.insert(nameList, n)
+                end
+            end
+        elseif type(info.name) == "string" and info.name ~= "" then
+            table.insert(nameList, info.name)
+        end
+        table.sort(nameList)
+        local namesStr = (#nameList > 0) and table.concat(nameList, ", ") or "Unknown"
+        local rawClass = info.class and string.upper(tostring(info.class)) or "UNKNOWN"
+        if not RTExt.VALID_BLACKLIST_CLASSES[rawClass] then rawClass = "UNKNOWN" end
+        table.insert(list, {
+            id = tostring(charID),
+            names = nameList,
+            namesStr = namesStr,
+            class = rawClass,
+            classStr = (rawClass ~= "UNKNOWN") and (" (" .. rawClass .. ")") or "",
+            reason = RTExt.SanitizeForXMLField(info.reason or "Unspecified"),
+            date = RTExt.SanitizeForXMLField(info.timestamp or "")
+        })
+    end
+    table.sort(list, function(a, b)
+        if a.namesStr ~= b.namesStr then return a.namesStr < b.namesStr end
+        return a.id < b.id
+    end)
+    return list
+end
+
+function RTExt.ExportBlacklistToBase64XML()
+    local items = RTExt.CollectSortedBlacklistItems()
+    local xmlLines = {
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<RaidersTrackerBlacklist schema="1">'
+    }
+    local exportedCount = 0
+    for _, item in ipairs(items) do
+        local cleanID = RTExt.SanitizeForXMLField(item.id)
+        local cleanReason = (item.reason ~= "") and item.reason or "Unspecified"
+        if #cleanReason > 80 then cleanReason = cleanReason:sub(1, 80) end
+        local cleanDate = RTExt.IsValidBlacklistTimestamp(item.date) and item.date or ""
+        local validNames = {}
+        for _, n in ipairs(item.names) do
+            local cn = RTExt.SanitizeForXMLField(n)
+            if RTExt.IsValidBlacklistCharName(cn) then
+                table.insert(validNames, cn)
+            end
+        end
+        if RTExt.IsValidBlacklistCharID(cleanID) and #validNames > 0 then
+            table.insert(xmlLines, string.format(
+                '  <Entry id="%s" class="%s" reason="%s" timestamp="%s">',
+                RTExt.EscapeXML(cleanID),
+                RTExt.EscapeXML(item.class),
+                RTExt.EscapeXML(cleanReason),
+                RTExt.EscapeXML(cleanDate)
+            ))
+            for _, n in ipairs(validNames) do
+                table.insert(xmlLines, string.format('    <Name>%s</Name>', RTExt.EscapeXML(n)))
+            end
+            table.insert(xmlLines, '  </Entry>')
+            exportedCount = exportedCount + 1
+        end
+    end
+    table.insert(xmlLines, '</RaidersTrackerBlacklist>')
+    local xmlStr = table.concat(xmlLines, "\n")
+    return RTExt.Base64Encode(xmlStr), exportedCount
+end
+
+function RTExt.BuildBlacklistPlainText()
+    local items = RTExt.CollectSortedBlacklistItems()
+    local lines = {
+        string.format("=== Raiders Tracker%s by %s - Player Blacklist ===", RTExt.GetVersionTag(), AUTHOR),
+        string.format("Total Blacklisted: %d", #items),
+        ""
+    }
+    if #items == 0 then
+        table.insert(lines, "No players currently blacklisted.")
+    else
+        for idx, item in ipairs(items) do
+            local dateSuffix = (item.date ~= "") and (" (" .. item.date .. ")") or ""
+            table.insert(lines, string.format(
+                "%d. [ID: %s] Names: %s%s - Reason: %s%s",
+                idx, item.id, item.namesStr, item.classStr, item.reason, dateSuffix
+            ))
+        end
+    end
+    return table.concat(lines, "\n")
+end
+
+function RTExt.ParseStrictXMLAttributes(attrText)
+    local attrs = {}
+    local allowed = { id = true, class = true, reason = true, timestamp = true }
+    local pos = 1
+    local len = #attrText
+    while pos <= len do
+        local _, wsEnd = attrText:find("^%s*", pos)
+        pos = (wsEnd or (pos - 1)) + 1
+        if pos > len then break end
+
+        local sPos, ePos, key, val = attrText:find('^([a-zA-Z]+)="([^"]*)"', pos)
+        if not sPos or not allowed[key] or attrs[key] ~= nil then
+            return nil
+        end
+        local unescaped = RTExt.UnescapeXMLStrict(val)
+        if unescaped == nil then
+            return nil
+        end
+        attrs[key] = unescaped
+        pos = ePos + 1
+        if pos <= len and not attrText:sub(pos, pos):match("%s") then
+            return nil
+        end
+    end
+    return attrs
+end
+
+function RTExt.ParseAndValidateBlacklistImport(rawBase64)
+    local xmlStr, b64Err = RTExt.Base64DecodeStrict(rawBase64)
+    if not xmlStr then
+        return nil, b64Err
+    end
+
+    if xmlStr:find("|", 1, true) then
+        return nil, "Invalid data: illegal escape character detected."
+    end
+    local upperXML = xmlStr:upper()
+    if upperXML:find("<!DOCTYPE", 1, true) or upperXML:find("<!ENTITY", 1, true)
+        or upperXML:find("<![CDATA[", 1, true) or xmlStr:find("<!--", 1, true) then
+        return nil, "Invalid data: forbidden XML construct detected."
+    end
+
+    local body = xmlStr:gsub("^%s+", ""):gsub("%s+$", "")
+    if body:sub(1, 5) == "<?xml" then
+        local _, headerEnd = body:find('^<%?xml version="1%.0" encoding="UTF%-8"%?>[%s]*')
+        if not headerEnd then
+            return nil, "Invalid XML header: not from Raiders Tracker."
+        end
+        body = body:sub(headerEnd + 1)
+    end
+    if body:find("<?", 1, true) then
+        return nil, "Invalid data: unexpected XML processing instruction."
+    end
+
+    local openStart, openEnd = body:find('^<RaidersTrackerBlacklist%s+schema="1">')
+    local closeStart, closeEnd = body:find('</RaidersTrackerBlacklist>$')
+    if not openStart or not closeStart or closeEnd ~= #body or openEnd >= closeStart then
+        return nil, "Invalid data: not a valid Raiders Tracker blacklist export."
+    end
+
+    local innerRoot = body:sub(openEnd + 1, closeStart - 1)
+    local entries = {}
+    local pos = 1
+    local rootLen = #innerRoot
+
+    while pos <= rootLen do
+        local _, wsEnd = innerRoot:find("^%s*", pos)
+        pos = (wsEnd or (pos - 1)) + 1
+        if pos > rootLen then break end
+
+        local tagStart, tagEnd, attrText = innerRoot:find("^<Entry%s+([^<>]+)>", pos)
+        if not tagStart then
+            return nil, "Invalid XML structure: unexpected tag or text inside blacklist."
+        end
+        local entryCloseStart, entryCloseEnd = innerRoot:find("</Entry>", tagEnd + 1, true)
+        if not entryCloseStart then
+            return nil, "Invalid XML structure: unclosed Entry tag."
+        end
+
+        local attrs = RTExt.ParseStrictXMLAttributes(attrText)
+        if not attrs or not attrs.id or not attrs.class or not attrs.reason or attrs.timestamp == nil then
+            return nil, "Invalid Entry attributes: corrupt or unsupported blacklist data."
+        end
+
+        local normClass = string.upper(attrs.class)
+        if not RTExt.IsValidBlacklistCharID(attrs.id) then
+            return nil, "Invalid character ID found in import data."
+        end
+        if not RTExt.VALID_BLACKLIST_CLASSES[normClass] then
+            return nil, "Invalid character class found in import data."
+        end
+        if not RTExt.IsValidBlacklistReason(attrs.reason) then
+            return nil, "Invalid or unsafe reason text found in import data."
+        end
+        if not RTExt.IsValidBlacklistTimestamp(attrs.timestamp) then
+            return nil, "Invalid timestamp format found in import data."
+        end
+
+        local entryInner = innerRoot:sub(tagEnd + 1, entryCloseStart - 1)
+        local nPos = 1
+        local nLen = #entryInner
+        local parsedNames = {}
+        local seenInEntry = {}
+
+        while nPos <= nLen do
+            local _, nWsEnd = entryInner:find("^%s*", nPos)
+            nPos = (nWsEnd or (nPos - 1)) + 1
+            if nPos > nLen then break end
+
+            local ns, ne, rawName = entryInner:find("^<Name>([^<>]+)</Name>", nPos)
+            if not ns then
+                return nil, "Invalid XML structure: expected valid Name element inside Entry."
+            end
+            local cleanName = RTExt.UnescapeXMLStrict(rawName)
+            if not cleanName or not RTExt.IsValidBlacklistCharName(cleanName) then
+                return nil, "Invalid or unsafe character name found in import data."
+            end
+            if not seenInEntry[cleanName:lower()] then
+                seenInEntry[cleanName:lower()] = true
+                table.insert(parsedNames, cleanName)
+                if #parsedNames > RTExt.MAX_IMPORT_NAMES_PER_ENTRY then
+                    return nil, "Import data exceeds maximum names allowed per entry."
+                end
+            end
+            nPos = ne + 1
+        end
+
+        if #parsedNames == 0 then
+            return nil, "Invalid Entry: missing character name."
+        end
+
+        table.insert(entries, {
+            id = attrs.id,
+            class = normClass,
+            reason = attrs.reason,
+            timestamp = (attrs.timestamp ~= "") and attrs.timestamp or date("%Y-%m-%d %H:%M"),
+            names = parsedNames
+        })
+        if #entries > RTExt.MAX_IMPORT_ENTRIES then
+            return nil, "Import data exceeds maximum allowed entries."
+        end
+
+        pos = entryCloseEnd + 1
+    end
+
+    return entries, nil
+end
+
+function RTExt.ProcessBlacklistImport(entries, dryRun)
+    RaidersTrackerDB.blacklist = RaidersTrackerDB.blacklist or {}
+    local targetBL = dryRun and DeepCopyTable(RaidersTrackerDB.blacklist) or RaidersTrackerDB.blacklist
+
+    local function FindKeyByLowerName(lowerName)
+        for existingID, existingInfo in pairs(targetBL) do
+            if type(existingInfo.names) == "table" then
+                for n in pairs(existingInfo.names) do
+                    if type(n) == "string" and n:lower() == lowerName then
+                        return existingID
+                    end
+                end
+            elseif type(existingInfo.name) == "string" and existingInfo.name:lower() == lowerName then
+                return existingID
+            end
+        end
+        return nil
+    end
+
+    local function EntryHasLowerName(existingInfo, lowerName)
+        if type(existingInfo.names) == "table" then
+            for n in pairs(existingInfo.names) do
+                if type(n) == "string" and n:lower() == lowerName then
+                    return true
+                end
+            end
+        end
+        if type(existingInfo.name) == "string" and existingInfo.name:lower() == lowerName then
+            return true
+        end
+        return false
+    end
+
+    local importedCount = 0
+    local duplicateCount = 0
+    local newNamesAddedCount = 0
+
+    for _, imp in ipairs(entries) do
+        local impID = imp.id
+        local existingKey = nil
+
+        if targetBL[impID] then
+            existingKey = impID
+        else
+            for _, impName in ipairs(imp.names) do
+                local matchedKey = FindKeyByLowerName(impName:lower())
+                if matchedKey then
+                    existingKey = matchedKey
+                    break
+                end
+            end
+        end
+
+        if existingKey then
+            local existing = targetBL[existingKey]
+            if existingKey:find("^NAME:") and impID:match("^%d+$") and not targetBL[impID] then
+                targetBL[impID] = existing
+                targetBL[existingKey] = nil
+                existingKey = impID
+            end
+
+            existing.names = existing.names or {}
+            if type(existing.name) == "string" and existing.name ~= "" then
+                existing.names[existing.name] = true
+                existing.name = nil
+            end
+
+            for _, impName in ipairs(imp.names) do
+                if not EntryHasLowerName(existing, impName:lower()) then
+                    existing.names[impName] = true
+                    newNamesAddedCount = newNamesAddedCount + 1
+                end
+            end
+            if (not existing.class or existing.class == "" or existing.class == "UNKNOWN") and imp.class ~= "UNKNOWN" then
+                existing.class = imp.class
+            end
+            duplicateCount = duplicateCount + 1
+        else
+            local namesMap = {}
+            for _, impName in ipairs(imp.names) do
+                namesMap[impName] = true
+            end
+            targetBL[impID] = {
+                names = namesMap,
+                class = (imp.class ~= "UNKNOWN") and imp.class or nil,
+                reason = imp.reason,
+                timestamp = imp.timestamp
+            }
+            importedCount = importedCount + 1
+        end
+    end
+
+    return importedCount, duplicateCount, newNamesAddedCount
 end
 
 -------------------------------------------------------------------------------
@@ -785,6 +1408,11 @@ local POTIONS_AND_BUFFS = {
     [9512] = "Thistle Tea", [9513] = "Thistle Tea", [18160] = "Thistle Tea",
     [43186] = "Runic Mana Potion", [53942] = "Runic Mana Injector",
     [43185] = "Runic Healing Potion", [53934] = "Runic Healing Injector",
+    [53910] = "Crazy Alchemist's Potion", [53750] = "Endless Healing Potion", [53751] = "Endless Mana Potion",
+    [53911] = "Potion of Nightmares", [28506] = "Heroic Potion", [28515] = "Ironshield Potion",
+    [6615] = "Free Action Potion", [24364] = "Living Action Potion", [17528] = "Mighty Rage Potion",
+    [28499] = "Super Mana Potion", [28495] = "Super Healing Potion",
+    [27869] = "Dark Rune", [16666] = "Demonic Rune",
     [47878] = "Fel Healthstone", [47871] = "Fel Healthstone", [47875] = "Fel Healthstone", [27230] = "Master Healthstone",
     [42985] = "Mana Sapphire", [33312] = "Mana Emerald", [42984] = "Mana Sapphire",
     [53755] = "Flask of the Frost Wyrm", [53760] = "Flask of Endless Rage",
@@ -856,6 +1484,7 @@ local POTIONS_AND_BUFFS = {
 local ALLOW_REFRESH_BUFFS = {
     [53908] = true, [53909] = true, [28494] = true, [28507] = true, [28508] = true,
     [53762] = true, [53753] = true, [54117] = true, [28714] = true,
+    [53911] = true, [28506] = true, [28515] = true, [6615] = true, [24364] = true, [17528] = true,
     [57933] = true, [10060] = true, [49016] = true, [29166] = true,
     [33206] = true, [47788] = true, [6940] = true, [1038] = true, [1044] = true,
     [71484] = true, [71485] = true, [71486] = true, [71487] = true, [71491] = true, [71492] = true,
@@ -977,6 +1606,8 @@ local EXTERNAL_TARGETED_UTILITY = {
 
 local INSTANT_CONSUMABLES = {
     [43186] = true, [53942] = true, [43185] = true, [53934] = true,
+    [53910] = true, [53750] = true, [53751] = true,
+    [28499] = true, [28495] = true, [27869] = true, [16666] = true,
     [47878] = true, [47871] = true, [47875] = true, [27230] = true,
     [42985] = true, [33312] = true, [42984] = true,
     [9512] = true, [9513] = true, [18160] = true,
@@ -1017,7 +1648,11 @@ local COMBAT_POTION_NAMES = {
     ["Potion of Speed"] = true, ["Potion of Wild Magic"] = true, ["Indestructible Potion"] = true,
     ["Insane Strength Potion"] = true, ["Haste Potion"] = true, ["Destruction Potion"] = true,
     ["Powerful Rejuvenation Potion"] = true, ["Runic Mana Potion"] = true, ["Runic Mana Injector"] = true,
-    ["Runic Healing Potion"] = true, ["Runic Healing Injector"] = true
+    ["Runic Healing Potion"] = true, ["Runic Healing Injector"] = true,
+    ["Crazy Alchemist's Potion"] = true, ["Endless Healing Potion"] = true, ["Endless Mana Potion"] = true,
+    ["Potion of Nightmares"] = true, ["Heroic Potion"] = true, ["Ironshield Potion"] = true,
+    ["Free Action Potion"] = true, ["Living Action Potion"] = true, ["Mighty Rage Potion"] = true,
+    ["Super Mana Potion"] = true, ["Super Healing Potion"] = true
 }
 
 -------------------------------------------------------------------------------
@@ -1039,6 +1674,7 @@ local inCombatState = false
 local hasEnteredBossCombat = false
 local lichKingRPActive = false
 local lichKingRPElapsed = 0
+RTExt.lichKingFuryTime = nil
 
 local lastKnownZone = nil
 local lastKnownDiff = nil
@@ -1060,6 +1696,7 @@ local function GetNewSegment(name, isBoss, bossID, bossName, attempt)
         difficulty = diff,
         potionsAndBuffs = {},
         raidUtility = {},
+        demonicPactValues = {},
         deaths = {},
         players = {},
         playerIDs = {},
@@ -1096,6 +1733,7 @@ local function EnsureTrashSegment()
         topSeg.deaths = topSeg.deaths or {}
         topSeg.players = topSeg.players or {}
         topSeg.playerIDs = topSeg.playerIDs or {}
+        topSeg.demonicPactValues = topSeg.demonicPactValues or {}
         topSeg.enrages = topSeg.enrages or {}
         topSeg.tanks = topSeg.tanks or {}
         currentSegment = topSeg
@@ -1116,13 +1754,14 @@ local function EnsureTrashSegment()
 end
 
 local function ResetLiveSessionState()
-    RaidersTrackerDB.liveSession = { name = "Live Current Session", segments = {}, players = {}, playerIDs = {} }
+    RaidersTrackerDB.liveSession = { name = "Live Current Session", segments = {}, players = {}, playerIDs = {}, zoneTimes = {} }
     currentSession = RaidersTrackerDB.liveSession
     currentSegment = nil
     inCombatState = false
     hasEnteredBossCombat = false
     lichKingRPActive = false
     lichKingRPElapsed = 0
+    RTExt.lichKingFuryTime = nil
     activeBossID = nil
     activeBossName = nil
     activeBossData = nil
@@ -1134,6 +1773,9 @@ local function ResetLiveSessionState()
     table.wipe(recentDeathLock)
     table.wipe(recentProcs)
     table.wipe(recentPrePullEvents)
+    table.wipe(RTExt.recentDemonicPact)
+    table.wipe(RTExt.pendingDemonicPacts)
+    if RTExt.dpWatcherFrame then RTExt.dpWatcherFrame:SetScript("OnUpdate", nil) end
     EnsureTrashSegment()
 end
 
@@ -1154,7 +1796,8 @@ local function SaveCurrentLiveSession(startFreshAfterSave)
         name = "Session " .. stamp,
         segments = cleanedSegments,
         players = DeepCopyTable(currentSession.players or {}),
-        playerIDs = DeepCopyTable(currentSession.playerIDs or {})
+        playerIDs = DeepCopyTable(currentSession.playerIDs or {}),
+        zoneTimes = DeepCopyTable(currentSession.zoneTimes or {})
     }
     table.insert(RaidersTrackerDB.savedSessions, 1, savedCopy)
     AnnounceLocalChat("Current session saved as: " .. savedCopy.name)
@@ -1239,6 +1882,147 @@ end
 local outOfCombatAccum = 0
 local gracePeriodAccum = 0
 local diffPollAccum = 0
+RTExt.zoneTimeAccum = 0
+
+function RTExt.UpdateSessionZoneTimes(dt)
+    if not RaidersTrackerDB or not RaidersTrackerDB.enabled or not currentSession then return end
+    dt = math.min(math.max(dt or 0, 0), 5.0)
+    if dt <= 0 then return end
+
+    currentSession.zoneTimes = currentSession.zoneTimes or {}
+    currentSession.players = currentSession.players or {}
+
+    local numRaid = GetNumRaidMembers()
+    if numRaid > 0 then
+        for i = 1, numRaid do
+            local rName, _, _, _, _, rFileName, rZone, rOnline = GetRaidRosterInfo(i)
+            if rName and rName ~= UNKNOWN then
+                local shortName = rName:match("^([^%-]+)") or rName
+                if rFileName and rFileName ~= "" then
+                    currentSession.players[shortName] = currentSession.players[shortName] or rFileName
+                    groupClasses[shortName] = groupClasses[shortName] or rFileName
+                end
+                local uGUID = UnitGUID("raid" .. i)
+                if uGUID then
+                    CachePlayerCharID(shortName, uGUID)
+                end
+                if rOnline and rZone and rZone ~= "" and rZone ~= "Offline" then
+                    currentSession.zoneTimes[shortName] = currentSession.zoneTimes[shortName] or {}
+                    currentSession.zoneTimes[shortName][rZone] = (currentSession.zoneTimes[shortName][rZone] or 0) + dt
+                end
+            end
+        end
+    else
+        local myZone = GetCurrentZoneSafe()
+        local myName = UnitName("player")
+        if myName and myName ~= UNKNOWN and myZone ~= "Unknown" then
+            local _, myClass = UnitClass("player")
+            if myClass then currentSession.players[myName] = currentSession.players[myName] or myClass end
+            currentSession.zoneTimes[myName] = currentSession.zoneTimes[myName] or {}
+            currentSession.zoneTimes[myName][myZone] = (currentSession.zoneTimes[myName][myZone] or 0) + dt
+        end
+        local numParty = GetNumPartyMembers()
+        for i = 1, numParty do
+            local unit = "party" .. i
+            if UnitExists(unit) and UnitIsConnected(unit) then
+                local pName = UnitName(unit)
+                if pName and pName ~= UNKNOWN then
+                    local _, pClass = UnitClass(unit)
+                    if pClass then currentSession.players[pName] = currentSession.players[pName] or pClass end
+                    local uGUID = UnitGUID(unit)
+                    if uGUID then CachePlayerCharID(pName, uGUID) end
+                    if myZone ~= "Unknown" and (UnitIsVisible(unit) or IsInInstance()) then
+                        currentSession.zoneTimes[pName] = currentSession.zoneTimes[pName] or {}
+                        currentSession.zoneTimes[pName][myZone] = (currentSession.zoneTimes[pName][myZone] or 0) + dt
+                    end
+                end
+            end
+        end
+    end
+end
+
+function RTExt.FormatZoneDuration(seconds)
+    local total = math.max(0, math.floor(tonumber(seconds) or 0))
+    local hrs = math.floor(total / 3600)
+    local mins = math.floor((total % 3600) / 60)
+    local secs = total % 60
+    if hrs > 0 then
+        return string.format("%dh %02dm %02ds", hrs, mins, secs)
+    end
+    return string.format("%dm %02ds", mins, secs)
+end
+
+function RTExt.GetMajorityRaidZone(activeSession)
+    local currentZone = GetCurrentZoneSafe()
+    if activeSession == currentSession and GetNumRaidMembers() > 0 then
+        local counts = {}
+        local totalOnline = 0
+        for i = 1, GetNumRaidMembers() do
+            local rName, _, _, _, _, _, rZone, rOnline = GetRaidRosterInfo(i)
+            if rName and rOnline and rZone and rZone ~= "" and rZone ~= "Offline" then
+                counts[rZone] = (counts[rZone] or 0) + 1
+                totalOnline = totalOnline + 1
+            end
+        end
+        local bestZone, bestCount = nil, 0
+        for zName, cnt in pairs(counts) do
+            if cnt > bestCount
+                or (cnt == bestCount and zName == currentZone)
+                or (cnt == bestCount and bestZone ~= currentZone and bestZone and zName < bestZone) then
+                bestZone = zName
+                bestCount = cnt
+            end
+        end
+        if bestZone then
+            return bestZone, bestCount, totalOnline
+        end
+    end
+
+    if activeSession and type(activeSession.zoneTimes) == "table" then
+        local zonePlayerCounts = {}
+        local zoneTotalSecs = {}
+        for _, zMap in pairs(activeSession.zoneTimes) do
+            if type(zMap) == "table" then
+                for zName, secs in pairs(zMap) do
+                    if zName and zName ~= "" and zName ~= "Unknown" and (tonumber(secs) or 0) > 0 then
+                        zonePlayerCounts[zName] = (zonePlayerCounts[zName] or 0) + 1
+                        zoneTotalSecs[zName] = (zoneTotalSecs[zName] or 0) + (tonumber(secs) or 0)
+                    end
+                end
+            end
+        end
+        local bestZone, bestPlayers, bestSecs = nil, 0, 0
+        for zName, pCnt in pairs(zonePlayerCounts) do
+            local zSec = zoneTotalSecs[zName] or 0
+            if pCnt > bestPlayers
+                or (pCnt == bestPlayers and zSec > bestSecs)
+                or (pCnt == bestPlayers and zSec == bestSecs and bestZone and zName < bestZone) then
+                bestZone = zName
+                bestPlayers = pCnt
+                bestSecs = zSec
+            end
+        end
+        if bestZone then
+            return bestZone, bestPlayers, 0
+        end
+    end
+
+    if activeSession and type(activeSession.segments) == "table" then
+        local segZoneCounts = {}
+        for _, seg in ipairs(activeSession.segments) do
+            if seg.zone and seg.zone ~= "" and seg.zone ~= "Unknown" then
+                segZoneCounts[seg.zone] = (segZoneCounts[seg.zone] or 0) + 1
+            end
+        end
+        local bestZone, bestCnt = nil, 0
+        for zName, cnt in pairs(segZoneCounts) do
+            if cnt > bestCnt then bestZone = zName; bestCnt = cnt end
+        end
+        if bestZone then return bestZone, 0, 0 end
+    end
+
+    return currentZone, 0, 0
+end
 
 local function StartEncounter(bossID, bossName, overrideData, fromSpeech)
     if inCombatState or not bossName then return end
@@ -1258,6 +2042,7 @@ local function StartEncounter(bossID, bossName, overrideData, fromSpeech)
     hasEnteredBossCombat = IsRaidInCombat()
     lichKingRPActive = false
     lichKingRPElapsed = 0
+    RTExt.lichKingFuryTime = nil
     bossStartTime = now
     outOfCombatAccum = 0
     gracePeriodAccum = 0
@@ -1301,6 +2086,11 @@ local function StartEncounter(bossID, bossName, overrideData, fromSpeech)
             elseif ev.category == "UTILITY" then
                 newBossSeg.raidUtility[ev.pName] = newBossSeg.raidUtility[ev.pName] or {}
                 newBossSeg.raidUtility[ev.pName][ev.entryName] = (newBossSeg.raidUtility[ev.pName][ev.entryName] or 0) + 1
+                if ev.dpValue ~= nil then
+                    newBossSeg.demonicPactValues = newBossSeg.demonicPactValues or {}
+                    newBossSeg.demonicPactValues[ev.pName] = newBossSeg.demonicPactValues[ev.pName] or {}
+                    table.insert(newBossSeg.demonicPactValues[ev.pName], ev.dpValue)
+                end
                 if prevTrashSeg and prevTrashSeg.raidUtility[ev.pName] and prevTrashSeg.raidUtility[ev.pName][ev.entryName] then
                     prevTrashSeg.raidUtility[ev.pName][ev.entryName] = prevTrashSeg.raidUtility[ev.pName][ev.entryName] - 1
                     if prevTrashSeg.raidUtility[ev.pName][ev.entryName] <= 0 then
@@ -1308,6 +2098,18 @@ local function StartEncounter(bossID, bossName, overrideData, fromSpeech)
                     end
                     if next(prevTrashSeg.raidUtility[ev.pName]) == nil then
                         prevTrashSeg.raidUtility[ev.pName] = nil
+                    end
+                end
+                if ev.dpValue ~= nil and prevTrashSeg and prevTrashSeg.demonicPactValues and prevTrashSeg.demonicPactValues[ev.pName] then
+                    local trashDP = prevTrashSeg.demonicPactValues[ev.pName]
+                    for idx = #trashDP, 1, -1 do
+                        if trashDP[idx] == ev.dpValue then
+                            table.remove(trashDP, idx)
+                            break
+                        end
+                    end
+                    if #trashDP == 0 then
+                        prevTrashSeg.demonicPactValues[ev.pName] = nil
                     end
                 end
             end
@@ -1327,10 +2129,6 @@ local function EndEncounter(isVictory, reason)
     if not inCombatState then return end
 
     local now = GetTime()
-    local duration = math.max(1, math.floor(now - bossStartTime))
-    local mins = math.floor(duration / 60)
-    local secs = duration % 60
-    local timeStr = string.format("%dm %ds", mins, secs)
     local finishedBoss = activeBossName or "Boss"
 
     if not isVictory and finishedBoss == "Faction Champions" then
@@ -1347,24 +2145,39 @@ local function EndEncounter(isVictory, reason)
         isVictory = true
     end
 
+    local usedLKFuryTime = false
+    local effectiveEndTime = now
+    if isVictory and finishedBoss == "The Lich King" and RTExt.lichKingFuryTime and RTExt.lichKingFuryTime >= bossStartTime then
+        effectiveEndTime = RTExt.lichKingFuryTime
+        usedLKFuryTime = true
+    end
+
+    local duration = math.max(1, math.floor(effectiveEndTime - bossStartTime))
+    local mins = math.floor(duration / 60)
+    local secs = duration % 60
+    local timeStr = string.format("%dm %ds", mins, secs)
+
     if isVictory then
         bossEndCooldowns[finishedBoss] = now
         defeatedBossLocks[finishedBoss] = now
         if currentSession.segments[1] and currentSession.segments[1].isBoss then
             currentSession.segments[1].duration = duration
+            if usedLKFuryTime then
+                currentSession.segments[1].lkFuryDuration = duration
+            end
             currentSession.segments[1].name = string.format("%s [Victory - %s]", finishedBoss, timeStr)
         end
         RepairSplitLichKingSegments(currentSession)
         AnnounceLocalChat(string.format("VICTORY: %s was killed and it was a victory! (%s)", finishedBoss, timeStr))
     else
-        if duration < 25 or not hasEnteredBossCombat then
+        if duration < RTExt.MIN_BOSS_PULL_DURATION or not hasEnteredBossCombat then
             if currentSession.segments[1] and currentSession.segments[1].isBoss then
                 table.remove(currentSession.segments, 1)
             end
             if activeBossName and bossAttemptCount[activeBossName] and bossAttemptCount[activeBossName] > 0 then
                 bossAttemptCount[activeBossName] = bossAttemptCount[activeBossName] - 1
             end
-            AnnounceLocalChat(string.format("Boss combat ended: %s (Attempt < 25s removed)", finishedBoss))
+            AnnounceLocalChat(string.format("Boss combat ended: %s (Attempt < %ds removed)", finishedBoss, RTExt.MIN_BOSS_PULL_DURATION))
         else
             bossEndCooldowns[finishedBoss] = now
             if currentSession.segments[1] and currentSession.segments[1].isBoss then
@@ -1380,6 +2193,7 @@ local function EndEncounter(isVictory, reason)
     hasEnteredBossCombat = false
     lichKingRPActive = false
     lichKingRPElapsed = 0
+    RTExt.lichKingFuryTime = nil
     activeBossID = nil
     activeBossName = nil
     activeBossData = nil
@@ -1388,6 +2202,7 @@ local function EndEncounter(isVictory, reason)
     table.wipe(defeatedGroupNPCs)
     table.wipe(recentProcs)
     table.wipe(recentPrePullEvents)
+    table.wipe(RTExt.recentDemonicPact)
 
     EnsureTrashSegment()
     RequestMainViewRefresh()
@@ -1404,6 +2219,13 @@ combatWatchdogFrame:SetScript("OnUpdate", function(self, elapsed)
                 HandleZoneOrDifficultyUpdate(true)
             end
         end
+    end
+
+    RTExt.zoneTimeAccum = RTExt.zoneTimeAccum + elapsed
+    if RTExt.zoneTimeAccum >= 1.0 then
+        local dt = RTExt.zoneTimeAccum
+        RTExt.zoneTimeAccum = 0
+        RTExt.UpdateSessionZoneTimes(dt)
     end
 
     if not inCombatState then
@@ -1654,7 +2476,139 @@ local function GetEnrageSummaryString(seg)
     return table.concat(parts, ", "), totalEnrages
 end
 
-local function BuildCondensedEntryLines(entryMap, indentPrefix)
+function RTExt.FormatDemonicPactLine(indentPrefix, dpValues, fallbackCount)
+    indentPrefix = indentPrefix or ""
+    if type(dpValues) == "table" and #dpValues > 0 then
+        return string.format("%sDemonic Pact (%d): %s", indentPrefix, #dpValues, table.concat(dpValues, ", "))
+    end
+    return string.format("%sDemonic Pact (%d)", indentPrefix, tonumber(fallbackCount) or 0)
+end
+
+function RTExt.IsPotionSummaryConsumable(rawName)
+    if type(rawName) ~= "string" or rawName == "" then return false end
+    local clean = StripColorCodes(rawName)
+    local base = clean:match("^(.-)%s*%[.-%]$") or clean
+    if base:find("Flask") or base:find("Elixir") or base:find("Well Fed") or base:find("Fish Feast") then
+        return false
+    end
+    if COMBAT_POTION_NAMES[base] or RTExt.POTIONS_SUMMARY_EXTRA[base] then
+        return true
+    end
+    if base:find("Potion") ~= nil or base:find("Injector") ~= nil then
+        return true
+    end
+    return false
+end
+
+function RTExt.BuildBossPotionsReportText(activeSession)
+    local sessionName = (activeSession and activeSession.name) or "Live Current Session"
+    local segs = (activeSession and activeSession.segments) or {}
+
+    local totalBossFights = 0
+    local victories = 0
+    local wipes = 0
+    local playerPotions = {}
+    local playerTotals = {}
+    local playerClasses = {}
+    local playerFights = {}
+    local grandTotalPotions = 0
+
+    for _, seg in ipairs(segs) do
+        if seg and seg.isBoss then
+            totalBossFights = totalBossFights + 1
+            if seg.name and seg.name:find("Victory") then
+                victories = victories + 1
+            else
+                wipes = wipes + 1
+            end
+
+            local presentList, presentMap = CollectPresentPlayersInSegment(seg)
+            for _, pName in ipairs(presentList) do
+                playerClasses[pName] = presentMap[pName] or playerClasses[pName] or string.upper(GetSafePlayerClass(pName))
+                playerFights[pName] = (playerFights[pName] or 0) + 1
+                playerTotals[pName] = playerTotals[pName] or 0
+                playerPotions[pName] = playerPotions[pName] or {}
+            end
+
+            for pName, entries in pairs(seg.potionsAndBuffs or {}) do
+                if not playerClasses[pName] then
+                    playerClasses[pName] = string.upper((seg.players and seg.players[pName]) or GetSafePlayerClass(pName))
+                end
+                playerTotals[pName] = playerTotals[pName] or 0
+                playerPotions[pName] = playerPotions[pName] or {}
+                for rawKey, count in pairs(entries or {}) do
+                    local c = tonumber(count) or 0
+                    if c > 0 and RTExt.IsPotionSummaryConsumable(rawKey) then
+                        local clean = StripColorCodes(rawKey)
+                        local base = clean:match("^(.-)%s*%[.-%]$") or clean
+                        playerPotions[pName][base] = (playerPotions[pName][base] or 0) + c
+                        playerTotals[pName] = playerTotals[pName] + c
+                        grandTotalPotions = grandTotalPotions + c
+                    end
+                end
+            end
+        end
+    end
+
+    local lines = {
+        string.format("=== Raiders Tracker%s by %s - Boss Potions Summary ===", RTExt.GetVersionTag(), AUTHOR),
+        string.format("Session: %s", sessionName),
+        string.format("Total Boss Fights: %d (%d Victories, %d Wipes/Attempts)", totalBossFights, victories, wipes),
+    }
+
+    if totalBossFights == 0 then
+        table.insert(lines, "")
+        table.insert(lines, "No boss fights recorded in this session yet.")
+        return table.concat(lines, "\n")
+    end
+
+    local sortedPlayers = {}
+    for pName in pairs(playerTotals) do
+        table.insert(sortedPlayers, {
+            name = pName,
+            class = playerClasses[pName] or "WARRIOR",
+            total = playerTotals[pName] or 0,
+            fights = playerFights[pName] or 0,
+            items = playerPotions[pName] or {},
+        })
+    end
+    table.sort(sortedPlayers, function(a, b)
+        if a.total ~= b.total then return a.total > b.total end
+        return a.name < b.name
+    end)
+
+    table.insert(lines, string.format("Total Players: %d | Total Potions Used: %d", #sortedPlayers, grandTotalPotions))
+    table.insert(lines, "")
+
+    if #sortedPlayers == 0 then
+        table.insert(lines, "No players recorded in boss fights yet.")
+    else
+        for idx, p in ipairs(sortedPlayers) do
+            local itemNames = {}
+            for itemName in pairs(p.items) do
+                table.insert(itemNames, itemName)
+            end
+            table.sort(itemNames)
+            local detailStr = "None"
+            if #itemNames > 0 then
+                local parts = {}
+                for _, itemName in ipairs(itemNames) do
+                    table.insert(parts, string.format("%s: %d", itemName, p.items[itemName]))
+                end
+                detailStr = table.concat(parts, ", ")
+            end
+            local fightWord = (p.fights == 1) and "fight" or "fights"
+            table.insert(lines, string.format(
+                "%d. %s (%s) - %d total [%d/%d %s] (%s)",
+                idx, p.name, p.class, p.total, p.fights, totalBossFights, fightWord, detailStr
+            ))
+        end
+    end
+
+    return table.concat(lines, "\n")
+end
+
+local function BuildCondensedEntryLines(entryMap, indentPrefix, dpValues)
     indentPrefix = indentPrefix or ""
     if not entryMap or next(entryMap) == nil then return {} end
     local grouped = {}
@@ -1698,6 +2652,8 @@ local function BuildCondensedEntryLines(entryMap, indentPrefix)
                     table.insert(out, string.format("%s%s [%s]: %d", indentPrefix, base, tName, info.targets[tName]))
                 end
             end
+        elseif base == "Demonic Pact" and type(dpValues) == "table" and #dpValues > 0 then
+            table.insert(out, RTExt.FormatDemonicPactLine(indentPrefix, dpValues, info.total))
         else
             table.insert(out, string.format("%s%s: %d", indentPrefix, base, info.total))
         end
@@ -1709,7 +2665,7 @@ local function BuildStandardRaidHeaderLines(seg)
     local segName = (seg and seg.name) or "TRASH"
     local segDiff = (seg and seg.difficulty) or GetRaidDifficultySuffix()
     return {
-        string.format("=== Raiders Tracker v%s by %s ===", GetAddonVersion(), AUTHOR),
+        string.format("=== Raiders Tracker%s by %s ===", RTExt.GetVersionTag(), AUTHOR),
         GITHUB_URL,
         string.format("Segment: %s (%s)", segName, segDiff)
     }
@@ -1791,10 +2747,20 @@ local function CloseAllPanels()
     if DeathsFrame then DeathsFrame:Hide() end
     if DeathLogFrame then DeathLogFrame:Hide() end
     if BlacklistFrame then BlacklistFrame:Hide() end
+    if RTExt.BlacklistExportFrame then RTExt.BlacklistExportFrame:Hide() end
+    if RTExt.BlacklistImportFrame then RTExt.BlacklistImportFrame:Hide() end
+    if RTExt.BlacklistTextFrame then RTExt.BlacklistTextFrame:Hide() end
+    if RTExt.CharacterExportFrame then RTExt.CharacterExportFrame:Hide() end
+    if RTExt.PotionsFrame then RTExt.PotionsFrame:Hide() end
 end
 
 local function ResetAllPanelPositions()
-    local panels = { MainTrackerFrame, ConfigFrame, CharacterFrame, ReportFrame, DeathsFrame, DeathLogFrame, BlacklistFrame }
+    local panels = {
+        MainTrackerFrame, ConfigFrame, CharacterFrame, RTExt.CharacterExportFrame,
+        ReportFrame, DeathsFrame, DeathLogFrame,
+        BlacklistFrame, RTExt.BlacklistExportFrame, RTExt.BlacklistImportFrame, RTExt.BlacklistTextFrame,
+        RTExt.PotionsFrame
+    }
     for _, frame in ipairs(panels) do
         if frame then
             frame:ClearAllPoints()
@@ -2204,6 +3170,12 @@ local function CreateMainTrackerFrame()
     btnDeaths:SetText("Deaths")
     btnDeaths:SetScript("OnClick", function() CloseAllPanels(); DeathsFrame:Show() end)
 
+    local btnPotionsPanel = CreateFrame("Button", nil, MainTrackerFrame, "UIPanelButtonTemplate")
+    btnPotionsPanel:SetSize(90, 22)
+    btnPotionsPanel:SetPoint("LEFT", btnDeaths, "RIGHT", 6, 0)
+    btnPotionsPanel:SetText("POTIONS")
+    btnPotionsPanel:SetScript("OnClick", function() CloseAllPanels(); RTExt.PotionsFrame:Show() end)
+
     local viewBox = CreateWhiteBorderViewBox(MainTrackerFrame, -132, 38)
 
     local scrollFrame = CreateFrame("ScrollFrame", "RTMainScrollFrame", viewBox, "UIPanelScrollFrameTemplate")
@@ -2339,7 +3311,12 @@ local function CreateMainTrackerFrame()
 
                     for _, entry in ipairs(sortedEntries) do
                         if lineIndex <= 1500 then
-                            fontStrings[lineIndex]:SetText(string.format("   |cff808080-|r %s: |cff00FF00%d|r", entry.name, entry.count))
+                            local dpVals = (currentView == "UTILITY" and entry.name == "Demonic Pact" and seg.demonicPactValues) and seg.demonicPactValues[pName] or nil
+                            if type(dpVals) == "table" and #dpVals > 0 then
+                                fontStrings[lineIndex]:SetText(string.format("   |cff808080-|r Demonic Pact (|cff00FF00%d|r): |cffFFD100%s|r", #dpVals, table.concat(dpVals, ", ")))
+                            else
+                                fontStrings[lineIndex]:SetText(string.format("   |cff808080-|r %s: |cff00FF00%d|r", entry.name, entry.count))
+                            end
                             fontStrings[lineIndex]:Show()
                             lineIndex = lineIndex + 1
                         end
@@ -2392,10 +3369,98 @@ local function CreateMainTrackerFrame()
 end
 
 -------------------------------------------------------------------------------
+-- Boss Potions Summary Panel Implementation
+-------------------------------------------------------------------------------
+function RTExt.CreatePotionsFrame()
+    local frame = CreateRUTPanel("RTPotionsFrame", 640, 480, "Boss Fights Potions")
+    RTExt.PotionsFrame = frame
+
+    local currentText = ""
+
+    local infoLabel = frame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    infoLabel:SetPoint("TOPLEFT", frame, "TOPLEFT", 18, -36)
+    infoLabel:SetText("All potions, Flame Caps, Thistle Tea & combat consumables across all boss fights (Ctrl+A, Ctrl+C):")
+
+    local viewBox = CreateWhiteBorderViewBox(frame, -58, 46)
+
+    local scrollFrame = CreateFrame("ScrollFrame", "RTPotionsScrollFrame", viewBox, "UIPanelScrollFrameTemplate")
+    scrollFrame:SetPoint("TOPLEFT", viewBox, "TOPLEFT", 8, -8)
+    scrollFrame:SetPoint("BOTTOMRIGHT", viewBox, "BOTTOMRIGHT", -28, 8)
+
+    local editBox = CreateFrame("EditBox", "RTPotionsEditBox", scrollFrame)
+    editBox:SetMultiLine(true)
+    editBox:SetAutoFocus(false)
+    if editBox.SetMaxLetters then editBox:SetMaxLetters(0) end
+    if editBox.SetMaxBytes then editBox:SetMaxBytes(0) end
+    editBox:SetFontObject(GameFontHighlightSmall)
+    editBox:SetWidth(560)
+    editBox:SetHeight(330)
+    editBox:SetScript("OnEscapePressed", function(self)
+        self:ClearFocus()
+        frame:Hide()
+    end)
+    editBox:SetScript("OnChar", function(self)
+        self:SetText(currentText)
+    end)
+    scrollFrame:SetScrollChild(editBox)
+
+    viewBox:EnableMouse(true)
+    viewBox:SetScript("OnMouseDown", function() editBox:SetFocus() end)
+    scrollFrame:EnableMouse(true)
+    scrollFrame:SetScript("OnMouseDown", function() editBox:SetFocus() end)
+
+    local btnSelectAll = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
+    btnSelectAll:SetSize(115, 24)
+    btnSelectAll:SetPoint("BOTTOMLEFT", frame, "BOTTOMLEFT", 18, 14)
+    btnSelectAll:SetText("Select All")
+    btnSelectAll:SetScript("OnClick", function()
+        editBox:SetFocus()
+        editBox:HighlightText()
+    end)
+
+    local btnBackMain = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
+    btnBackMain:SetSize(130, 24)
+    btnBackMain:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", -18, 14)
+    btnBackMain:SetText("BACK to MAIN")
+    btnBackMain:SetScript("OnClick", function()
+        CloseAllPanels()
+        MainTrackerFrame:Show()
+    end)
+
+    frame:SetScript("OnShow", function()
+        local activeSession = GetActiveSession()
+        currentText = RTExt.BuildBossPotionsReportText(activeSession)
+        editBox:SetText(currentText)
+        if scrollFrame.UpdateScrollChildRect then scrollFrame:UpdateScrollChildRect() end
+        scrollFrame:SetVerticalScroll(0)
+        editBox:SetFocus()
+        editBox:HighlightText()
+    end)
+end
+
+-------------------------------------------------------------------------------
 -- Blacklist Panel Implementation
 -------------------------------------------------------------------------------
 local function CreateBlacklistFrame()
     BlacklistFrame = CreateRUTPanel("RTBlacklistFrame", 620, 480, "Player Blacklist")
+
+    local btnExportBL = CreateFrame("Button", nil, BlacklistFrame, "UIPanelButtonTemplate")
+    btnExportBL:SetSize(135, 24)
+    btnExportBL:SetPoint("TOPLEFT", BlacklistFrame, "TOPLEFT", 18, -36)
+    btnExportBL:SetText("Export Blacklist")
+    btnExportBL:SetScript("OnClick", function() CloseAllPanels(); RTExt.BlacklistExportFrame:Show() end)
+
+    local btnImportBL = CreateFrame("Button", nil, BlacklistFrame, "UIPanelButtonTemplate")
+    btnImportBL:SetSize(135, 24)
+    btnImportBL:SetPoint("LEFT", btnExportBL, "RIGHT", 10, 0)
+    btnImportBL:SetText("Import Blacklist")
+    btnImportBL:SetScript("OnClick", function() CloseAllPanels(); RTExt.BlacklistImportFrame:Show() end)
+
+    local btnCopyTextBL = CreateFrame("Button", nil, BlacklistFrame, "UIPanelButtonTemplate")
+    btnCopyTextBL:SetSize(135, 24)
+    btnCopyTextBL:SetPoint("LEFT", btnImportBL, "RIGHT", 10, 0)
+    btnCopyTextBL:SetText("Copy as Text")
+    btnCopyTextBL:SetScript("OnClick", function() CloseAllPanels(); RTExt.BlacklistTextFrame:Show() end)
 
     local btnBack = CreateFrame("Button", nil, BlacklistFrame, "UIPanelButtonTemplate")
     btnBack:SetSize(130, 24)
@@ -2403,7 +3468,7 @@ local function CreateBlacklistFrame()
     btnBack:SetText("Back to Tracker")
     btnBack:SetScript("OnClick", function() CloseAllPanels(); MainTrackerFrame:Show() end)
 
-    local viewBox = CreateWhiteBorderViewBox(BlacklistFrame, -42, 46)
+    local viewBox = CreateWhiteBorderViewBox(BlacklistFrame, -68, 46)
 
     local scrollFrame = CreateFrame("ScrollFrame", "RTBlacklistScrollFrame", viewBox, "UIPanelScrollFrameTemplate")
     scrollFrame:SetPoint("TOPLEFT", viewBox, "TOPLEFT", 8, -8)
@@ -2485,7 +3550,7 @@ local function CreateBlacklistFrame()
         local shownCount = math.min(#list, 100)
         for idx = 1, shownCount do
             local item = list[idx]
-            rows[idx].text:SetText(string.format("ID: |cff00FF00[%s]|r Names: |cffFF4444%s|r%s\nReason: |cffFFD100%s|r (%s)", item.id, item.namesStr, item.classStr, item.reason, item.date))
+            rows[idx].text:SetText(string.format("ID: |cff00FF00[%s]|r Names: |cffFFFF00%s|r%s\nReason: |cffFFD100%s|r (%s)", item.id, item.namesStr, item.classStr, item.reason, item.date))
             rows[idx].btnRemove.targetID = item.id
             if not rows[idx]:IsShown() then rows[idx]:Show() end
         end
@@ -2494,6 +3559,269 @@ local function CreateBlacklistFrame()
     end
 
     BlacklistFrame:SetScript("OnShow", RefreshBlacklistView)
+end
+
+function RTExt.CreateBlacklistExportFrame()
+    local frame = CreateRUTPanel("RTBlacklistExportFrame", 620, 440, "Export Blacklist")
+    RTExt.BlacklistExportFrame = frame
+
+    local currentExportText = ""
+
+    local infoLabel = frame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    infoLabel:SetPoint("TOPLEFT", frame, "TOPLEFT", 18, -36)
+    infoLabel:SetText("Base64 XML backup of your blacklist (Ctrl+A, Ctrl+C to copy):")
+
+    local statusLabel = frame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    statusLabel:SetPoint("TOPLEFT", frame, "TOPLEFT", 18, -52)
+
+    local viewBox = CreateWhiteBorderViewBox(frame, -72, 46)
+
+    local scrollFrame = CreateFrame("ScrollFrame", "RTBlacklistExportScrollFrame", viewBox, "UIPanelScrollFrameTemplate")
+    scrollFrame:SetPoint("TOPLEFT", viewBox, "TOPLEFT", 8, -8)
+    scrollFrame:SetPoint("BOTTOMRIGHT", viewBox, "BOTTOMRIGHT", -28, 8)
+
+    local editBox = CreateFrame("EditBox", "RTBlacklistExportEditBox", scrollFrame)
+    editBox:SetMultiLine(true)
+    editBox:SetAutoFocus(false)
+    if editBox.SetMaxLetters then editBox:SetMaxLetters(0) end
+    if editBox.SetMaxBytes then editBox:SetMaxBytes(0) end
+    editBox:SetFontObject(GameFontHighlightSmall)
+    editBox:SetWidth(540)
+    editBox:SetHeight(280)
+    editBox:SetScript("OnEscapePressed", function(self)
+        self:ClearFocus()
+        frame:Hide()
+    end)
+    editBox:SetScript("OnChar", function(self)
+        self:SetText(currentExportText)
+    end)
+    scrollFrame:SetScrollChild(editBox)
+
+    viewBox:EnableMouse(true)
+    viewBox:SetScript("OnMouseDown", function() editBox:SetFocus() end)
+
+    local btnSelectAll = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
+    btnSelectAll:SetSize(115, 24)
+    btnSelectAll:SetPoint("BOTTOMLEFT", frame, "BOTTOMLEFT", 18, 14)
+    btnSelectAll:SetText("Select All")
+    btnSelectAll:SetScript("OnClick", function()
+        editBox:SetFocus()
+        editBox:HighlightText()
+    end)
+
+    local btnBackBL = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
+    btnBackBL:SetSize(135, 24)
+    btnBackBL:SetPoint("LEFT", btnSelectAll, "RIGHT", 10, 0)
+    btnBackBL:SetText("Back to Blacklist")
+    btnBackBL:SetScript("OnClick", function() CloseAllPanels(); BlacklistFrame:Show() end)
+
+    local btnBackTracker = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
+    btnBackTracker:SetSize(130, 24)
+    btnBackTracker:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", -18, 14)
+    btnBackTracker:SetText("Back to Tracker")
+    btnBackTracker:SetScript("OnClick", function() CloseAllPanels(); MainTrackerFrame:Show() end)
+
+    frame:SetScript("OnShow", function()
+        local b64, count = RTExt.ExportBlacklistToBase64XML()
+        currentExportText = b64 or ""
+        if count == 0 then
+            statusLabel:SetText("|cffFFFF00Your blacklist is currently empty (0 entries exported).|r")
+        else
+            statusLabel:SetText(string.format("|cff00FF00Ready to share: %d %s exported (%d Base64 characters).|r", count, (count == 1) and "entry" or "entries", #currentExportText))
+        end
+        editBox:SetText(currentExportText)
+        if scrollFrame.UpdateScrollChildRect then scrollFrame:UpdateScrollChildRect() end
+        scrollFrame:SetVerticalScroll(0)
+        editBox:SetFocus()
+        editBox:HighlightText()
+    end)
+end
+
+function RTExt.CreateBlacklistImportFrame()
+    local frame = CreateRUTPanel("RTBlacklistImportFrame", 620, 460, "Import Blacklist")
+    RTExt.BlacklistImportFrame = frame
+
+    local infoLabel = frame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    infoLabel:SetPoint("TOPLEFT", frame, "TOPLEFT", 18, -36)
+    infoLabel:SetText("Paste Base64 blacklist data exported from Raiders Tracker below (Ctrl+V):")
+
+    local statusLabel = frame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    statusLabel:SetPoint("TOPLEFT", frame, "TOPLEFT", 18, -52)
+    statusLabel:SetPoint("TOPRIGHT", frame, "TOPRIGHT", -18, -52)
+    statusLabel:SetJustifyH("LEFT")
+    statusLabel:SetWordWrap(true)
+    statusLabel:SetText("|cffCCCCCCPaste data and click Verify or Import.|r")
+
+    local viewBox = CreateWhiteBorderViewBox(frame, -82, 46)
+
+    local scrollFrame = CreateFrame("ScrollFrame", "RTBlacklistImportScrollFrame", viewBox, "UIPanelScrollFrameTemplate")
+    scrollFrame:SetPoint("TOPLEFT", viewBox, "TOPLEFT", 8, -8)
+    scrollFrame:SetPoint("BOTTOMRIGHT", viewBox, "BOTTOMRIGHT", -28, 8)
+
+    local editBox = CreateFrame("EditBox", "RTBlacklistImportEditBox", scrollFrame)
+    editBox:SetMultiLine(true)
+    editBox:SetAutoFocus(false)
+    if editBox.SetMaxLetters then editBox:SetMaxLetters(0) end
+    if editBox.SetMaxBytes then editBox:SetMaxBytes(0) end
+    editBox:SetFontObject(GameFontHighlightSmall)
+    editBox:SetWidth(540)
+    editBox:SetHeight(290)
+    editBox:SetScript("OnEscapePressed", function(self)
+        self:ClearFocus()
+        frame:Hide()
+    end)
+    editBox:SetScript("OnTextChanged", function()
+        if scrollFrame.UpdateScrollChildRect then scrollFrame:UpdateScrollChildRect() end
+    end)
+    scrollFrame:SetScrollChild(editBox)
+
+    viewBox:EnableMouse(true)
+    viewBox:SetScript("OnMouseDown", function() editBox:SetFocus() end)
+    scrollFrame:EnableMouse(true)
+    scrollFrame:SetScript("OnMouseDown", function() editBox:SetFocus() end)
+
+    local btnVerify = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
+    btnVerify:SetSize(100, 24)
+    btnVerify:SetPoint("BOTTOMLEFT", frame, "BOTTOMLEFT", 18, 14)
+    btnVerify:SetText("Verify")
+
+    local btnImport = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
+    btnImport:SetSize(110, 24)
+    btnImport:SetPoint("LEFT", btnVerify, "RIGHT", 8, 0)
+    btnImport:SetText("Import")
+
+    local btnClear = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
+    btnClear:SetSize(80, 24)
+    btnClear:SetPoint("LEFT", btnImport, "RIGHT", 8, 0)
+    btnClear:SetText("Clear")
+
+    local btnBackBL = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
+    btnBackBL:SetSize(135, 24)
+    btnBackBL:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", -18, 14)
+    btnBackBL:SetText("Back to Blacklist")
+    btnBackBL:SetScript("OnClick", function() CloseAllPanels(); BlacklistFrame:Show() end)
+
+    btnClear:SetScript("OnClick", function()
+        editBox:SetText("")
+        statusLabel:SetText("|cffCCCCCCCleared. Paste Base64 data and click Verify or Import.|r")
+        editBox:SetFocus()
+    end)
+
+    btnVerify:SetScript("OnClick", function()
+        local raw = editBox:GetText() or ""
+        local entries, err = RTExt.ParseAndValidateBlacklistImport(raw)
+        if not entries then
+            statusLabel:SetText("|cffFFFF00WARNING: " .. tostring(err) .. "|r")
+            return
+        end
+        if #entries == 0 then
+            statusLabel:SetText("|cffFFFF00Valid Raiders Tracker format, but contains 0 blacklist entries.|r")
+            return
+        end
+        local impCnt, dupCnt, newNamesCnt = RTExt.ProcessBlacklistImport(entries, true)
+        local extraStr = (newNamesCnt > 0) and string.format(", %d new name(s) for existing IDs", newNamesCnt) or ""
+        statusLabel:SetText(string.format("|cff00FF00Valid data! Ready to import: %d new, %d duplicates to omit%s.|r", impCnt, dupCnt, extraStr))
+    end)
+
+    btnImport:SetScript("OnClick", function()
+        local raw = editBox:GetText() or ""
+        local entries, err = RTExt.ParseAndValidateBlacklistImport(raw)
+        if not entries then
+            local warn = "Blacklist Import Failed - " .. tostring(err)
+            statusLabel:SetText("|cffFFFF00WARNING: " .. tostring(err) .. "|r")
+            if DEFAULT_CHAT_FRAME then
+                DEFAULT_CHAT_FRAME:AddMessage("|cffFFFF00[Raiders Tracker] " .. warn .. "|r")
+            end
+            return
+        end
+        if #entries == 0 then
+            statusLabel:SetText("|cffFFFF00Valid Raiders Tracker format, but 0 entries were present to import.|r")
+            return
+        end
+        local impCnt, dupCnt, newNamesCnt = RTExt.ProcessBlacklistImport(entries, false)
+        local extraStr = (newNamesCnt > 0) and string.format(", %d new name(s) added to existing IDs", newNamesCnt) or ""
+        local summary = string.format("Import complete: %d imported, %d duplicates omitted%s.", impCnt, dupCnt, extraStr)
+        statusLabel:SetText("|cff00FF00" .. summary .. "|r")
+        AnnounceLocalChat(summary)
+        if BlacklistFrame and BlacklistFrame:IsShown() then
+            RefreshBlacklistView()
+        end
+    end)
+
+    frame:SetScript("OnShow", function()
+        editBox:SetText("")
+        statusLabel:SetText("|cffCCCCCCPaste Base64 data exported from Raiders Tracker and click Verify or Import.|r")
+        if scrollFrame.UpdateScrollChildRect then scrollFrame:UpdateScrollChildRect() end
+        scrollFrame:SetVerticalScroll(0)
+        editBox:SetFocus()
+    end)
+end
+
+function RTExt.CreateBlacklistTextFrame()
+    local frame = CreateRUTPanel("RTBlacklistTextFrame", 620, 440, "Copy Blacklist as Text")
+    RTExt.BlacklistTextFrame = frame
+
+    local currentText = ""
+
+    local infoLabel = frame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    infoLabel:SetPoint("TOPLEFT", frame, "TOPLEFT", 18, -36)
+    infoLabel:SetText("Plain-text blacklist ready to copy (Ctrl+A, Ctrl+C):")
+
+    local viewBox = CreateWhiteBorderViewBox(frame, -58, 46)
+
+    local scrollFrame = CreateFrame("ScrollFrame", "RTBlacklistTextScrollFrame", viewBox, "UIPanelScrollFrameTemplate")
+    scrollFrame:SetPoint("TOPLEFT", viewBox, "TOPLEFT", 8, -8)
+    scrollFrame:SetPoint("BOTTOMRIGHT", viewBox, "BOTTOMRIGHT", -28, 8)
+
+    local editBox = CreateFrame("EditBox", "RTBlacklistTextEditBox", scrollFrame)
+    editBox:SetMultiLine(true)
+    editBox:SetAutoFocus(false)
+    if editBox.SetMaxLetters then editBox:SetMaxLetters(0) end
+    if editBox.SetMaxBytes then editBox:SetMaxBytes(0) end
+    editBox:SetFontObject(GameFontHighlightSmall)
+    editBox:SetWidth(540)
+    editBox:SetHeight(290)
+    editBox:SetScript("OnEscapePressed", function(self)
+        self:ClearFocus()
+        frame:Hide()
+    end)
+    editBox:SetScript("OnChar", function(self)
+        self:SetText(currentText)
+    end)
+    scrollFrame:SetScrollChild(editBox)
+
+    viewBox:EnableMouse(true)
+    viewBox:SetScript("OnMouseDown", function() editBox:SetFocus() end)
+
+    local btnSelectAll = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
+    btnSelectAll:SetSize(115, 24)
+    btnSelectAll:SetPoint("BOTTOMLEFT", frame, "BOTTOMLEFT", 18, 14)
+    btnSelectAll:SetText("Select All")
+    btnSelectAll:SetScript("OnClick", function()
+        editBox:SetFocus()
+        editBox:HighlightText()
+    end)
+
+    local btnBackBL = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
+    btnBackBL:SetSize(135, 24)
+    btnBackBL:SetPoint("LEFT", btnSelectAll, "RIGHT", 10, 0)
+    btnBackBL:SetText("Back to Blacklist")
+    btnBackBL:SetScript("OnClick", function() CloseAllPanels(); BlacklistFrame:Show() end)
+
+    local btnBackTracker = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
+    btnBackTracker:SetSize(130, 24)
+    btnBackTracker:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", -18, 14)
+    btnBackTracker:SetText("Back to Tracker")
+    btnBackTracker:SetScript("OnClick", function() CloseAllPanels(); MainTrackerFrame:Show() end)
+
+    frame:SetScript("OnShow", function()
+        currentText = RTExt.BuildBlacklistPlainText()
+        editBox:SetText(currentText)
+        if scrollFrame.UpdateScrollChildRect then scrollFrame:UpdateScrollChildRect() end
+        scrollFrame:SetVerticalScroll(0)
+        editBox:SetFocus()
+        editBox:HighlightText()
+    end)
 end
 
 -------------------------------------------------------------------------------
@@ -2626,7 +3954,7 @@ local function CreateDeathsFrame()
             local item = sortedList[idx]
             local hexColor = GetPlayerClassColor(item.class)
             local deathWord = (item.count == 1) and "Death" or "Deaths"
-            rows[idx].text:SetText(string.format("%d. %s  |cffFF4444(%d %s)|r", idx, ColorizeText(item.name, hexColor), item.count, deathWord))
+            rows[idx].text:SetText(string.format("%d. %s  |cffFFFF00(%d %s)|r", idx, ColorizeText(item.name, hexColor), item.count, deathWord))
             rows[idx].btnLog.playerName = item.name
             if not rows[idx]:IsShown() then rows[idx]:Show() end
         end
@@ -2686,7 +4014,7 @@ local function CreateDeathLogFrame()
         local hexColor = GetPlayerClassColor(pClass)
         local pDeaths = deathsByPlayer[pName] or {}
 
-        headerLabel:SetText(string.format("Detailed Death Log for %s  |cffFF4444(%d Total)|r", ColorizeText(pName, hexColor), #pDeaths))
+        headerLabel:SetText(string.format("Detailed Death Log for %s  |cffFFFF00(%d Total)|r", ColorizeText(pName, hexColor), #pDeaths))
 
         if #pDeaths == 0 then
             logLines[1]:SetText("|cff999999No deaths recorded for this player in the selected scope.|r")
@@ -2714,7 +4042,7 @@ local function CreateDeathLogFrame()
             end
 
             logLines[idx]:SetText(string.format(
-                "%d. |cff888888[%s - %s]|r Killed by |cffFF5555%s|r  |  Ability: |cffFFD100%s|r  |  Damage: |cffFF2222%s|r",
+                "%d. |cff888888[%s - %s]|r Killed by |cffFFFF00%s|r  |  Ability: |cffFFD100%s|r  |  Damage: |cffFFFF00%s|r",
                 idx, timeStampDisplay, segLabel, killer, ability, dmgText
             ))
             logLines[idx]:Show()
@@ -2732,13 +4060,24 @@ end
 local function CreateCharacterFrame()
     CharacterFrame = CreateRUTPanel("RTCharacterFrame", 580, 440, "Session Characters")
 
+    local zoneHeaderLabel = CharacterFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    zoneHeaderLabel:SetPoint("TOPLEFT", CharacterFrame, "TOPLEFT", 18, -36)
+    zoneHeaderLabel:SetPoint("TOPRIGHT", CharacterFrame, "TOPRIGHT", -18, -36)
+    zoneHeaderLabel:SetJustifyH("LEFT")
+
+    local btnExportChars = CreateFrame("Button", nil, CharacterFrame, "UIPanelButtonTemplate")
+    btnExportChars:SetSize(145, 24)
+    btnExportChars:SetPoint("BOTTOMLEFT", CharacterFrame, "BOTTOMLEFT", 18, 14)
+    btnExportChars:SetText("Export Characters")
+    btnExportChars:SetScript("OnClick", function() CloseAllPanels(); RTExt.CharacterExportFrame:Show() end)
+
     local btnBack = CreateFrame("Button", nil, CharacterFrame, "UIPanelButtonTemplate")
     btnBack:SetSize(130, 24)
-    btnBack:SetPoint("BOTTOM", CharacterFrame, "BOTTOM", 0, 14)
+    btnBack:SetPoint("BOTTOMRIGHT", CharacterFrame, "BOTTOMRIGHT", -18, 14)
     btnBack:SetText("Back to Tracker")
     btnBack:SetScript("OnClick", function() CloseAllPanels(); MainTrackerFrame:Show() end)
 
-    local viewBox = CreateWhiteBorderViewBox(CharacterFrame, -42, 46)
+    local viewBox = CreateWhiteBorderViewBox(CharacterFrame, -58, 46)
 
     local scrollFrame = CreateFrame("ScrollFrame", "RTCharScrollFrame", viewBox, "UIPanelScrollFrameTemplate")
     scrollFrame:SetPoint("TOPLEFT", viewBox, "TOPLEFT", 8, -8)
@@ -2771,7 +4110,7 @@ local function CreateCharacterFrame()
     table.insert(activeCustomMenus, blacklistMenu)
 
     local menuButtons = {}
-    local reasons = { "leaver", "bad dps", "unskilled", "ninja", "ninja pulls", "low gs", "afk bot" }
+    local reasons = { "leaver", "bad dps", "unskilled", "ninja", "ninja pulls", "low gs", "afk bot", "rude" }
     for i, reason in ipairs(reasons) do
         local mBtn = CreateFrame("Button", nil, blacklistMenu)
         mBtn:SetHeight(18)
@@ -2845,6 +4184,8 @@ local function CreateCharacterFrame()
 
         local text = row:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
         text:SetPoint("LEFT", row, "LEFT", 6, 0)
+        text:SetJustifyH("LEFT")
+        text:SetWordWrap(false)
 
         local btnWhisper = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
         btnWhisper:SetSize(65, 20)
@@ -2879,6 +4220,8 @@ local function CreateCharacterFrame()
             end
         end)
 
+        text:SetPoint("RIGHT", btnBlacklist, "LEFT", -6, 0)
+
         row.text = text
         row.btnWhisper = btnWhisper
         row.btnBlacklist = btnBlacklist
@@ -2890,6 +4233,15 @@ local function CreateCharacterFrame()
         if not CharacterFrame or not CharacterFrame:IsShown() then return end
         UpdateGroupCache()
         local activeSession = GetActiveSession()
+        local majZone, majCount, totalOnline = RTExt.GetMajorityRaidZone(activeSession)
+        RTExt.activeMajorityRaidZone = majZone
+
+        if totalOnline and totalOnline > 0 then
+            zoneHeaderLabel:SetText(string.format("Majority Raid Zone: |cffFFD100%s|r |cff888888(%d/%d online in zone)|r", majZone or "Unknown", majCount or 0, totalOnline))
+        else
+            zoneHeaderLabel:SetText(string.format("Majority Raid Zone: |cffFFD100%s|r", majZone or "Unknown"))
+        end
+
         local playerMap = {}
         local playerIDMap = {}
         for pName, pClass in pairs((activeSession and activeSession.players) or {}) do
@@ -2897,6 +4249,13 @@ local function CreateCharacterFrame()
         end
         for pName, cID in pairs((activeSession and activeSession.playerIDs) or {}) do
             playerIDMap[pName] = cID
+        end
+        if activeSession and activeSession.zoneTimes then
+            for pName in pairs(activeSession.zoneTimes) do
+                if not playerMap[pName] then
+                    playerMap[pName] = GetSafePlayerClass(pName)
+                end
+            end
         end
         for _, seg in ipairs((activeSession and activeSession.segments) or {}) do
             for pName, pClass in pairs(seg.players or {}) do
@@ -2914,7 +4273,7 @@ local function CreateCharacterFrame()
         if #sortedPlayers == 0 then
             for i = 1, 100 do rows[i]:Hide() end
             emptyLabel:Show()
-            scrollContent:SetHeight(330)
+            scrollContent:SetHeight(315)
             return
         end
 
@@ -2933,7 +4292,11 @@ local function CreateCharacterFrame()
                 activeSession.playerIDs[pName] = pCharID
                 nameToCharID[pName] = pCharID
             end
-            rows[idx].text:SetText(string.format("%s |cff888888(%s)|r", ColorizeText(pName, hexColor), pClass))
+            local zoneSecs = 0
+            if activeSession and activeSession.zoneTimes and activeSession.zoneTimes[pName] and majZone then
+                zoneSecs = activeSession.zoneTimes[pName][majZone] or 0
+            end
+            rows[idx].text:SetText(string.format("%s |cff888888(%s)|r - |cff00FF00%s|r", ColorizeText(pName, hexColor), pClass, RTExt.FormatZoneDuration(zoneSecs)))
             rows[idx].btnWhisper.playerName = pName
             rows[idx].btnBlacklist.playerName = pName
             rows[idx].btnBlacklist.playerClass = pClass
@@ -2947,6 +4310,121 @@ local function CreateCharacterFrame()
 
     CharacterFrame:SetScript("OnShow", RefreshCharactersView)
     CharacterFrame:SetScript("OnHide", function() blacklistMenu:Hide() end)
+end
+
+function RTExt.CreateCharacterExportFrame()
+    local frame = CreateRUTPanel("RTCharacterExportFrame", 580, 440, "Export Characters")
+    RTExt.CharacterExportFrame = frame
+
+    local currentExportText = ""
+
+    local infoLabel = frame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    infoLabel:SetPoint("TOPLEFT", frame, "TOPLEFT", 18, -36)
+    infoLabel:SetText("Copy character names, classes, and raid zone online time (Ctrl+A, Ctrl+C):")
+
+    local viewBox = CreateWhiteBorderViewBox(frame, -58, 46)
+
+    local scrollFrame = CreateFrame("ScrollFrame", "RTCharExportScrollFrame", viewBox, "UIPanelScrollFrameTemplate")
+    scrollFrame:SetPoint("TOPLEFT", viewBox, "TOPLEFT", 8, -8)
+    scrollFrame:SetPoint("BOTTOMRIGHT", viewBox, "BOTTOMRIGHT", -28, 8)
+
+    local editBox = CreateFrame("EditBox", "RTCharExportEditBox", scrollFrame)
+    editBox:SetMultiLine(true)
+    editBox:SetAutoFocus(false)
+    if editBox.SetMaxLetters then editBox:SetMaxLetters(0) end
+    if editBox.SetMaxBytes then editBox:SetMaxBytes(0) end
+    editBox:SetFontObject(GameFontHighlightSmall)
+    editBox:SetWidth(500)
+    editBox:SetHeight(290)
+    editBox:SetScript("OnEscapePressed", function(self)
+        self:ClearFocus()
+        frame:Hide()
+    end)
+    editBox:SetScript("OnChar", function(self)
+        self:SetText(currentExportText)
+    end)
+    scrollFrame:SetScrollChild(editBox)
+
+    viewBox:EnableMouse(true)
+    viewBox:SetScript("OnMouseDown", function() editBox:SetFocus() end)
+
+    local btnSelectAll = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
+    btnSelectAll:SetSize(110, 24)
+    btnSelectAll:SetPoint("BOTTOMLEFT", frame, "BOTTOMLEFT", 18, 14)
+    btnSelectAll:SetText("Select All")
+    btnSelectAll:SetScript("OnClick", function()
+        editBox:SetFocus()
+        editBox:HighlightText()
+    end)
+
+    local btnBackChars = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
+    btnBackChars:SetSize(145, 24)
+    btnBackChars:SetPoint("LEFT", btnSelectAll, "RIGHT", 10, 0)
+    btnBackChars:SetText("Back to Characters")
+    btnBackChars:SetScript("OnClick", function() CloseAllPanels(); CharacterFrame:Show() end)
+
+    local btnBackTracker = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
+    btnBackTracker:SetSize(130, 24)
+    btnBackTracker:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", -18, 14)
+    btnBackTracker:SetText("Back to Tracker")
+    btnBackTracker:SetScript("OnClick", function() CloseAllPanels(); MainTrackerFrame:Show() end)
+
+    frame:SetScript("OnShow", function()
+        local activeSession = GetActiveSession()
+        local majZone = RTExt.activeMajorityRaidZone
+        if not majZone or majZone == "" then
+            majZone = RTExt.GetMajorityRaidZone(activeSession)
+            RTExt.activeMajorityRaidZone = majZone
+        end
+
+        local playerMap = {}
+        for pName, pClass in pairs((activeSession and activeSession.players) or {}) do
+            playerMap[pName] = pClass
+        end
+        if activeSession and activeSession.zoneTimes then
+            for pName in pairs(activeSession.zoneTimes) do
+                if not playerMap[pName] then
+                    playerMap[pName] = GetSafePlayerClass(pName)
+                end
+            end
+        end
+        for _, seg in ipairs((activeSession and activeSession.segments) or {}) do
+            for pName, pClass in pairs(seg.players or {}) do
+                playerMap[pName] = pClass
+            end
+        end
+
+        local sortedPlayers = {}
+        for pName in pairs(playerMap) do table.insert(sortedPlayers, pName) end
+        table.sort(sortedPlayers)
+
+        local lines = {
+            string.format("=== Raiders Tracker%s by %s - Session Characters ===", RTExt.GetVersionTag(), AUTHOR),
+            string.format("Session: %s", (activeSession and activeSession.name) or "Live Current Session"),
+            string.format("Raid Zone: %s", majZone or "Unknown"),
+            string.format("Total Characters: %d", #sortedPlayers),
+            ""
+        }
+        if #sortedPlayers == 0 then
+            table.insert(lines, "No characters recorded in this session yet.")
+        else
+            for _, pName in ipairs(sortedPlayers) do
+                local pClass = string.upper(playerMap[pName] or "WARRIOR")
+                local zoneSecs = 0
+                if activeSession and activeSession.zoneTimes and activeSession.zoneTimes[pName] and majZone then
+                    zoneSecs = activeSession.zoneTimes[pName][majZone] or 0
+                end
+                table.insert(lines, string.format("%s (%s) - %s", pName, pClass, RTExt.FormatZoneDuration(zoneSecs)))
+            end
+        end
+
+        currentExportText = table.concat(lines, "\n")
+        editBox:SetText(currentExportText)
+        if scrollFrame.UpdateScrollChildRect then scrollFrame:UpdateScrollChildRect() end
+        scrollFrame:SetVerticalScroll(0)
+        editBox:SetFocus()
+        editBox:HighlightText()
+    end)
 end
 
 -------------------------------------------------------------------------------
@@ -3186,8 +4664,9 @@ local function CreateReportFrame()
         else
             for _, pName in ipairs(utilPlayers) do
                 local pClass = presentMap[pName] or string.upper(seg.players[pName] or "WARRIOR")
-                table.insert(rLines, string.format("%s (%s)", pName, pClass))
-                for _, cLine in ipairs(BuildCondensedEntryLines(seg.raidUtility[pName], "- ")) do
+                table.insert(rLines, string.format("%s (%s):", pName, pClass))
+                local dpVals = seg.demonicPactValues and seg.demonicPactValues[pName] or nil
+                for _, cLine in ipairs(BuildCondensedEntryLines(seg.raidUtility[pName], "- ", dpVals)) do
                     table.insert(rLines, cLine)
                 end
             end
@@ -3303,7 +4782,7 @@ local function CreateReportFrame()
         elseif activeReportPanel == "DEATHS" then
             btnPanelDeaths:LockHighlight()
             subFrameInfo:Show()
-            infoBannerText:SetText("|cffFF4444Viewing: Chronological Suspicious Deaths Breakdown & Unused Defensives|r")
+            infoBannerText:SetText("|cffFFFF00Viewing: Chronological Suspicious Deaths Breakdown & Unused Defensives|r")
         end
 
         if not seg then
@@ -3385,7 +4864,7 @@ local function CreateReportFrame()
                     "</head>",
                     '<body style="background-color: #141419; color: #E0E0E0; font-family: Arial, Helvetica, sans-serif; line-height: 1.5; padding: 20px;">',
                     '  <h1 style="color: #00FF00; margin-bottom: 4px;">Raiders Tracker by Copper</h1>',
-                    string.format('  <p style="margin-top: 0; margin-bottom: 18px;">Version %s &mdash; <a href="%s" target="_blank" style="color: #69CCF0; text-decoration: underline;">%s</a></p>', EscapeHTML(GetAddonVersion()), GITHUB_URL, GITHUB_URL),
+                    string.format('  <p style="margin-top: 0; margin-bottom: 18px;">%s<a href="%s" target="_blank" style="color: #69CCF0; text-decoration: underline;">%s</a></p>', (GetAddonVersion() ~= "" and ("Version " .. EscapeHTML(GetAddonVersion()) .. " &mdash; ") or ""), GITHUB_URL, GITHUB_URL),
                     string.format('  <h1 style="color: #FFFFFF; border-bottom: 1px solid #444444; padding-bottom: 6px;">%s</h1>', EscapeHTML(header)),
                     string.format('  <h1 style="color: #FFD100; font-size: 1.35em; margin-top: 24px;">1. Characters Present (%d)</h1>', #presentList),
                     "  <ul>"
@@ -3410,7 +4889,7 @@ local function CreateReportFrame()
                         local pClass = presentMap[pName] or string.upper(GetSafePlayerClass(pName))
                         local hexColor = GetPlayerClassColor(pClass)
                         local deathWord = (dPlayer.count == 1) and "Death" or "Deaths"
-                        table.insert(lines, string.format('    <li><span style="color: #%s; font-weight: bold;">%s</span> (%s) &mdash; <span style="color: #FF4444; font-weight: bold;">%d %s</span>', hexColor, EscapeHTML(pName), EscapeHTML(pClass), dPlayer.count, deathWord))
+                        table.insert(lines, string.format('    <li><span style="color: #%s; font-weight: bold;">%s</span> (%s) &mdash; <span style="color: #FFFF00; font-weight: bold;">%d %s</span>', hexColor, EscapeHTML(pName), EscapeHTML(pClass), dPlayer.count, deathWord))
                         table.insert(lines, "      <ul>")
                         for idx, d in ipairs(dPlayer.list) do
                             local killer = StripColorCodes(d.killer or "Unknown Mob")
@@ -3423,7 +4902,7 @@ local function CreateReportFrame()
                             local dmgText = (amount > 0) and string.format("%d dmg", amount) or "Fatal Effect"
                             if overkill > 0 then dmgText = string.format("%d dmg (%d overkill)", amount, overkill) end
                             table.insert(lines, string.format(
-                                '        <li>%d. [%s] Killed by <span style="color: #FF5555;">%s</span> | Ability: <span style="color: #FFD100;">%s</span> | Damage: <span style="color: #FF2222;">%s</span></li>',
+                                '        <li>%d. [%s] Killed by <span style="color: #FFFF00;">%s</span> | Ability: <span style="color: #FFD100;">%s</span> | Damage: <span style="color: #FFFF00;">%s</span></li>',
                                 idx, EscapeHTML(stamp), EscapeHTML(killer), EscapeHTML(ability), EscapeHTML(dmgText)
                             ))
                         end
@@ -3470,8 +4949,13 @@ local function CreateReportFrame()
                             table.insert(sortedEntries, { rawName = utilName, cleanName = StripColorCodes(utilName), count = count })
                         end
                         table.sort(sortedEntries, function(a, b) return a.cleanName < b.cleanName end)
+                        local dpVals = seg.demonicPactValues and seg.demonicPactValues[pName] or nil
                         for _, entry in ipairs(sortedEntries) do
-                            table.insert(lines, string.format('        <li>%s: <span style="color: #00FF00; font-weight: bold;">%d</span></li>', ConvertWoWColorsToHTML(entry.rawName), entry.count))
+                            if entry.cleanName == "Demonic Pact" and type(dpVals) == "table" and #dpVals > 0 then
+                                table.insert(lines, string.format('        <li>Demonic Pact (<span style="color: #00FF00; font-weight: bold;">%d</span>): %s</li>', #dpVals, EscapeHTML(table.concat(dpVals, ", "))))
+                            else
+                                table.insert(lines, string.format('        <li>%s: <span style="color: #00FF00; font-weight: bold;">%d</span></li>', ConvertWoWColorsToHTML(entry.rawName), entry.count))
+                            end
                         end
                         table.insert(lines, "      </ul>")
                         table.insert(lines, "    </li>")
@@ -3484,7 +4968,7 @@ local function CreateReportFrame()
 
             elseif activeAllFormat == "DISCORD" then
                 local lines = {
-                    string.format("=== Raiders Tracker v%s by %s ===", GetAddonVersion(), AUTHOR),
+                    string.format("=== Raiders Tracker%s by %s ===", RTExt.GetVersionTag(), AUTHOR),
                     GITHUB_URL,
                     string.format("Segment: %s (%s)", segName, segDiff),
                     "",
@@ -3541,8 +5025,9 @@ local function CreateReportFrame()
                 else
                     for _, pName in ipairs(utilPlayers) do
                         local pClass = presentMap[pName] or string.upper(seg.players[pName] or "WARRIOR")
-                        table.insert(lines, string.format("**%s (%s)**", pName, pClass))
-                        for _, cLine in ipairs(BuildCondensedEntryLines(seg.raidUtility[pName], "- ")) do
+                        table.insert(lines, string.format("**%s (%s):**", pName, pClass))
+                        local dpVals = seg.demonicPactValues and seg.demonicPactValues[pName] or nil
+                        for _, cLine in ipairs(BuildCondensedEntryLines(seg.raidUtility[pName], "- ", dpVals)) do
                             table.insert(lines, cLine)
                         end
                     end
@@ -3568,7 +5053,8 @@ local function CreateReportFrame()
                     else
                         for _, l in ipairs(potLines) do table.insert(lines, l) end
                     end
-                    local utilLines = BuildCondensedEntryLines((seg.raidUtility or {})[pName], "- ")
+                    local dpVals = seg.demonicPactValues and seg.demonicPactValues[pName] or nil
+                    local utilLines = BuildCondensedEntryLines((seg.raidUtility or {})[pName], "- ", dpVals)
                     table.insert(lines, "[Raid Utility Used]")
                     if #utilLines == 0 then
                         table.insert(lines, "- None recorded")
@@ -3943,9 +5429,8 @@ local function ScheduleLoadMessage(delay)
             CheckGroupBlacklist()
             if not hasPrintedLoadMsg then
                 hasPrintedLoadMsg = true
-                local version = GetAddonVersion()
                 if DEFAULT_CHAT_FRAME then
-                    DEFAULT_CHAT_FRAME:AddMessage("|cff00FF00Raiders Tracker v" .. version .. " by " .. AUTHOR .. " loaded.|r")
+                    DEFAULT_CHAT_FRAME:AddMessage("|cff00FF00Raiders Tracker" .. RTExt.GetVersionTag() .. " by " .. AUTHOR .. " loaded.|r")
                     DEFAULT_CHAT_FRAME:AddMessage("  - |cffFFFFFFLeft-Click Minimap Icon:|r Opens Main Tracker Panel.")
                     DEFAULT_CHAT_FRAME:AddMessage("  - |cffFFFFFFRight-Click Minimap Icon:|r Opens Config Panel.")
                     DEFAULT_CHAT_FRAME:AddMessage("  - Chat commands: |cff00FF00/rt|r or |cff00FF00/rt reset|r to reset panel positions.")
@@ -4154,6 +5639,337 @@ local function RecordPlayerDeath(destName, destGUID)
 end
 
 -------------------------------------------------------------------------------
+-- Demonic Pact Tracking Engine (Demo Warlock Owner Only + Tooltip SP Capture)
+-------------------------------------------------------------------------------
+RTExt.dpScanTooltip = CreateFrame("GameTooltip", "RTDemonicPactScanTooltip", nil, "GameTooltipTemplate")
+RTExt.dpScanTooltip:SetOwner(WorldFrame, "ANCHOR_NONE")
+
+RTExt.dpWatcherFrame = CreateFrame("Frame")
+
+function RTExt.IsDemonicPactEvent(subevent, spellID, spellName)
+    if subevent ~= "SPELL_AURA_APPLIED" and subevent ~= "SPELL_AURA_REFRESH" then
+        return false
+    end
+    if type(spellID) == "number" and RTExt.DEMONIC_PACT_BUFF_IDS[spellID] then
+        return true
+    end
+    if type(spellName) == "string" and spellName == "Demonic Pact" then
+        if spellID ~= 47236 and spellID ~= 47237 and spellID ~= 47238 and spellID ~= 47239 then
+            return true
+        end
+    end
+    return false
+end
+
+function RTExt.ExtractSpellPowerFromTooltip()
+    local numLines = RTExt.dpScanTooltip:NumLines() or 0
+    local fallbackNum = nil
+    for lineIdx = 2, numLines do
+        local fs = _G["RTDemonicPactScanTooltipTextLeft" .. lineIdx]
+        local lineText = fs and fs:GetText()
+        if lineText and lineText ~= "" then
+            local lower = lineText:lower()
+            local isDurationLine = (lower:find("remaining") ~= nil or lower:find("sec") ~= nil or lower:find("min") ~= nil)
+                and (lower:find("spell") == nil and lower:find("power") == nil and lower:find("damage") == nil)
+            if not isDurationLine then
+                local numStr = lineText:match("(%d[%d,]*)")
+                if numStr then
+                    local val = tonumber((numStr:gsub(",", "")))
+                    if val and val > 0 then
+                        if lower:find("spell") or lower:find("power") or lower:find("damage") then
+                            return val
+                        elseif not fallbackNum and lineIdx == 2 then
+                            fallbackNum = val
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return fallbackNum
+end
+
+function RTExt.ReadDemonicPactFromUnit(unit, expectedPetUnit, expectedOwnerUnit, strictCaster)
+    if not unit or not UnitExists(unit) then return nil end
+    for i = 1, 40 do
+        local buffName, _, _, _, _, _, _, unitCaster, _, _, bSpellID = UnitBuff(unit, i)
+        if not buffName then break end
+        if (bSpellID and RTExt.DEMONIC_PACT_BUFF_IDS[bSpellID]) or buffName == "Demonic Pact" then
+            local casterMatches = (not strictCaster)
+                or (expectedPetUnit and unitCaster == expectedPetUnit)
+                or (expectedOwnerUnit and unitCaster == expectedOwnerUnit)
+            if casterMatches then
+                RTExt.dpScanTooltip:SetOwner(WorldFrame, "ANCHOR_NONE")
+                RTExt.dpScanTooltip:ClearLines()
+                RTExt.dpScanTooltip:SetUnitBuff(unit, i)
+                local sp = RTExt.ExtractSpellPowerFromTooltip()
+                if sp and sp > 0 then
+                    return sp
+                end
+            end
+        end
+    end
+    return nil
+end
+
+function RTExt.ScanRaidForDemonicPactSP(pending)
+    local unitsToCheck = {}
+    local seen = {}
+    local function AddUnit(u)
+        if u and not seen[u] and UnitExists(u) then
+            seen[u] = true
+            table.insert(unitsToCheck, u)
+        end
+    end
+
+    for _, u in ipairs(pending.candidateUnits or {}) do
+        AddUnit(u)
+    end
+    AddUnit(pending.ownerUnit)
+    AddUnit("player")
+
+    local numRaid = GetNumRaidMembers()
+    if numRaid > 0 then
+        for i = 1, numRaid do AddUnit("raid" .. i) end
+    else
+        for i = 1, GetNumPartyMembers() do AddUnit("party" .. i) end
+    end
+
+    if pending.petUnit or pending.ownerUnit then
+        for _, u in ipairs(unitsToCheck) do
+            local sp = RTExt.ReadDemonicPactFromUnit(u, pending.petUnit, pending.ownerUnit, true)
+            if sp and sp > 0 then return sp end
+        end
+    end
+
+    for _, u in ipairs(unitsToCheck) do
+        local sp = RTExt.ReadDemonicPactFromUnit(u, pending.petUnit, pending.ownerUnit, false)
+        if sp and sp > 0 then return sp end
+    end
+
+    return nil
+end
+
+function RTExt.OwnerInfoFromCasterUnit(unitCaster)
+    if not unitCaster or unitCaster == "" then return nil end
+    if RTExt.petUnitToOwner[unitCaster] then
+        return RTExt.petUnitToOwner[unitCaster]
+    end
+    local ownerUnit = nil
+    local petUnit = nil
+    if unitCaster == "pet" then
+        ownerUnit = "player"
+        petUnit = "pet"
+    elseif unitCaster:match("^raidpet(%d+)$") then
+        ownerUnit = "raid" .. unitCaster:match("^raidpet(%d+)$")
+        petUnit = unitCaster
+    elseif unitCaster:match("^partypet(%d+)$") then
+        ownerUnit = "party" .. unitCaster:match("^partypet(%d+)$")
+        petUnit = unitCaster
+    elseif unitCaster == "player" or unitCaster:match("^raid%d+$") or unitCaster:match("^party%d+$") then
+        ownerUnit = unitCaster
+    end
+    if ownerUnit and UnitExists(ownerUnit) then
+        local ownerName = UnitName(ownerUnit)
+        local ownerGUID = UnitGUID(ownerUnit)
+        local _, engClass = UnitClass(ownerUnit)
+        if ownerName and ownerName ~= UNKNOWN then
+            return {
+                name = ownerName,
+                guid = ownerGUID,
+                class = engClass or GetSafePlayerClass(ownerName, ownerGUID),
+                unit = ownerUnit,
+                petUnit = petUnit,
+            }
+        end
+    end
+    return nil
+end
+
+function RTExt.ResolveDemonicPactOwner(sourceName, sourceGUID, destUnit)
+    local ownerInfo = nil
+
+    if sourceGUID and RTExt.petGUIDToOwner[sourceGUID] then
+        ownerInfo = RTExt.petGUIDToOwner[sourceGUID]
+    elseif sourceGUID and not IsPlayerGUID(sourceGUID) then
+        UpdateGroupCache()
+        if RTExt.petGUIDToOwner[sourceGUID] then
+            ownerInfo = RTExt.petGUIDToOwner[sourceGUID]
+        end
+    end
+
+    if not ownerInfo and sourceName and IsGroupMember(sourceName, sourceGUID) then
+        local srcClass = GetSafePlayerClass(sourceName, sourceGUID)
+        if srcClass == "WARLOCK" then
+            ownerInfo = {
+                name = sourceName,
+                guid = sourceGUID,
+                class = "WARLOCK",
+                unit = RTExt.playerNameToUnit[sourceName],
+                petUnit = nil,
+            }
+        end
+    end
+
+    if not ownerInfo and destUnit and UnitExists(destUnit) then
+        for i = 1, 40 do
+            local buffName, _, _, _, _, _, _, unitCaster, _, _, bSpellID = UnitBuff(destUnit, i)
+            if not buffName then break end
+            if (bSpellID and RTExt.DEMONIC_PACT_BUFF_IDS[bSpellID]) or buffName == "Demonic Pact" then
+                ownerInfo = RTExt.OwnerInfoFromCasterUnit(unitCaster)
+                if ownerInfo then break end
+            end
+        end
+    end
+
+    if not ownerInfo and sourceName and RTExt.petNameToOwner[sourceName] then
+        ownerInfo = RTExt.petNameToOwner[sourceName]
+    end
+
+    if not ownerInfo or not ownerInfo.name then return nil end
+    local ownerClass = ownerInfo.class or GetSafePlayerClass(ownerInfo.name, ownerInfo.guid)
+    if ownerClass ~= "WARLOCK" then return nil end
+    if not IsGroupMember(ownerInfo.name, ownerInfo.guid) then return nil end
+    ownerInfo.class = "WARLOCK"
+    return ownerInfo
+end
+
+function RTExt.RecordDemonicPactProc(pending, spValue)
+    if not pending or not pending.ownerName then return end
+    local ownerName = pending.ownerName
+    local ownerGUID = pending.ownerGUID
+    local ownerClass = "WARLOCK"
+
+    local targetSegment = pending.segment
+    if pending.isPrePull and inCombatState and currentSession and currentSession.segments[1] and currentSession.segments[1].isBoss then
+        targetSegment = currentSession.segments[1]
+        pending.isPrePull = false
+    end
+    if not targetSegment then
+        if not currentSession or not currentSession.segments[1] then
+            EnsureTrashSegment()
+        end
+        targetSegment = currentSession and currentSession.segments[1]
+    end
+    if not targetSegment then return end
+
+    local ownerCharID = CachePlayerCharID(ownerName, ownerGUID, targetSegment)
+    targetSegment.players = targetSegment.players or {}
+    targetSegment.players[ownerName] = ownerClass
+    currentSession.players = currentSession.players or {}
+    local addedNewSessionPlayer = (currentSession.players[ownerName] == nil)
+    currentSession.players[ownerName] = ownerClass
+
+    local recordedSP = (spValue and spValue > 0) and spValue or "?"
+
+    targetSegment.raidUtility = targetSegment.raidUtility or {}
+    targetSegment.raidUtility[ownerName] = targetSegment.raidUtility[ownerName] or {}
+    targetSegment.raidUtility[ownerName]["Demonic Pact"] = (targetSegment.raidUtility[ownerName]["Demonic Pact"] or 0) + 1
+
+    targetSegment.demonicPactValues = targetSegment.demonicPactValues or {}
+    targetSegment.demonicPactValues[ownerName] = targetSegment.demonicPactValues[ownerName] or {}
+    table.insert(targetSegment.demonicPactValues[ownerName], recordedSP)
+
+    if pending.isPrePull and not inCombatState then
+        table.insert(recentPrePullEvents, {
+            category = "UTILITY",
+            pName = ownerName,
+            pClass = ownerClass,
+            pCharID = ownerCharID,
+            entryName = "Demonic Pact",
+            dpValue = recordedSP,
+            ts = pending.createdAt or GetTime(),
+        })
+    end
+
+    if addedNewSessionPlayer and CharacterFrame and CharacterFrame:IsShown() then
+        RefreshCharactersView()
+    end
+    RequestMainViewRefresh()
+end
+
+function RTExt.OnDemonicPactWatcherUpdate(self, elapsed)
+    local list = RTExt.pendingDemonicPacts
+    if #list == 0 then
+        self:SetScript("OnUpdate", nil)
+        return
+    end
+    local now = GetTime()
+    local i = 1
+    while i <= #list do
+        local pending = list[i]
+        if now >= pending.readyAt then
+            local sp = RTExt.ScanRaidForDemonicPactSP(pending)
+            if (sp and sp > 0) or now >= pending.maxWaitAt then
+                table.remove(list, i)
+                RTExt.RecordDemonicPactProc(pending, sp)
+            else
+                i = i + 1
+            end
+        else
+            i = i + 1
+        end
+    end
+    if #list == 0 then
+        self:SetScript("OnUpdate", nil)
+    end
+end
+
+function RTExt.HandleDemonicPactCLEU(subevent, sourceGUID, sourceName, destGUID, destName, spellID, spellName)
+    if not RTExt.IsDemonicPactEvent(subevent, spellID, spellName) then return end
+
+    local destUnit = (destGUID and RTExt.playerGUIDToUnit[destGUID]) or (destName and RTExt.playerNameToUnit[destName]) or nil
+    local ownerInfo = RTExt.ResolveDemonicPactOwner(sourceName, sourceGUID, destUnit)
+    if not ownerInfo then return end
+
+    local ownerName = ownerInfo.name
+    local now = GetTime()
+
+    for _, pending in ipairs(RTExt.pendingDemonicPacts) do
+        if pending.ownerName == ownerName then
+            if destUnit then
+                local exists = false
+                for _, u in ipairs(pending.candidateUnits) do
+                    if u == destUnit then exists = true; break end
+                end
+                if not exists then table.insert(pending.candidateUnits, destUnit) end
+            end
+            return
+        end
+    end
+
+    local lastProcTime = RTExt.recentDemonicPact[ownerName]
+    if lastProcTime and (now - lastProcTime) < 2.5 then
+        return
+    end
+    RTExt.recentDemonicPact[ownerName] = now
+
+    if not currentSession.segments[1] or currentSession.segments[1].isBoss ~= inCombatState then
+        EnsureTrashSegment()
+    end
+    local targetSegment = currentSession and currentSession.segments[1]
+    if not targetSegment then return end
+
+    table.insert(RTExt.pendingDemonicPacts, {
+        ownerName = ownerName,
+        ownerGUID = ownerInfo.guid,
+        ownerClass = "WARLOCK",
+        ownerUnit = ownerInfo.unit or RTExt.playerNameToUnit[ownerName],
+        petUnit = ownerInfo.petUnit,
+        candidateUnits = destUnit and { destUnit } or {},
+        segment = targetSegment,
+        isPrePull = not inCombatState,
+        createdAt = now,
+        readyAt = now + 0.12,
+        maxWaitAt = now + 0.45,
+    })
+
+    if not RTExt.dpWatcherFrame:GetScript("OnUpdate") then
+        RTExt.dpWatcherFrame:SetScript("OnUpdate", RTExt.OnDemonicPactWatcherUpdate)
+    end
+end
+
+-------------------------------------------------------------------------------
 -- Event Dispatcher
 -------------------------------------------------------------------------------
 local eventHandler = CreateFrame("Frame")
@@ -4162,6 +5978,7 @@ eventHandler:RegisterEvent("ADDON_LOADED")
 eventHandler:RegisterEvent("PLAYER_ENTERING_WORLD")
 eventHandler:RegisterEvent("PARTY_MEMBERS_CHANGED")
 eventHandler:RegisterEvent("RAID_ROSTER_UPDATE")
+eventHandler:RegisterEvent("UNIT_PET")
 eventHandler:RegisterEvent("PLAYER_DIFFICULTY_CHANGED")
 eventHandler:RegisterEvent("UPDATE_INSTANCE_INFO")
 eventHandler:RegisterEvent("CHAT_MSG_SYSTEM")
@@ -4181,12 +5998,17 @@ eventHandler:SetScript("OnEvent", function(self, event, ...)
             InitializeDB()
             CreateMinimapButton()
             CreateMainTrackerFrame()
+            RTExt.CreatePotionsFrame()
             CreateCharacterFrame()
+            RTExt.CreateCharacterExportFrame()
             CreateReportFrame()
             CreateConfigFrame()
             CreateDeathsFrame()
             CreateDeathLogFrame()
             CreateBlacklistFrame()
+            RTExt.CreateBlacklistExportFrame()
+            RTExt.CreateBlacklistImportFrame()
+            RTExt.CreateBlacklistTextFrame()
             UpdateGroupCache()
             EnsureTrashSegment()
         end
@@ -4211,6 +6033,11 @@ eventHandler:SetScript("OnEvent", function(self, event, ...)
     if event == "PLAYER_DIFFICULTY_CHANGED" or event == "UPDATE_INSTANCE_INFO" then
         UpdateGroupCache()
         HandleZoneOrDifficultyUpdate(true)
+        return
+    end
+
+    if event == "UNIT_PET" then
+        UpdateGroupCache()
         return
     end
 
@@ -4254,6 +6081,9 @@ eventHandler:SetScript("OnEvent", function(self, event, ...)
             if activeBossName == "The Lich King" then
                 for _, rpPhrase in ipairs(LICH_KING_RP_SPEECH) do
                     if lowerMsg:find(rpPhrase, 1, true) then
+                        if not RTExt.lichKingFuryTime and rpPhrase == "no questions remain unanswered" then
+                            RTExt.lichKingFuryTime = GetTime()
+                        end
                         lichKingRPActive = true
                         lichKingRPElapsed = 0
                         outOfCombatAccum = 0
@@ -4332,10 +6162,21 @@ eventHandler:SetScript("OnEvent", function(self, event, ...)
                     EndEncounter(true, "Valithria Dreamwalker Healed to 100%")
                     return
                 end
-                if activeBossName == "The Lich King" and (spellID == 72350 or spellID == 70063 or spellID == 71769 or spellID == 72398 or spellID == 72429 or spellID == 72423) then
-                    lichKingRPActive = true
-                    lichKingRPElapsed = 0
-                    outOfCombatAccum = 0
+                if activeBossName == "The Lich King" then
+                    local isFuryOfFrostmourne = (spellID == 72350)
+                        or (type(spellName) == "string" and spellName:lower():find("fury of frostmourne", 1, true) ~= nil)
+                    if isFuryOfFrostmourne then
+                        if not RTExt.lichKingFuryTime then
+                            RTExt.lichKingFuryTime = GetTime()
+                        end
+                        lichKingRPActive = true
+                        lichKingRPElapsed = 0
+                        outOfCombatAccum = 0
+                    elseif spellID == 70063 or spellID == 71769 or spellID == 72398 or spellID == 72429 or spellID == 72423 then
+                        lichKingRPActive = true
+                        lichKingRPElapsed = 0
+                        outOfCombatAccum = 0
+                    end
                 end
             end
 
@@ -4450,6 +6291,10 @@ eventHandler:SetScript("OnEvent", function(self, event, ...)
                     recentProcs[utilKey] = now
                     RecordProc(sourceName, sourceGUID, destName, destGUID, "UTILITY", spellID, spellName, false)
                 end
+            end
+
+            if RTExt.IsDemonicPactEvent(subevent, spellID, spellName) then
+                RTExt.HandleDemonicPactCLEU(subevent, sourceGUID, sourceName, destGUID, destName, spellID, spellName)
             end
         end
         return
