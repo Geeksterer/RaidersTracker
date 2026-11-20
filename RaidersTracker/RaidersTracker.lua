@@ -9,10 +9,17 @@ local GITHUB_URL = "https://github.com/Geeksterer/RaidersTracker/"
 local RTExt = {}
 RTExt.MIN_BOSS_PULL_DURATION = 35
 RTExt.DEMONIC_PACT_BUFF_IDS = {
-    [47240] = true, -- Demonic Pact (3.3.5a raid buff)
-    [53646] = true, -- Demonic Pact (alternate 3.3.5a buff ID)
-    [48090] = true, -- Demonic Pact (proc trigger spell)
+    [48090] = true, -- Demonic Pact (3.3.5a 45s raid buff)
+    [53646] = true, -- Demonic Pact (alternate 3.3.5a raid buff ID)
 }
+RTExt.DEMONIC_PACT_PASSIVE_IDS = {
+    [47236] = true, -- Demonic Pact Talent Rank 1
+    [47237] = true, -- Demonic Pact Talent Rank 2
+    [47238] = true, -- Demonic Pact Talent Rank 3
+    [47239] = true, -- Demonic Pact Talent Rank 4
+    [47240] = true, -- Demonic Pact Talent Rank 5
+}
+RTExt.DEMONIC_PACT_ICD = 18.0
 RTExt.POTIONS_SUMMARY_EXTRA = {
     ["Flame Cap"] = true,
     ["Thistle Tea"] = true,
@@ -25,7 +32,29 @@ RTExt.petNameToOwner = {}
 RTExt.playerGUIDToUnit = {}
 RTExt.playerNameToUnit = {}
 RTExt.recentDemonicPact = {}
+RTExt.lastDemonicPactConfirmedAt = {}
+RTExt.lastDemonicPactExpiry = {}
 RTExt.pendingDemonicPacts = {}
+RTExt.DEMONIC_PACT_ADDON_PREFIX = "RT_DP"
+RTExt.OVERRIDDEN_SP_TOTEMS = {
+    [57722] = 280, -- Totem of Wrath (Rank 4)
+    [57721] = 140, -- Totem of Wrath (Rank 3)
+    [57720] = 120, -- Totem of Wrath (Rank 2)
+    [30708] = 100, -- Totem of Wrath (Rank 1)
+    [58656] = 144, -- Flametongue Totem (Rank 8)
+    [58652] = 122, -- Flametongue Totem (Rank 7)
+    [58649] = 101, -- Flametongue Totem (Rank 6)
+}
+RTExt.lastPlayerSP = 0
+RTExt.prevPlayerSP = 0
+RTExt.prevPlayerSPTime = 0
+RTExt.lastPlayerHasDP = false
+RTExt.lastPlayerTotemSP = 0
+RTExt.preDPTransitionSP = nil
+RTExt.preDPTransitionTime = 0
+RTExt.playerSelfDPContribution = 0
+RTExt.activeObservedDP = 0
+RTExt.spPollAccum = 0
 
 local function GetAddonVersion()
     return GetAddOnMetadata("RaidersTracker", "Version") or ""
@@ -427,7 +456,11 @@ local function UpdateGroupCache()
                     RTExt.petGUIDToOwner[petGUID] = ownerInfo
                 end
                 if petName and petName ~= UNKNOWN then
-                    RTExt.petNameToOwner[petName] = ownerInfo
+                    if RTExt.petNameToOwner[petName] == nil then
+                        RTExt.petNameToOwner[petName] = ownerInfo
+                    elseif RTExt.petNameToOwner[petName] ~= false and RTExt.petNameToOwner[petName].name ~= ownerInfo.name then
+                        RTExt.petNameToOwner[petName] = false
+                    end
                 end
             end
         end
@@ -1774,7 +1807,12 @@ local function ResetLiveSessionState()
     table.wipe(recentProcs)
     table.wipe(recentPrePullEvents)
     table.wipe(RTExt.recentDemonicPact)
+    table.wipe(RTExt.lastDemonicPactConfirmedAt)
+    table.wipe(RTExt.lastDemonicPactExpiry)
     table.wipe(RTExt.pendingDemonicPacts)
+    RTExt.playerSelfDPContribution = 0
+    RTExt.activeObservedDP = 0
+    RTExt.preDPTransitionSP = nil
     if RTExt.dpWatcherFrame then RTExt.dpWatcherFrame:SetScript("OnUpdate", nil) end
     EnsureTrashSegment()
 end
@@ -1884,6 +1922,59 @@ local gracePeriodAccum = 0
 local diffPollAccum = 0
 RTExt.zoneTimeAccum = 0
 
+function RTExt.GetZoneTimeTotal(entry)
+    if type(entry) == "table" then
+        return (tonumber(entry.prev) or 0) + (tonumber(entry.curr) or 0)
+    end
+    return tonumber(entry) or 0
+end
+
+function RTExt.CloseActiveZoneStint(entry)
+    if type(entry) ~= "table" then return end
+    if entry.inGroup then
+        if (tonumber(entry.curr) or 0) > 0 then
+            entry.prev = tonumber(entry.curr) or 0
+            entry.curr = 0
+        end
+        entry.inGroup = false
+    end
+    entry.absentSince = nil
+end
+
+function RTExt.CloseAllActiveZoneStints(session)
+    if not session or type(session.zoneTimes) ~= "table" then return end
+    for _, zMap in pairs(session.zoneTimes) do
+        if type(zMap) == "table" then
+            for zName, entry in pairs(zMap) do
+                if type(entry) == "number" then
+                    if entry > 0 then
+                        zMap[zName] = { prev = entry, curr = 0, inGroup = false }
+                    end
+                elseif type(entry) == "table" then
+                    RTExt.CloseActiveZoneStint(entry)
+                end
+            end
+        end
+    end
+end
+
+function RTExt.AddZoneTimeSeconds(session, playerName, zoneName, dt)
+    if not session or not playerName or not zoneName or zoneName == "" or zoneName == "Unknown" then return end
+    session.zoneTimes = session.zoneTimes or {}
+    session.zoneTimes[playerName] = session.zoneTimes[playerName] or {}
+    local entry = session.zoneTimes[playerName][zoneName]
+    if type(entry) == "number" then
+        entry = { prev = 0, curr = entry, inGroup = true }
+        session.zoneTimes[playerName][zoneName] = entry
+    elseif type(entry) ~= "table" then
+        entry = { prev = 0, curr = 0, inGroup = true }
+        session.zoneTimes[playerName][zoneName] = entry
+    end
+    entry.inGroup = true
+    entry.absentSince = nil
+    entry.curr = (tonumber(entry.curr) or 0) + dt
+end
+
 function RTExt.UpdateSessionZoneTimes(dt)
     if not RaidersTrackerDB or not RaidersTrackerDB.enabled or not currentSession then return end
     dt = math.min(math.max(dt or 0, 0), 5.0)
@@ -1893,11 +1984,23 @@ function RTExt.UpdateSessionZoneTimes(dt)
     currentSession.players = currentSession.players or {}
 
     local numRaid = GetNumRaidMembers()
+    local numParty = GetNumPartyMembers()
+
+    -- Do not track time when solo / not in a raid or party
+    if numRaid == 0 and numParty == 0 then
+        RTExt.CloseAllActiveZoneStints(currentSession)
+        return
+    end
+
+    local now = GetTime()
+    local presentInGroup = {}
+
     if numRaid > 0 then
         for i = 1, numRaid do
             local rName, _, _, _, _, rFileName, rZone, rOnline = GetRaidRosterInfo(i)
             if rName and rName ~= UNKNOWN then
                 local shortName = rName:match("^([^%-]+)") or rName
+                presentInGroup[shortName] = true
                 if rFileName and rFileName ~= "" then
                     currentSession.players[shortName] = currentSession.players[shortName] or rFileName
                     groupClasses[shortName] = groupClasses[shortName] or rFileName
@@ -1907,33 +2010,48 @@ function RTExt.UpdateSessionZoneTimes(dt)
                     CachePlayerCharID(shortName, uGUID)
                 end
                 if rOnline and rZone and rZone ~= "" and rZone ~= "Offline" then
-                    currentSession.zoneTimes[shortName] = currentSession.zoneTimes[shortName] or {}
-                    currentSession.zoneTimes[shortName][rZone] = (currentSession.zoneTimes[shortName][rZone] or 0) + dt
+                    RTExt.AddZoneTimeSeconds(currentSession, shortName, rZone, dt)
                 end
             end
         end
     else
         local myZone = GetCurrentZoneSafe()
         local myName = UnitName("player")
-        if myName and myName ~= UNKNOWN and myZone ~= "Unknown" then
+        if myName and myName ~= UNKNOWN then
+            presentInGroup[myName] = true
             local _, myClass = UnitClass("player")
             if myClass then currentSession.players[myName] = currentSession.players[myName] or myClass end
-            currentSession.zoneTimes[myName] = currentSession.zoneTimes[myName] or {}
-            currentSession.zoneTimes[myName][myZone] = (currentSession.zoneTimes[myName][myZone] or 0) + dt
+            if myZone ~= "Unknown" then
+                RTExt.AddZoneTimeSeconds(currentSession, myName, myZone, dt)
+            end
         end
-        local numParty = GetNumPartyMembers()
         for i = 1, numParty do
             local unit = "party" .. i
-            if UnitExists(unit) and UnitIsConnected(unit) then
+            if UnitExists(unit) then
                 local pName = UnitName(unit)
                 if pName and pName ~= UNKNOWN then
+                    presentInGroup[pName] = true
                     local _, pClass = UnitClass(unit)
                     if pClass then currentSession.players[pName] = currentSession.players[pName] or pClass end
                     local uGUID = UnitGUID(unit)
                     if uGUID then CachePlayerCharID(pName, uGUID) end
-                    if myZone ~= "Unknown" and (UnitIsVisible(unit) or IsInInstance()) then
-                        currentSession.zoneTimes[pName] = currentSession.zoneTimes[pName] or {}
-                        currentSession.zoneTimes[pName][myZone] = (currentSession.zoneTimes[pName][myZone] or 0) + dt
+                    if UnitIsConnected(unit) and myZone ~= "Unknown" and (UnitIsVisible(unit) or IsInInstance()) then
+                        RTExt.AddZoneTimeSeconds(currentSession, pName, myZone, dt)
+                    end
+                end
+            end
+        end
+    end
+
+    -- Detect individual players who left the group/raid so returning adds previous + current only
+    for pName, zMap in pairs(currentSession.zoneTimes) do
+        if type(zMap) == "table" and not presentInGroup[pName] then
+            for _, entry in pairs(zMap) do
+                if type(entry) == "table" and entry.inGroup then
+                    if not entry.absentSince then
+                        entry.absentSince = now
+                    elseif (now - entry.absentSince) >= 5.0 then
+                        RTExt.CloseActiveZoneStint(entry)
                     end
                 end
             end
@@ -1983,10 +2101,11 @@ function RTExt.GetMajorityRaidZone(activeSession)
         local zoneTotalSecs = {}
         for _, zMap in pairs(activeSession.zoneTimes) do
             if type(zMap) == "table" then
-                for zName, secs in pairs(zMap) do
-                    if zName and zName ~= "" and zName ~= "Unknown" and (tonumber(secs) or 0) > 0 then
+                for zName, entry in pairs(zMap) do
+                    local secs = RTExt.GetZoneTimeTotal(entry)
+                    if zName and zName ~= "" and zName ~= "Unknown" and secs > 0 then
                         zonePlayerCounts[zName] = (zonePlayerCounts[zName] or 0) + 1
-                        zoneTotalSecs[zName] = (zoneTotalSecs[zName] or 0) + (tonumber(secs) or 0)
+                        zoneTotalSecs[zName] = (zoneTotalSecs[zName] or 0) + secs
                     end
                 end
             end
@@ -2047,6 +2166,9 @@ local function StartEncounter(bossID, bossName, overrideData, fromSpeech)
     outOfCombatAccum = 0
     gracePeriodAccum = 0
     table.wipe(defeatedGroupNPCs)
+    table.wipe(RTExt.recentDemonicPact)
+    table.wipe(RTExt.lastDemonicPactConfirmedAt)
+    table.wipe(RTExt.lastDemonicPactExpiry)
 
     bossAttemptCount[bossName] = (bossAttemptCount[bossName] or 0) + 1
     local att = bossAttemptCount[bossName]
@@ -2203,6 +2325,12 @@ local function EndEncounter(isVictory, reason)
     table.wipe(recentProcs)
     table.wipe(recentPrePullEvents)
     table.wipe(RTExt.recentDemonicPact)
+    table.wipe(RTExt.lastDemonicPactConfirmedAt)
+    table.wipe(RTExt.lastDemonicPactExpiry)
+    table.wipe(RTExt.pendingDemonicPacts)
+    RTExt.playerSelfDPContribution = 0
+    RTExt.activeObservedDP = 0
+    if RTExt.dpWatcherFrame then RTExt.dpWatcherFrame:SetScript("OnUpdate", nil) end
 
     EnsureTrashSegment()
     RequestMainViewRefresh()
@@ -2226,6 +2354,14 @@ combatWatchdogFrame:SetScript("OnUpdate", function(self, elapsed)
         local dt = RTExt.zoneTimeAccum
         RTExt.zoneTimeAccum = 0
         RTExt.UpdateSessionZoneTimes(dt)
+    end
+
+    RTExt.spPollAccum = RTExt.spPollAccum + elapsed
+    if RTExt.spPollAccum >= 0.20 then
+        RTExt.spPollAccum = 0
+        if RTExt.SnapshotPlayerSpellPowerState then
+            RTExt.SnapshotPlayerSpellPowerState()
+        end
     end
 
     if not inCombatState then
@@ -3173,7 +3309,7 @@ local function CreateMainTrackerFrame()
     local btnPotionsPanel = CreateFrame("Button", nil, MainTrackerFrame, "UIPanelButtonTemplate")
     btnPotionsPanel:SetSize(90, 22)
     btnPotionsPanel:SetPoint("LEFT", btnDeaths, "RIGHT", 6, 0)
-    btnPotionsPanel:SetText("POTIONS")
+    btnPotionsPanel:SetText("Potions")
     btnPotionsPanel:SetScript("OnClick", function() CloseAllPanels(); RTExt.PotionsFrame:Show() end)
 
     local viewBox = CreateWhiteBorderViewBox(MainTrackerFrame, -132, 38)
@@ -3421,7 +3557,7 @@ function RTExt.CreatePotionsFrame()
     local btnBackMain = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
     btnBackMain:SetSize(130, 24)
     btnBackMain:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", -18, 14)
-    btnBackMain:SetText("BACK to MAIN")
+    btnBackMain:SetText("Cancel/Back")
     btnBackMain:SetScript("OnClick", function()
         CloseAllPanels()
         MainTrackerFrame:Show()
@@ -4057,12 +4193,67 @@ end
 -------------------------------------------------------------------------------
 -- Character Panel Implementation (With Multi-Name History & Class Blacklisting)
 -------------------------------------------------------------------------------
+function RTExt.CountActiveSessionPlayers(activeSession, playerMap)
+    if not activeSession or activeSession ~= currentSession then
+        return 0
+    end
+    local activeSet = {}
+    local numRaid = GetNumRaidMembers()
+    if numRaid > 0 then
+        for i = 1, numRaid do
+            local rName, _, _, _, _, rFileName, _, rOnline = GetRaidRosterInfo(i)
+            if rName and rName ~= UNKNOWN then
+                local shortName = rName:match("^([^%-]+)") or rName
+                if playerMap and not playerMap[shortName] then
+                    playerMap[shortName] = (rFileName and rFileName ~= "") and rFileName or GetSafePlayerClass(shortName)
+                end
+                if rOnline then
+                    activeSet[shortName] = true
+                end
+            end
+        end
+    else
+        local numParty = GetNumPartyMembers()
+        if numParty > 0 then
+            local myName = UnitName("player")
+            if myName and myName ~= UNKNOWN then
+                if playerMap and not playerMap[myName] then
+                    playerMap[myName] = GetSafePlayerClass(myName)
+                end
+                activeSet[myName] = true
+            end
+            for i = 1, numParty do
+                local unit = "party" .. i
+                if UnitExists(unit) then
+                    local pName = UnitName(unit)
+                    if pName and pName ~= UNKNOWN then
+                        if playerMap and not playerMap[pName] then
+                            playerMap[pName] = GetSafePlayerClass(pName)
+                        end
+                        if UnitIsConnected(unit) then
+                            activeSet[pName] = true
+                        end
+                    end
+                end
+            end
+        end
+    end
+    local count = 0
+    for _ in pairs(activeSet) do count = count + 1 end
+    return count
+end
+
 local function CreateCharacterFrame()
     CharacterFrame = CreateRUTPanel("RTCharacterFrame", 580, 440, "Session Characters")
 
+    local playerCountLabel = CharacterFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    playerCountLabel:SetPoint("TOPLEFT", CharacterFrame, "TOPLEFT", 18, -34)
+    playerCountLabel:SetPoint("TOPRIGHT", CharacterFrame, "TOPRIGHT", -18, -34)
+    playerCountLabel:SetJustifyH("LEFT")
+
     local zoneHeaderLabel = CharacterFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    zoneHeaderLabel:SetPoint("TOPLEFT", CharacterFrame, "TOPLEFT", 18, -36)
-    zoneHeaderLabel:SetPoint("TOPRIGHT", CharacterFrame, "TOPRIGHT", -18, -36)
+    zoneHeaderLabel:SetPoint("TOPLEFT", CharacterFrame, "TOPLEFT", 18, -50)
+    zoneHeaderLabel:SetPoint("TOPRIGHT", CharacterFrame, "TOPRIGHT", -18, -50)
     zoneHeaderLabel:SetJustifyH("LEFT")
 
     local btnExportChars = CreateFrame("Button", nil, CharacterFrame, "UIPanelButtonTemplate")
@@ -4077,7 +4268,7 @@ local function CreateCharacterFrame()
     btnBack:SetText("Back to Tracker")
     btnBack:SetScript("OnClick", function() CloseAllPanels(); MainTrackerFrame:Show() end)
 
-    local viewBox = CreateWhiteBorderViewBox(CharacterFrame, -58, 46)
+    local viewBox = CreateWhiteBorderViewBox(CharacterFrame, -68, 46)
 
     local scrollFrame = CreateFrame("ScrollFrame", "RTCharScrollFrame", viewBox, "UIPanelScrollFrameTemplate")
     scrollFrame:SetPoint("TOPLEFT", viewBox, "TOPLEFT", 8, -8)
@@ -4266,9 +4457,13 @@ local function CreateCharacterFrame()
             end
         end
 
+        local activeCount = RTExt.CountActiveSessionPlayers(activeSession, playerMap)
+
         local sortedPlayers = {}
         for pName in pairs(playerMap) do table.insert(sortedPlayers, pName) end
         table.sort(sortedPlayers)
+
+        playerCountLabel:SetText(string.format("Players: |cff00FF00Active: %d|r  |  |cffFFFFFFTotal: %d|r", activeCount, #sortedPlayers))
 
         if #sortedPlayers == 0 then
             for i = 1, 100 do rows[i]:Hide() end
@@ -4294,7 +4489,7 @@ local function CreateCharacterFrame()
             end
             local zoneSecs = 0
             if activeSession and activeSession.zoneTimes and activeSession.zoneTimes[pName] and majZone then
-                zoneSecs = activeSession.zoneTimes[pName][majZone] or 0
+                zoneSecs = RTExt.GetZoneTimeTotal(activeSession.zoneTimes[pName][majZone])
             end
             rows[idx].text:SetText(string.format("%s |cff888888(%s)|r - |cff00FF00%s|r", ColorizeText(pName, hexColor), pClass, RTExt.FormatZoneDuration(zoneSecs)))
             rows[idx].btnWhisper.playerName = pName
@@ -4394,6 +4589,8 @@ function RTExt.CreateCharacterExportFrame()
             end
         end
 
+        local activeCount = RTExt.CountActiveSessionPlayers(activeSession, playerMap)
+
         local sortedPlayers = {}
         for pName in pairs(playerMap) do table.insert(sortedPlayers, pName) end
         table.sort(sortedPlayers)
@@ -4402,7 +4599,7 @@ function RTExt.CreateCharacterExportFrame()
             string.format("=== Raiders Tracker%s by %s - Session Characters ===", RTExt.GetVersionTag(), AUTHOR),
             string.format("Session: %s", (activeSession and activeSession.name) or "Live Current Session"),
             string.format("Raid Zone: %s", majZone or "Unknown"),
-            string.format("Total Characters: %d", #sortedPlayers),
+            string.format("Players: Active: %d | Total: %d", activeCount, #sortedPlayers),
             ""
         }
         if #sortedPlayers == 0 then
@@ -4412,7 +4609,7 @@ function RTExt.CreateCharacterExportFrame()
                 local pClass = string.upper(playerMap[pName] or "WARRIOR")
                 local zoneSecs = 0
                 if activeSession and activeSession.zoneTimes and activeSession.zoneTimes[pName] and majZone then
-                    zoneSecs = activeSession.zoneTimes[pName][majZone] or 0
+                    zoneSecs = RTExt.GetZoneTimeTotal(activeSession.zoneTimes[pName][majZone])
                 end
                 table.insert(lines, string.format("%s (%s) - %s", pName, pClass, RTExt.FormatZoneDuration(zoneSecs)))
             end
@@ -5639,115 +5836,148 @@ local function RecordPlayerDeath(destName, destGUID)
 end
 
 -------------------------------------------------------------------------------
--- Demonic Pact Tracking Engine (Demo Warlock Owner Only + Tooltip SP Capture)
+-- Demonic Pact Tracking Engine (Demo Warlock Owner Only + 3.3.5a SP Capture)
 -------------------------------------------------------------------------------
 RTExt.dpScanTooltip = CreateFrame("GameTooltip", "RTDemonicPactScanTooltip", nil, "GameTooltipTemplate")
 RTExt.dpScanTooltip:SetOwner(WorldFrame, "ANCHOR_NONE")
 
 RTExt.dpWatcherFrame = CreateFrame("Frame")
 
-function RTExt.IsDemonicPactEvent(subevent, spellID, spellName)
-    if subevent ~= "SPELL_AURA_APPLIED" and subevent ~= "SPELL_AURA_REFRESH" then
-        return false
-    end
-    if type(spellID) == "number" and RTExt.DEMONIC_PACT_BUFF_IDS[spellID] then
-        return true
-    end
-    if type(spellName) == "string" and spellName == "Demonic Pact" then
-        if spellID ~= 47236 and spellID ~= 47237 and spellID ~= 47238 and spellID ~= 47239 then
+function RTExt.IsDemonicPactRaidBuff(spellID, spellName)
+    if type(spellID) == "number" then
+        if RTExt.DEMONIC_PACT_PASSIVE_IDS[spellID] then
+            return false
+        end
+        if RTExt.DEMONIC_PACT_BUFF_IDS[spellID] then
             return true
         end
+    end
+    if type(spellName) == "string" and spellName == "Demonic Pact" then
+        return true
     end
     return false
 end
 
-function RTExt.ExtractSpellPowerFromTooltip()
-    local numLines = RTExt.dpScanTooltip:NumLines() or 0
-    local fallbackNum = nil
-    for lineIdx = 2, numLines do
-        local fs = _G["RTDemonicPactScanTooltipTextLeft" .. lineIdx]
-        local lineText = fs and fs:GetText()
-        if lineText and lineText ~= "" then
-            local lower = lineText:lower()
-            local isDurationLine = (lower:find("remaining") ~= nil or lower:find("sec") ~= nil or lower:find("min") ~= nil)
-                and (lower:find("spell") == nil and lower:find("power") == nil and lower:find("damage") == nil)
-            if not isDurationLine then
-                local numStr = lineText:match("(%d[%d,]*)")
-                if numStr then
-                    local val = tonumber((numStr:gsub(",", "")))
-                    if val and val > 0 then
-                        if lower:find("spell") or lower:find("power") or lower:find("damage") then
-                            return val
-                        elseif not fallbackNum and lineIdx == 2 then
-                            fallbackNum = val
-                        end
-                    end
+function RTExt.IsDemonicPactEvent(subevent, spellID, spellName)
+    if subevent ~= "SPELL_AURA_APPLIED" and subevent ~= "SPELL_AURA_REFRESH" then
+        return false
+    end
+    return RTExt.IsDemonicPactRaidBuff(spellID, spellName)
+end
+
+function RTExt.GetPlayerBaseSpellPower()
+    if not GetSpellBonusDamage then return 0 end
+    local minSP = nil
+    for school = 2, 7 do
+        local sp = GetSpellBonusDamage(school)
+        if sp and (not minSP or sp < minSP) then
+            minSP = sp
+        end
+    end
+    return minSP or 0
+end
+
+function RTExt.GetPlayerDemonicPactPct()
+    local _, engClass = UnitClass("player")
+    if engClass ~= "WARLOCK" then return 0 end
+    if GetNumTalents and GetTalentInfo then
+        local numTalents = GetNumTalents(2) or 0
+        for i = 1, numTalents do
+            local tName, _, _, _, rank = GetTalentInfo(2, i)
+            if tName == "Demonic Pact" then
+                if rank and rank > 0 then
+                    return rank * 0.02
                 end
+                return 0
             end
         end
     end
-    return fallbackNum
+    return 0
 end
 
-function RTExt.ReadDemonicPactFromUnit(unit, expectedPetUnit, expectedOwnerUnit, strictCaster)
-    if not unit or not UnitExists(unit) then return nil end
+function RTExt.GetPlayerBuffDPAndTotemState()
+    local hasDP = false
+    local totemSP = 0
     for i = 1, 40 do
-        local buffName, _, _, _, _, _, _, unitCaster, _, _, bSpellID = UnitBuff(unit, i)
+        local buffName, _, _, _, _, _, _, _, _, _, bSpellID = UnitBuff("player", i)
         if not buffName then break end
-        if (bSpellID and RTExt.DEMONIC_PACT_BUFF_IDS[bSpellID]) or buffName == "Demonic Pact" then
-            local casterMatches = (not strictCaster)
-                or (expectedPetUnit and unitCaster == expectedPetUnit)
-                or (expectedOwnerUnit and unitCaster == expectedOwnerUnit)
-            if casterMatches then
-                RTExt.dpScanTooltip:SetOwner(WorldFrame, "ANCHOR_NONE")
-                RTExt.dpScanTooltip:ClearLines()
-                RTExt.dpScanTooltip:SetUnitBuff(unit, i)
-                local sp = RTExt.ExtractSpellPowerFromTooltip()
-                if sp and sp > 0 then
-                    return sp
-                end
-            end
+        if RTExt.IsDemonicPactRaidBuff(bSpellID, buffName) then
+            hasDP = true
+        end
+        if bSpellID and RTExt.OVERRIDDEN_SP_TOTEMS[bSpellID] then
+            local val = RTExt.OVERRIDDEN_SP_TOTEMS[bSpellID]
+            if val > totemSP then totemSP = val end
         end
     end
-    return nil
+    return hasDP, totemSP
 end
 
-function RTExt.ScanRaidForDemonicPactSP(pending)
-    local unitsToCheck = {}
-    local seen = {}
-    local function AddUnit(u)
-        if u and not seen[u] and UnitExists(u) then
-            seen[u] = true
-            table.insert(unitsToCheck, u)
+function RTExt.SnapshotPlayerSpellPowerState(forceUpdate)
+    if not forceUpdate and #RTExt.pendingDemonicPacts > 0 then
+        return
+    end
+    local curSP = RTExt.GetPlayerBaseSpellPower()
+    local hasDP, totemSP = RTExt.GetPlayerBuffDPAndTotemState()
+    local now = GetTime()
+
+    if not RTExt.lastPlayerHasDP and hasDP then
+        RTExt.preDPTransitionSP = RTExt.lastPlayerSP
+        RTExt.preDPTransitionTime = now
+    elseif RTExt.lastPlayerSP and RTExt.lastPlayerSP ~= curSP then
+        RTExt.prevPlayerSP = RTExt.lastPlayerSP
+        RTExt.prevPlayerSPTime = now
+    end
+
+    if not hasDP then
+        RTExt.playerSelfDPContribution = 0
+        RTExt.activeObservedDP = 0
+    end
+
+    RTExt.lastPlayerSP = curSP
+    RTExt.lastPlayerHasDP = hasDP
+    RTExt.lastPlayerTotemSP = totemSP
+end
+
+function RTExt.BroadcastDemonicPactSP(ownerName, spValue)
+    if not ownerName or not spValue or spValue <= 0 or not SendAddonMessage then return end
+    local channel = nil
+    if GetNumRaidMembers() > 0 then
+        channel = "RAID"
+    elseif GetNumPartyMembers() > 0 then
+        channel = "PARTY"
+    end
+    if channel then
+        SendAddonMessage(RTExt.DEMONIC_PACT_ADDON_PREFIX, string.format("%s:%d", ownerName, math.floor(spValue + 0.5)), channel)
+    end
+end
+
+function RTExt.HandleDemonicPactAddonMessage(prefix, msg, dist, sender)
+    if prefix ~= RTExt.DEMONIC_PACT_ADDON_PREFIX or type(msg) ~= "string" then return end
+    local ownerName, spStr = msg:match("^([^:]+):(%d+)$")
+    local spVal = tonumber(spStr)
+    if not ownerName or not spVal or spVal <= 0 then return end
+    if ownerName == UnitName("player") then return end
+
+    local senderShort = sender and (sender:match("^([^%-]+)") or sender) or nil
+    if senderShort and senderShort ~= ownerName then return end
+
+    for _, pending in ipairs(RTExt.pendingDemonicPacts) do
+        if pending.ownerName == ownerName then
+            pending.syncedSP = spVal
+            return
         end
     end
 
-    for _, u in ipairs(pending.candidateUnits or {}) do
-        AddUnit(u)
-    end
-    AddUnit(pending.ownerUnit)
-    AddUnit("player")
-
-    local numRaid = GetNumRaidMembers()
-    if numRaid > 0 then
-        for i = 1, numRaid do AddUnit("raid" .. i) end
-    else
-        for i = 1, GetNumPartyMembers() do AddUnit("party" .. i) end
-    end
-
-    if pending.petUnit or pending.ownerUnit then
-        for _, u in ipairs(unitsToCheck) do
-            local sp = RTExt.ReadDemonicPactFromUnit(u, pending.petUnit, pending.ownerUnit, true)
-            if sp and sp > 0 then return sp end
+    local seg = currentSession and currentSession.segments and currentSession.segments[1]
+    if seg and seg.demonicPactValues and seg.demonicPactValues[ownerName] then
+        local dpList = seg.demonicPactValues[ownerName]
+        local lastIdx = #dpList
+        local confirmedAt = RTExt.lastDemonicPactConfirmedAt[ownerName]
+        if lastIdx > 0 and confirmedAt and (GetTime() - confirmedAt) <= 2.0 then
+            dpList[lastIdx] = spVal
+            RequestMainViewRefresh()
         end
     end
-
-    for _, u in ipairs(unitsToCheck) do
-        local sp = RTExt.ReadDemonicPactFromUnit(u, pending.petUnit, pending.ownerUnit, false)
-        if sp and sp > 0 then return sp end
-    end
-
-    return nil
 end
 
 function RTExt.OwnerInfoFromCasterUnit(unitCaster)
@@ -5786,19 +6016,247 @@ function RTExt.OwnerInfoFromCasterUnit(unitCaster)
     return nil
 end
 
+function RTExt.ExtractSpellPowerFromTooltip()
+    local numLines = RTExt.dpScanTooltip:NumLines() or 0
+    local fallbackNum = nil
+    for lineIdx = 2, numLines do
+        local fs = _G["RTDemonicPactScanTooltipTextLeft" .. lineIdx]
+        local lineText = fs and fs:GetText()
+        if lineText and lineText ~= "" then
+            local lower = lineText:lower()
+            local isDurationLine = (lower:find("remaining") ~= nil or lower:find("sec") ~= nil or lower:find("min") ~= nil)
+                and (lower:find("spell") == nil and lower:find("power") == nil and lower:find("damage") == nil)
+            if not isDurationLine then
+                local numStr = lineText:match("(%d[%d,]*)")
+                if numStr then
+                    local val = tonumber((numStr:gsub(",", "")))
+                    if val and val > 0 then
+                        if lower:find("spell") or lower:find("power") or lower:find("damage") then
+                            return val
+                        elseif not fallbackNum and lineIdx == 2 then
+                            fallbackNum = val
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return fallbackNum
+end
+
+function RTExt.ReadDemonicPactFromUnit(unit, expectedPetUnit, expectedOwnerUnit, expectedOwnerName, strictCaster)
+    if not unit or not UnitExists(unit) then return nil end
+    for i = 1, 40 do
+        local buffName, _, _, _, _, _, _, unitCaster, _, _, bSpellID = UnitBuff(unit, i)
+        if not buffName then break end
+        if RTExt.IsDemonicPactRaidBuff(bSpellID, buffName) then
+            local casterOwner = unitCaster and RTExt.OwnerInfoFromCasterUnit(unitCaster) or nil
+            local casterMatches = false
+            if strictCaster then
+                casterMatches = (expectedPetUnit and unitCaster == expectedPetUnit)
+                    or (expectedOwnerUnit and unitCaster == expectedOwnerUnit)
+                    or (casterOwner and expectedOwnerName and casterOwner.name == expectedOwnerName)
+            else
+                casterMatches = (not casterOwner) or (not expectedOwnerName) or (casterOwner.name == expectedOwnerName)
+            end
+            if casterMatches then
+                RTExt.dpScanTooltip:SetOwner(WorldFrame, "ANCHOR_NONE")
+                RTExt.dpScanTooltip:ClearLines()
+                RTExt.dpScanTooltip:SetUnitBuff(unit, i)
+                local sp = RTExt.ExtractSpellPowerFromTooltip()
+                if sp and sp > 0 then
+                    return sp
+                end
+            end
+        end
+    end
+    return nil
+end
+
+function RTExt.CollectUnitsForDemonicPactCheck(pending)
+    local unitsToCheck = {}
+    local seen = {}
+    local function AddUnit(u)
+        if u and not seen[u] and UnitExists(u) then
+            seen[u] = true
+            table.insert(unitsToCheck, u)
+        end
+    end
+
+    for _, u in ipairs(pending.candidateUnits or {}) do
+        AddUnit(u)
+    end
+    AddUnit(pending.ownerUnit)
+    AddUnit("player")
+
+    local numRaid = GetNumRaidMembers()
+    if numRaid > 0 then
+        for i = 1, numRaid do AddUnit("raid" .. i) end
+    else
+        for i = 1, GetNumPartyMembers() do AddUnit("party" .. i) end
+    end
+    return unitsToCheck
+end
+
+function RTExt.GetDemonicPactAuraTiming(pending)
+    local unitsToCheck = RTExt.CollectUnitsForDemonicPactCheck(pending)
+    local function FindTiming(strictCaster)
+        for _, u in ipairs(unitsToCheck) do
+            for i = 1, 40 do
+                local buffName, _, _, _, _, duration, expirationTime, unitCaster, _, _, bSpellID = UnitBuff(u, i)
+                if not buffName then break end
+                if RTExt.IsDemonicPactRaidBuff(bSpellID, buffName) then
+                    local casterOwner = unitCaster and RTExt.OwnerInfoFromCasterUnit(unitCaster) or nil
+                    local matches = false
+                    if strictCaster then
+                        matches = (pending.petUnit and unitCaster == pending.petUnit)
+                            or (pending.ownerUnit and unitCaster == pending.ownerUnit)
+                            or (casterOwner and pending.ownerName and casterOwner.name == pending.ownerName)
+                    else
+                        matches = (not casterOwner) or (not pending.ownerName) or (casterOwner.name == pending.ownerName)
+                    end
+                    if matches then
+                        return expirationTime, duration
+                    end
+                end
+            end
+        end
+        return nil, nil
+    end
+
+    local exp, dur = FindTiming(true)
+    if exp and exp > 0 then return exp, dur end
+    return FindTiming(false)
+end
+
+function RTExt.ScanRaidForDemonicPactSP(pending)
+    local unitsToCheck = RTExt.CollectUnitsForDemonicPactCheck(pending)
+
+    if pending.petUnit or pending.ownerUnit or pending.ownerName then
+        for _, u in ipairs(unitsToCheck) do
+            local sp = RTExt.ReadDemonicPactFromUnit(u, pending.petUnit, pending.ownerUnit, pending.ownerName, true)
+            if sp and sp > 0 then return sp end
+        end
+    end
+
+    for _, u in ipairs(unitsToCheck) do
+        local sp = RTExt.ReadDemonicPactFromUnit(u, pending.petUnit, pending.ownerUnit, pending.ownerName, false)
+        if sp and sp > 0 then return sp end
+    end
+
+    return nil
+end
+
+function RTExt.ResolveDemonicPactSpellPower(pending)
+    -- Priority 1: Exact value synced from the Warlock whose pet procced DP via addon channel
+    if pending.syncedSP and pending.syncedSP > 0 then
+        RTExt.activeObservedDP = pending.syncedSP
+        return pending.syncedSP
+    end
+
+    -- Priority 2: Direct calculation ONLY if the local player's own pet procced DP AND player currently has Demonic Pact talented
+    if pending.isSelfWarlock and pending.dpPct and pending.dpPct > 0 then
+        local pct = pending.dpPct
+        local postSP = RTExt.GetPlayerBaseSpellPower()
+        if postSP <= 0 then postSP = pending.immediateSP or pending.preSP or 0 end
+        if postSP > 0 then
+            local spValue = nil
+            local preSP = pending.preSP or postSP
+            if not pending.hadDPBefore then
+                local delta = postSP - preSP
+                local expectedFromPre = math.floor(preSP * pct + 0.5)
+                if preSP > 0 and expectedFromPre > 0 and delta >= math.floor(expectedFromPre * 0.70) and delta <= math.ceil(expectedFromPre * 1.35) then
+                    spValue = expectedFromPre
+                    RTExt.playerSelfDPContribution = spValue
+                else
+                    RTExt.playerSelfDPContribution = 0
+                    spValue = math.floor(postSP * pct + 0.5)
+                end
+            else
+                if (RTExt.playerSelfDPContribution or 0) > 0 then
+                    local trueBaseSP = postSP / (1 + pct)
+                    spValue = math.floor(trueBaseSP * pct + 0.5)
+                    RTExt.playerSelfDPContribution = spValue
+                else
+                    spValue = math.floor(postSP * pct + 0.5)
+                end
+            end
+            if spValue and spValue > 0 then
+                RTExt.activeObservedDP = spValue
+                RTExt.BroadcastDemonicPactSP(pending.ownerName, spValue)
+                return spValue
+            end
+        end
+    end
+
+    -- Priority 3: Tooltip check (supports servers that populate dynamic tooltip values)
+    local tooltipSP = RTExt.ScanRaidForDemonicPactSP(pending)
+    if tooltipSP and tooltipSP > 0 then
+        RTExt.activeObservedDP = tooltipSP
+        return tooltipSP
+    end
+
+    -- Priority 4: Live GetSpellBonusDamage stat-delta fallback on local player when another Warlock's pet procs DP
+    local nowHasDP = RTExt.GetPlayerBuffDPAndTotemState()
+    if nowHasDP then
+        local postSP = RTExt.GetPlayerBaseSpellPower()
+        local preSP = pending.preSP or postSP
+        local delta = postSP - preSP
+        if not pending.hadDPBefore then
+            local effective = delta + (pending.preTotemSP or 0)
+            if effective > 0 and effective < 2500 then
+                RTExt.activeObservedDP = math.floor(effective + 0.5)
+                return RTExt.activeObservedDP
+            end
+        elseif (RTExt.activeObservedDP or 0) > 0 then
+            local candidate = RTExt.activeObservedDP + delta
+            if candidate > 0 and candidate < 2500 then
+                RTExt.activeObservedDP = math.floor(candidate + 0.5)
+                return RTExt.activeObservedDP
+            end
+        end
+    end
+
+    return nil
+end
+
 function RTExt.ResolveDemonicPactOwner(sourceName, sourceGUID, destUnit)
+    -- Strictly resolve only the Warlock whose pet actually procced Demonic Pact in this event.
+    -- Never lock in a Warlock from earlier fights or talent/stat assumptions.
     local ownerInfo = nil
+    local sourceIsPetOrNPC = (sourceGUID ~= nil and not IsPlayerGUID(sourceGUID))
 
     if sourceGUID and RTExt.petGUIDToOwner[sourceGUID] then
         ownerInfo = RTExt.petGUIDToOwner[sourceGUID]
-    elseif sourceGUID and not IsPlayerGUID(sourceGUID) then
+    elseif sourceIsPetOrNPC then
         UpdateGroupCache()
         if RTExt.petGUIDToOwner[sourceGUID] then
             ownerInfo = RTExt.petGUIDToOwner[sourceGUID]
         end
     end
 
-    if not ownerInfo and sourceName and IsGroupMember(sourceName, sourceGUID) then
+    if not ownerInfo and destUnit and UnitExists(destUnit) then
+        for i = 1, 40 do
+            local buffName, _, _, _, _, _, _, unitCaster, _, _, bSpellID = UnitBuff(destUnit, i)
+            if not buffName then break end
+            if RTExt.IsDemonicPactRaidBuff(bSpellID, buffName) and unitCaster then
+                local isPetCaster = (unitCaster == "pet" or unitCaster:match("^raidpet%d+$") or unitCaster:match("^partypet%d+$"))
+                if isPetCaster or (not sourceIsPetOrNPC) then
+                    ownerInfo = RTExt.OwnerInfoFromCasterUnit(unitCaster)
+                    if ownerInfo then break end
+                end
+            end
+        end
+    end
+
+    if not ownerInfo and sourceIsPetOrNPC and sourceName then
+        local mapped = RTExt.petNameToOwner[sourceName]
+        if type(mapped) == "table" then
+            ownerInfo = mapped
+        end
+    end
+
+    if not ownerInfo and not sourceIsPetOrNPC and sourceName and IsGroupMember(sourceName, sourceGUID) then
         local srcClass = GetSafePlayerClass(sourceName, sourceGUID)
         if srcClass == "WARLOCK" then
             ownerInfo = {
@@ -5809,21 +6267,6 @@ function RTExt.ResolveDemonicPactOwner(sourceName, sourceGUID, destUnit)
                 petUnit = nil,
             }
         end
-    end
-
-    if not ownerInfo and destUnit and UnitExists(destUnit) then
-        for i = 1, 40 do
-            local buffName, _, _, _, _, _, _, unitCaster, _, _, bSpellID = UnitBuff(destUnit, i)
-            if not buffName then break end
-            if (bSpellID and RTExt.DEMONIC_PACT_BUFF_IDS[bSpellID]) or buffName == "Demonic Pact" then
-                ownerInfo = RTExt.OwnerInfoFromCasterUnit(unitCaster)
-                if ownerInfo then break end
-            end
-        end
-    end
-
-    if not ownerInfo and sourceName and RTExt.petNameToOwner[sourceName] then
-        ownerInfo = RTExt.petNameToOwner[sourceName]
     end
 
     if not ownerInfo or not ownerInfo.name then return nil end
@@ -5860,7 +6303,7 @@ function RTExt.RecordDemonicPactProc(pending, spValue)
     local addedNewSessionPlayer = (currentSession.players[ownerName] == nil)
     currentSession.players[ownerName] = ownerClass
 
-    local recordedSP = (spValue and spValue > 0) and spValue or "?"
+    local recordedSP = (spValue and spValue > 0) and math.floor(spValue + 0.5) or "?"
 
     targetSegment.raidUtility = targetSegment.raidUtility or {}
     targetSegment.raidUtility[ownerName] = targetSegment.raidUtility[ownerName] or {}
@@ -5899,12 +6342,37 @@ function RTExt.OnDemonicPactWatcherUpdate(self, elapsed)
     while i <= #list do
         local pending = list[i]
         if now >= pending.readyAt then
-            local sp = RTExt.ScanRaidForDemonicPactSP(pending)
-            if (sp and sp > 0) or now >= pending.maxWaitAt then
+            local ownerName = pending.ownerName
+            local curExpiry, curDur = RTExt.GetDemonicPactAuraTiming(pending)
+            local lastExpiry = RTExt.lastDemonicPactExpiry[ownerName]
+
+            -- Reject non-refresh aura re-evaluations (Shaman totem pulses, range re-entry, battle-rez)
+            local isDuplicateAura = false
+            if curExpiry and curExpiry > 0 then
+                if lastExpiry and lastExpiry > now and curExpiry <= (lastExpiry + 3.0) then
+                    isDuplicateAura = true
+                elseif curDur and curDur >= 30 and (curExpiry - now) < (curDur - 8.0) then
+                    isDuplicateAura = true
+                end
+            end
+
+            if isDuplicateAura then
                 table.remove(list, i)
-                RTExt.RecordDemonicPactProc(pending, sp)
             else
-                i = i + 1
+                local sp = RTExt.ResolveDemonicPactSpellPower(pending)
+                if (sp and sp > 0) or now >= pending.maxWaitAt then
+                    table.remove(list, i)
+                    RTExt.lastDemonicPactConfirmedAt[ownerName] = now
+                    RTExt.recentDemonicPact[ownerName] = now
+                    if curExpiry and curExpiry > now then
+                        RTExt.lastDemonicPactExpiry[ownerName] = curExpiry
+                    else
+                        RTExt.lastDemonicPactExpiry[ownerName] = now + 45.0
+                    end
+                    RTExt.RecordDemonicPactProc(pending, sp)
+                else
+                    i = i + 1
+                end
             end
         else
             i = i + 1
@@ -5912,11 +6380,15 @@ function RTExt.OnDemonicPactWatcherUpdate(self, elapsed)
     end
     if #list == 0 then
         self:SetScript("OnUpdate", nil)
+        RTExt.SnapshotPlayerSpellPowerState(true)
     end
 end
 
 function RTExt.HandleDemonicPactCLEU(subevent, sourceGUID, sourceName, destGUID, destName, spellID, spellName)
     if not RTExt.IsDemonicPactEvent(subevent, spellID, spellName) then return end
+
+    -- Only track raid/party player destinations (ignore temporary pets/guardians like ghouls, Mirror Images, etc.)
+    if not destName or not IsGroupMember(destName, destGUID) then return end
 
     local destUnit = (destGUID and RTExt.playerGUIDToUnit[destGUID]) or (destName and RTExt.playerNameToUnit[destName]) or nil
     local ownerInfo = RTExt.ResolveDemonicPactOwner(sourceName, sourceGUID, destUnit)
@@ -5938,17 +6410,33 @@ function RTExt.HandleDemonicPactCLEU(subevent, sourceGUID, sourceName, destGUID,
         end
     end
 
-    local lastProcTime = RTExt.recentDemonicPact[ownerName]
-    if lastProcTime and (now - lastProcTime) < 2.5 then
-        return
+    local lastConfirmed = RTExt.lastDemonicPactConfirmedAt[ownerName]
+    local lastExpiry = RTExt.lastDemonicPactExpiry[ownerName]
+    if lastConfirmed and (now - lastConfirmed) < RTExt.DEMONIC_PACT_ICD then
+        -- While the previous proc's 45s aura is still active (or within 2.5s burst window), suppress duplicates
+        if (lastExpiry and lastExpiry > now) or (now - lastConfirmed) < 2.5 then
+            return
+        end
     end
-    RTExt.recentDemonicPact[ownerName] = now
 
     if not currentSession.segments[1] or currentSession.segments[1].isBoss ~= inCombatState then
         EnsureTrashSegment()
     end
     local targetSegment = currentSession and currentSession.segments[1]
     if not targetSegment then return end
+
+    local isSelfWarlock = (ownerName == UnitName("player"))
+    local dpPct = isSelfWarlock and RTExt.GetPlayerDemonicPactPct() or 0
+    local immediateSP = RTExt.GetPlayerBaseSpellPower()
+    local preSP = RTExt.lastPlayerSP or immediateSP
+    local hadDPBefore = RTExt.lastPlayerHasDP
+
+    if RTExt.preDPTransitionSP and (now - (RTExt.preDPTransitionTime or 0)) <= 0.5 then
+        preSP = RTExt.preDPTransitionSP
+        hadDPBefore = false
+    elseif RTExt.prevPlayerSP and (now - (RTExt.prevPlayerSPTime or 0)) <= 0.25 and immediateSP == RTExt.lastPlayerSP then
+        preSP = RTExt.prevPlayerSP
+    end
 
     table.insert(RTExt.pendingDemonicPacts, {
         ownerName = ownerName,
@@ -5959,8 +6447,15 @@ function RTExt.HandleDemonicPactCLEU(subevent, sourceGUID, sourceName, destGUID,
         candidateUnits = destUnit and { destUnit } or {},
         segment = targetSegment,
         isPrePull = not inCombatState,
+        isSelfWarlock = isSelfWarlock,
+        dpPct = dpPct,
+        preSP = preSP,
+        immediateSP = immediateSP,
+        hadDPBefore = hadDPBefore,
+        preTotemSP = RTExt.lastPlayerTotemSP or 0,
+        syncedSP = nil,
         createdAt = now,
-        readyAt = now + 0.12,
+        readyAt = now + (isSelfWarlock and 0.10 or 0.15),
         maxWaitAt = now + 0.45,
     })
 
@@ -5979,6 +6474,11 @@ eventHandler:RegisterEvent("PLAYER_ENTERING_WORLD")
 eventHandler:RegisterEvent("PARTY_MEMBERS_CHANGED")
 eventHandler:RegisterEvent("RAID_ROSTER_UPDATE")
 eventHandler:RegisterEvent("UNIT_PET")
+eventHandler:RegisterEvent("UNIT_AURA")
+eventHandler:RegisterEvent("UNIT_STATS")
+eventHandler:RegisterEvent("CHAT_MSG_ADDON")
+eventHandler:RegisterEvent("PLAYER_TALENT_UPDATE")
+eventHandler:RegisterEvent("ACTIVE_TALENT_GROUP_CHANGED")
 eventHandler:RegisterEvent("PLAYER_DIFFICULTY_CHANGED")
 eventHandler:RegisterEvent("UPDATE_INSTANCE_INFO")
 eventHandler:RegisterEvent("CHAT_MSG_SYSTEM")
@@ -6019,6 +6519,7 @@ eventHandler:SetScript("OnEvent", function(self, event, ...)
         UpdateGroupCache()
         wasInGroup = IsPlayerInGroup()
         groupStateInitialized = true
+        RTExt.SnapshotPlayerSpellPowerState(true)
         HandleZoneOrDifficultyUpdate(false)
         CheckGroupBlacklist()
         if not hasPrintedLoadMsg then ScheduleLoadMessage(2.0) end
@@ -6036,6 +6537,29 @@ eventHandler:SetScript("OnEvent", function(self, event, ...)
         return
     end
 
+    if event == "UNIT_AURA" or event == "UNIT_STATS" then
+        local unit = ...
+        if unit == "player" then
+            RTExt.SnapshotPlayerSpellPowerState(false)
+        end
+        return
+    end
+
+    if event == "CHAT_MSG_ADDON" then
+        local prefix, msg, dist, sender = ...
+        RTExt.HandleDemonicPactAddonMessage(prefix, msg, dist, sender)
+        return
+    end
+
+    if event == "PLAYER_TALENT_UPDATE" or event == "ACTIVE_TALENT_GROUP_CHANGED" then
+        RTExt.playerSelfDPContribution = 0
+        RTExt.activeObservedDP = 0
+        RTExt.preDPTransitionSP = nil
+        UpdateGroupCache()
+        RTExt.SnapshotPlayerSpellPowerState(true)
+        return
+    end
+
     if event == "UNIT_PET" then
         UpdateGroupCache()
         return
@@ -6043,9 +6567,15 @@ eventHandler:SetScript("OnEvent", function(self, event, ...)
 
     if event == "PARTY_MEMBERS_CHANGED" or event == "RAID_ROSTER_UPDATE" then
         UpdateGroupCache()
+        if not IsPlayerInGroup() then
+            RTExt.CloseAllActiveZoneStints(currentSession)
+        end
         CheckGroupJoinPrompt()
         CheckGroupBlacklist()
         HandleZoneOrDifficultyUpdate(false)
+        if CharacterFrame and CharacterFrame:IsShown() then
+            RefreshCharactersView()
+        end
         return
     end
 
@@ -6290,6 +6820,17 @@ eventHandler:SetScript("OnEvent", function(self, event, ...)
                 if not recentProcs[utilKey] or (now - recentProcs[utilKey]) > 0.5 then
                     recentProcs[utilKey] = now
                     RecordProc(sourceName, sourceGUID, destName, destGUID, "UTILITY", spellID, spellName, false)
+                end
+            end
+
+            if subevent == "SPELL_AURA_REMOVED" and destGUID == UnitGUID("player") and RTExt.IsDemonicPactRaidBuff(spellID, spellName) then
+                RTExt.playerSelfDPContribution = 0
+                RTExt.activeObservedDP = 0
+                if GetNumRaidMembers() == 0 and GetNumPartyMembers() == 0 then
+                    local myName = UnitName("player")
+                    if myName then
+                        RTExt.lastDemonicPactExpiry[myName] = nil
+                    end
                 end
             end
 
