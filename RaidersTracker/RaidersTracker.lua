@@ -55,6 +55,14 @@ RTExt.preDPTransitionTime = 0
 RTExt.playerSelfDPContribution = 0
 RTExt.activeObservedDP = 0
 RTExt.spPollAccum = 0
+RTExt.mainConsumablesOnly = false
+RTExt.reportConsumablesOnly = false
+RTExt.bossPotionsAllFights = true
+RTExt.charSortByTime = false
+RTExt.charActiveOnly = false
+RTExt.pendingLargeRaidLines = nil
+RTExt.OnRaidChatQueueStateChanged = nil
+RTExt.OpenReportPanel = nil
 
 local function GetAddonVersion()
     return GetAddOnMetadata("RaidersTracker", "Version") or ""
@@ -124,11 +132,20 @@ local function MergeSegmentDataInto(targetSeg, sourceSeg)
         end
     end
     targetSeg.demonicPactValues = targetSeg.demonicPactValues or {}
+    targetSeg.demonicPactTimes = targetSeg.demonicPactTimes or {}
     for pName, dpList in pairs(sourceSeg.demonicPactValues or {}) do
         if type(dpList) == "table" and #dpList > 0 then
             targetSeg.demonicPactValues[pName] = targetSeg.demonicPactValues[pName] or {}
             for _, spVal in ipairs(dpList) do
                 table.insert(targetSeg.demonicPactValues[pName], spVal)
+            end
+        end
+    end
+    for pName, dpTimeList in pairs(sourceSeg.demonicPactTimes or {}) do
+        if type(dpTimeList) == "table" and #dpTimeList > 0 then
+            targetSeg.demonicPactTimes[pName] = targetSeg.demonicPactTimes[pName] or {}
+            for _, tVal in ipairs(dpTimeList) do
+                table.insert(targetSeg.demonicPactTimes[pName], tVal)
             end
         end
     end
@@ -211,6 +228,7 @@ local function InitializeDB()
             seg.potionsAndBuffs = seg.potionsAndBuffs or {}
             seg.raidUtility = seg.raidUtility or {}
             seg.demonicPactValues = seg.demonicPactValues or {}
+            seg.demonicPactTimes = seg.demonicPactTimes or {}
             seg.enrages = seg.enrages or {}
             seg.tanks = seg.tanks or {}
             for pName, cID in pairs(seg.playerIDs) do
@@ -231,6 +249,7 @@ local function InitializeDB()
             seg.potionsAndBuffs = seg.potionsAndBuffs or {}
             seg.raidUtility = seg.raidUtility or {}
             seg.demonicPactValues = seg.demonicPactValues or {}
+            seg.demonicPactTimes = seg.demonicPactTimes or {}
             seg.enrages = seg.enrages or {}
             seg.tanks = seg.tanks or {}
             for pName, cID in pairs(seg.playerIDs) do
@@ -280,13 +299,31 @@ local function SendSingleOutboundLine(line)
     end
 end
 
+function RTExt.IsRaidChatQueueActive()
+    return (#chatQueue > 0) or (chatQueueFrame:GetScript("OnUpdate") ~= nil)
+end
+
+function RTExt.StopRaidChatQueue()
+    table.wipe(chatQueue)
+    chatQueueElapsed = 0
+    chatQueueFrame:SetScript("OnUpdate", nil)
+    if RTExt.OnRaidChatQueueStateChanged then
+        RTExt.OnRaidChatQueueStateChanged(false)
+    end
+end
+
 local function OnChatQueueUpdate(self, elapsed)
     chatQueueElapsed = chatQueueElapsed + elapsed
     if chatQueueElapsed >= 0.20 then
         chatQueueElapsed = 0
         local nextLine = table.remove(chatQueue, 1)
         if nextLine then SendSingleOutboundLine(nextLine) end
-        if #chatQueue == 0 then self:SetScript("OnUpdate", nil) end
+        if #chatQueue == 0 then
+            self:SetScript("OnUpdate", nil)
+            if RTExt.OnRaidChatQueueStateChanged then
+                RTExt.OnRaidChatQueueStateChanged(false)
+            end
+        end
     end
 end
 
@@ -310,6 +347,9 @@ local function EnqueueRaidChatLines(rawLines)
         if #chatQueue > 0 then
             chatQueueElapsed = 0
             chatQueueFrame:SetScript("OnUpdate", OnChatQueueUpdate)
+            if RTExt.OnRaidChatQueueStateChanged then
+                RTExt.OnRaidChatQueueStateChanged(true)
+            end
         end
     end
 end
@@ -1730,6 +1770,7 @@ local function GetNewSegment(name, isBoss, bossID, bossName, attempt)
         potionsAndBuffs = {},
         raidUtility = {},
         demonicPactValues = {},
+        demonicPactTimes = {},
         deaths = {},
         players = {},
         playerIDs = {},
@@ -1767,6 +1808,7 @@ local function EnsureTrashSegment()
         topSeg.players = topSeg.players or {}
         topSeg.playerIDs = topSeg.playerIDs or {}
         topSeg.demonicPactValues = topSeg.demonicPactValues or {}
+        topSeg.demonicPactTimes = topSeg.demonicPactTimes or {}
         topSeg.enrages = topSeg.enrages or {}
         topSeg.tanks = topSeg.tanks or {}
         currentSegment = topSeg
@@ -2166,9 +2208,14 @@ local function StartEncounter(bossID, bossName, overrideData, fromSpeech)
     outOfCombatAccum = 0
     gracePeriodAccum = 0
     table.wipe(defeatedGroupNPCs)
-    table.wipe(RTExt.recentDemonicPact)
-    table.wipe(RTExt.lastDemonicPactConfirmedAt)
-    table.wipe(RTExt.lastDemonicPactExpiry)
+    -- Preserve very recent pre-pull DP dedupe/expiry state (<= 5s) so opening pre-pull procs don't duplicate on pull
+    for pName, tConf in pairs(RTExt.lastDemonicPactConfirmedAt) do
+        if (now - tConf) > 5.0 then
+            RTExt.lastDemonicPactConfirmedAt[pName] = nil
+            RTExt.lastDemonicPactExpiry[pName] = nil
+            RTExt.recentDemonicPact[pName] = nil
+        end
+    end
 
     bossAttemptCount[bossName] = (bossAttemptCount[bossName] or 0) + 1
     local att = bossAttemptCount[bossName]
@@ -2212,6 +2259,9 @@ local function StartEncounter(bossID, bossName, overrideData, fromSpeech)
                     newBossSeg.demonicPactValues = newBossSeg.demonicPactValues or {}
                     newBossSeg.demonicPactValues[ev.pName] = newBossSeg.demonicPactValues[ev.pName] or {}
                     table.insert(newBossSeg.demonicPactValues[ev.pName], ev.dpValue)
+                    newBossSeg.demonicPactTimes = newBossSeg.demonicPactTimes or {}
+                    newBossSeg.demonicPactTimes[ev.pName] = newBossSeg.demonicPactTimes[ev.pName] or {}
+                    table.insert(newBossSeg.demonicPactTimes[ev.pName], 0)
                 end
                 if prevTrashSeg and prevTrashSeg.raidUtility[ev.pName] and prevTrashSeg.raidUtility[ev.pName][ev.entryName] then
                     prevTrashSeg.raidUtility[ev.pName][ev.entryName] = prevTrashSeg.raidUtility[ev.pName][ev.entryName] - 1
@@ -2620,6 +2670,76 @@ function RTExt.FormatDemonicPactLine(indentPrefix, dpValues, fallbackCount)
     return string.format("%sDemonic Pact (%d)", indentPrefix, tonumber(fallbackCount) or 0)
 end
 
+function RTExt.ComputeDemonicPactStats(dpValues, dpTimes, segDur, fallbackCount)
+    local count = (type(dpValues) == "table" and #dpValues > 0) and #dpValues or (tonumber(fallbackCount) or 0)
+    local sumSP, validSPCount = 0, 0
+    if type(dpValues) == "table" then
+        for _, v in ipairs(dpValues) do
+            local n = tonumber(v)
+            if n and n > 0 then
+                sumSP = sumSP + n
+                validSPCount = validSPCount + 1
+            end
+        end
+    end
+    local avgSP = (validSPCount > 0) and math.floor((sumSP / validSPCount) + 0.5) or nil
+
+    local uptimePct = nil
+    local possibleProcs = nil
+    segDur = tonumber(segDur) or 0
+    if segDur > 0 and count > 0 then
+        possibleProcs = math.max(count, math.max(1, math.floor(segDur / 20)))
+        local intervals = {}
+        if type(dpTimes) == "table" and #dpTimes > 0 then
+            for _, t in ipairs(dpTimes) do
+                local tNum = tonumber(t)
+                if tNum then
+                    local s = math.max(0, math.min(segDur, tNum))
+                    local e = math.min(segDur, s + 45)
+                    if e > s then
+                        table.insert(intervals, { s = s, e = e })
+                    end
+                end
+            end
+        end
+        if #intervals > 0 then
+            table.sort(intervals, function(a, b) return a.s < b.s end)
+            local covered = 0
+            local curS, curE = intervals[1].s, intervals[1].e
+            for i = 2, #intervals do
+                if intervals[i].s <= curE then
+                    if intervals[i].e > curE then curE = intervals[i].e end
+                else
+                    covered = covered + (curE - curS)
+                    curS, curE = intervals[i].s, intervals[i].e
+                end
+            end
+            covered = covered + (curE - curS)
+            uptimePct = math.min(100, math.floor((covered / segDur) * 100 + 0.5))
+        else
+            uptimePct = math.min(100, math.floor(((count * 45) / segDur) * 100 + 0.5))
+        end
+    end
+    return avgSP, uptimePct, count, possibleProcs
+end
+
+function RTExt.FormatDemonicPactSummaryLine(indentPrefix, dpValues, dpTimes, segDur, fallbackCount)
+    indentPrefix = indentPrefix or "  "
+    local avgSP, uptimePct, count, possibleProcs = RTExt.ComputeDemonicPactStats(dpValues, dpTimes, segDur, fallbackCount)
+    local parts = {}
+    if avgSP and avgSP > 0 then
+        table.insert(parts, string.format("Avg: %d SP", avgSP))
+    end
+    if uptimePct ~= nil then
+        table.insert(parts, string.format("Uptime: %d%%", uptimePct))
+    end
+    if possibleProcs and possibleProcs > 0 then
+        table.insert(parts, string.format("%d/%d possible procs", count, possibleProcs))
+    end
+    if #parts == 0 then return nil end
+    return string.format("%s(%s)", indentPrefix, table.concat(parts, " | "))
+end
+
 function RTExt.IsPotionSummaryConsumable(rawName)
     if type(rawName) ~= "string" or rawName == "" then return false end
     local clean = StripColorCodes(rawName)
@@ -2636,11 +2756,50 @@ function RTExt.IsPotionSummaryConsumable(rawName)
     return false
 end
 
-function RTExt.BuildBossPotionsReportText(activeSession)
-    local sessionName = (activeSession and activeSession.name) or "Live Current Session"
-    local segs = (activeSession and activeSession.segments) or {}
+function RTExt.IsStrictConsumable(rawName)
+    if type(rawName) ~= "string" or rawName == "" then return false end
+    local clean = StripColorCodes(rawName)
+    local base = clean:match("^(.-)%s*%[.-%]$") or clean
+    if RTExt.IsPotionSummaryConsumable(base) then
+        return true
+    end
+    if base:find("Flask") or base:find("Elixir") or base:find("Well Fed") or base:find("Fish Feast") then
+        return true
+    end
+    if base:find("Healthstone") or base == "Mana Sapphire" or base == "Mana Emerald" then
+        return true
+    end
+    return false
+end
 
-    local totalBossFights = 0
+function RTExt.FilterPotionsAndBuffsMap(entryMap, consumablesOnly)
+    if not entryMap then return {} end
+    if not consumablesOnly then return entryMap end
+    local filtered = {}
+    for k, v in pairs(entryMap) do
+        if RTExt.IsStrictConsumable(k) then
+            filtered[k] = v
+        end
+    end
+    return filtered
+end
+
+function RTExt.BuildBossPotionsReportLines(activeSession, selectedSegOnly)
+    local sessionName = (activeSession and activeSession.name) or "Live Current Session"
+    local segsToScan = {}
+    local isSingleSeg = (selectedSegOnly ~= nil)
+
+    if isSingleSeg then
+        table.insert(segsToScan, selectedSegOnly)
+    else
+        for _, seg in ipairs((activeSession and activeSession.segments) or {}) do
+            if seg and seg.isBoss then
+                table.insert(segsToScan, seg)
+            end
+        end
+    end
+
+    local totalFights = 0
     local victories = 0
     local wipes = 0
     local playerPotions = {}
@@ -2649,38 +2808,38 @@ function RTExt.BuildBossPotionsReportText(activeSession)
     local playerFights = {}
     local grandTotalPotions = 0
 
-    for _, seg in ipairs(segs) do
-        if seg and seg.isBoss then
-            totalBossFights = totalBossFights + 1
+    for _, seg in ipairs(segsToScan) do
+        totalFights = totalFights + 1
+        if seg.isBoss then
             if seg.name and seg.name:find("Victory") then
                 victories = victories + 1
             else
                 wipes = wipes + 1
             end
+        end
 
-            local presentList, presentMap = CollectPresentPlayersInSegment(seg)
-            for _, pName in ipairs(presentList) do
-                playerClasses[pName] = presentMap[pName] or playerClasses[pName] or string.upper(GetSafePlayerClass(pName))
-                playerFights[pName] = (playerFights[pName] or 0) + 1
-                playerTotals[pName] = playerTotals[pName] or 0
-                playerPotions[pName] = playerPotions[pName] or {}
+        local presentList, presentMap = CollectPresentPlayersInSegment(seg)
+        for _, pName in ipairs(presentList) do
+            playerClasses[pName] = presentMap[pName] or playerClasses[pName] or string.upper(GetSafePlayerClass(pName))
+            playerFights[pName] = (playerFights[pName] or 0) + 1
+            playerTotals[pName] = playerTotals[pName] or 0
+            playerPotions[pName] = playerPotions[pName] or {}
+        end
+
+        for pName, entries in pairs(seg.potionsAndBuffs or {}) do
+            if not playerClasses[pName] then
+                playerClasses[pName] = string.upper((seg.players and seg.players[pName]) or GetSafePlayerClass(pName))
             end
-
-            for pName, entries in pairs(seg.potionsAndBuffs or {}) do
-                if not playerClasses[pName] then
-                    playerClasses[pName] = string.upper((seg.players and seg.players[pName]) or GetSafePlayerClass(pName))
-                end
-                playerTotals[pName] = playerTotals[pName] or 0
-                playerPotions[pName] = playerPotions[pName] or {}
-                for rawKey, count in pairs(entries or {}) do
-                    local c = tonumber(count) or 0
-                    if c > 0 and RTExt.IsPotionSummaryConsumable(rawKey) then
-                        local clean = StripColorCodes(rawKey)
-                        local base = clean:match("^(.-)%s*%[.-%]$") or clean
-                        playerPotions[pName][base] = (playerPotions[pName][base] or 0) + c
-                        playerTotals[pName] = playerTotals[pName] + c
-                        grandTotalPotions = grandTotalPotions + c
-                    end
+            playerTotals[pName] = playerTotals[pName] or 0
+            playerPotions[pName] = playerPotions[pName] or {}
+            for rawKey, count in pairs(entries or {}) do
+                local c = tonumber(count) or 0
+                if c > 0 and RTExt.IsPotionSummaryConsumable(rawKey) then
+                    local clean = StripColorCodes(rawKey)
+                    local base = clean:match("^(.-)%s*%[.-%]$") or clean
+                    playerPotions[pName][base] = (playerPotions[pName][base] or 0) + c
+                    playerTotals[pName] = playerTotals[pName] + c
+                    grandTotalPotions = grandTotalPotions + c
                 end
             end
         end
@@ -2689,13 +2848,19 @@ function RTExt.BuildBossPotionsReportText(activeSession)
     local lines = {
         string.format("=== Raiders Tracker%s by %s - Boss Potions Summary ===", RTExt.GetVersionTag(), AUTHOR),
         string.format("Session: %s", sessionName),
-        string.format("Total Boss Fights: %d (%d Victories, %d Wipes/Attempts)", totalBossFights, victories, wipes),
     }
 
-    if totalBossFights == 0 then
-        table.insert(lines, "")
-        table.insert(lines, "No boss fights recorded in this session yet.")
-        return table.concat(lines, "\n")
+    if isSingleSeg then
+        local segName = selectedSegOnly.name or "TRASH"
+        local segDiff = selectedSegOnly.difficulty or GetRaidDifficultySuffix()
+        table.insert(lines, string.format("Scope: Selected Segment - %s (%s)", segName, segDiff))
+    else
+        table.insert(lines, string.format("Total Boss Fights: %d (%d Victories, %d Wipes/Attempts)", totalFights, victories, wipes))
+        if totalFights == 0 then
+            table.insert(lines, "")
+            table.insert(lines, "No boss fights recorded in this session yet.")
+            return lines
+        end
     end
 
     local sortedPlayers = {}
@@ -2717,7 +2882,7 @@ function RTExt.BuildBossPotionsReportText(activeSession)
     table.insert(lines, "")
 
     if #sortedPlayers == 0 then
-        table.insert(lines, "No players recorded in boss fights yet.")
+        table.insert(lines, isSingleSeg and "No players recorded in this segment yet." or "No players recorded in boss fights yet.")
     else
         for idx, p in ipairs(sortedPlayers) do
             local itemNames = {}
@@ -2733,18 +2898,25 @@ function RTExt.BuildBossPotionsReportText(activeSession)
                 end
                 detailStr = table.concat(parts, ", ")
             end
-            local fightWord = (p.fights == 1) and "fight" or "fights"
-            table.insert(lines, string.format(
-                "%d. %s (%s) - %d total [%d/%d %s] (%s)",
-                idx, p.name, p.class, p.total, p.fights, totalBossFights, fightWord, detailStr
-            ))
+            if isSingleSeg then
+                table.insert(lines, string.format(
+                    "%d. %s (%s) - %d total (%s)",
+                    idx, p.name, p.class, p.total, detailStr
+                ))
+            else
+                local fightWord = (p.fights == 1) and "fight" or "fights"
+                table.insert(lines, string.format(
+                    "%d. %s (%s) - %d total [%d/%d %s] (%s)",
+                    idx, p.name, p.class, p.total, p.fights, totalFights, fightWord, detailStr
+                ))
+            end
         end
     end
 
-    return table.concat(lines, "\n")
+    return lines
 end
 
-local function BuildCondensedEntryLines(entryMap, indentPrefix, dpValues)
+local function BuildCondensedEntryLines(entryMap, indentPrefix, dpValues, dpTimes, segDur)
     indentPrefix = indentPrefix or ""
     if not entryMap or next(entryMap) == nil then return {} end
     local grouped = {}
@@ -2790,6 +2962,10 @@ local function BuildCondensedEntryLines(entryMap, indentPrefix, dpValues)
             end
         elseif base == "Demonic Pact" and type(dpValues) == "table" and #dpValues > 0 then
             table.insert(out, RTExt.FormatDemonicPactLine(indentPrefix, dpValues, info.total))
+            local summaryLine = RTExt.FormatDemonicPactSummaryLine("  ", dpValues, dpTimes, segDur, info.total)
+            if summaryLine then
+                table.insert(out, summaryLine)
+            end
         else
             table.insert(out, string.format("%s%s: %d", indentPrefix, base, info.total))
         end
@@ -2887,15 +3063,13 @@ local function CloseAllPanels()
     if RTExt.BlacklistImportFrame then RTExt.BlacklistImportFrame:Hide() end
     if RTExt.BlacklistTextFrame then RTExt.BlacklistTextFrame:Hide() end
     if RTExt.CharacterExportFrame then RTExt.CharacterExportFrame:Hide() end
-    if RTExt.PotionsFrame then RTExt.PotionsFrame:Hide() end
 end
 
 local function ResetAllPanelPositions()
     local panels = {
         MainTrackerFrame, ConfigFrame, CharacterFrame, RTExt.CharacterExportFrame,
         ReportFrame, DeathsFrame, DeathLogFrame,
-        BlacklistFrame, RTExt.BlacklistExportFrame, RTExt.BlacklistImportFrame, RTExt.BlacklistTextFrame,
-        RTExt.PotionsFrame
+        BlacklistFrame, RTExt.BlacklistExportFrame, RTExt.BlacklistImportFrame, RTExt.BlacklistTextFrame
     }
     for _, frame in ipairs(panels) do
         if frame then
@@ -2998,10 +3172,44 @@ local function CreateCustomDropdown(parent, width, height)
         label:SetText(text or "")
     end
 
-    dropdown:SetScript("OnEnter", function(self) self:SetBackdropBorderColor(1.0, 0.82, 0.0, 1.0) end)
-    dropdown:SetScript("OnLeave", function(self) self:SetBackdropBorderColor(0.85, 0.85, 0.85, 0.90) end)
+    function dropdown:SetHighlightTint(isTinted)
+        self.isTinted = isTinted and true or false
+        if self.isDisabled then return end
+        if self.isTinted then
+            self:SetBackdropBorderColor(1.0, 0.65, 0.0, 0.95)
+        else
+            self:SetBackdropBorderColor(0.85, 0.85, 0.85, 0.90)
+        end
+    end
+
+    function dropdown:SetDisabledState(isDisabled)
+        self.isDisabled = isDisabled and true or false
+        if self.isDisabled then
+            menuFrame:Hide()
+            self:SetBackdropBorderColor(0.45, 0.45, 0.45, 0.60)
+            arrow:SetText("|cff666666v|r")
+        else
+            arrow:SetText("|cffFFFFFFv|r")
+            self:SetHighlightTint(self.isTinted)
+        end
+    end
+
+    dropdown:SetScript("OnEnter", function(self)
+        if self.isDisabled then return end
+        self:SetBackdropBorderColor(1.0, 0.82, 0.0, 1.0)
+    end)
+    dropdown:SetScript("OnLeave", function(self)
+        if self.isDisabled then
+            self:SetBackdropBorderColor(0.45, 0.45, 0.45, 0.60)
+        elseif self.isTinted then
+            self:SetBackdropBorderColor(1.0, 0.65, 0.0, 0.95)
+        else
+            self:SetBackdropBorderColor(0.85, 0.85, 0.85, 0.90)
+        end
+    end)
 
     dropdown:SetScript("OnClick", function(self)
+        if self.isDisabled then return end
         if menuFrame:IsShown() then menuFrame:Hide(); return end
         HideAllCustomDropdownMenus()
         if not self.getItems then return end
@@ -3171,21 +3379,42 @@ end
 -------------------------------------------------------------------------------
 -- Main Tracker Frame Implementation
 -------------------------------------------------------------------------------
+function RTExt.ApplySessionDropdownDisplay(dropdown)
+    if not dropdown then return end
+    if selectedSessionIndex == 0 then
+        dropdown:SetText("Live Current Session")
+        dropdown:SetHighlightTint(false)
+    else
+        local sess = RaidersTrackerDB.savedSessions[selectedSessionIndex]
+        local sName = (sess and sess.name) or ("Saved Session " .. tostring(selectedSessionIndex))
+        dropdown:SetText("|cffFFAA00[Saved] " .. sName .. "|r")
+        dropdown:SetHighlightTint(true)
+    end
+end
+
 local function CreateMainTrackerFrame()
     MainTrackerFrame = CreateRUTPanel("RTMainTrackerFrame", 740, 560, ADDON_NAME)
 
+    -- Row 1: View Tabs + Consumables Filter + Status
     local btnPotions = CreateFrame("Button", nil, MainTrackerFrame, "UIPanelButtonTemplate")
-    btnPotions:SetSize(175, 25)
+    btnPotions:SetSize(155, 25)
     btnPotions:SetPoint("TOPLEFT", MainTrackerFrame, "TOPLEFT", 18, -36)
     btnPotions:SetText("1. Potions and Buffs")
 
     local btnUtility = CreateFrame("Button", nil, MainTrackerFrame, "UIPanelButtonTemplate")
-    btnUtility:SetSize(175, 25)
-    btnUtility:SetPoint("LEFT", btnPotions, "RIGHT", 10, 0)
+    btnUtility:SetSize(130, 25)
+    btnUtility:SetPoint("LEFT", btnPotions, "RIGHT", 8, 0)
     btnUtility:SetText("2. Raid Utility")
 
+    local btnMainFilter = CreateFrame("Button", nil, MainTrackerFrame, "UIPanelButtonTemplate")
+    btnMainFilter:SetSize(165, 25)
+    btnMainFilter:SetPoint("LEFT", btnUtility, "RIGHT", 8, 0)
+    btnMainFilter:SetText("Filter: Everything")
+
     local viewStatusText = MainTrackerFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    viewStatusText:SetPoint("LEFT", btnUtility, "RIGHT", 16, 0)
+    viewStatusText:SetPoint("LEFT", btnMainFilter, "RIGHT", 10, 0)
+    viewStatusText:SetPoint("RIGHT", MainTrackerFrame, "RIGHT", -18, 0)
+    viewStatusText:SetJustifyH("LEFT")
     viewStatusText:SetTextColor(0.85, 0.85, 0.85)
 
     btnPotions:SetScript("OnClick", function()
@@ -3198,12 +3427,18 @@ local function CreateMainTrackerFrame()
         currentView = "UTILITY"
         RefreshMainView()
     end)
+    btnMainFilter:SetScript("OnClick", function()
+        HideAllCustomDropdownMenus()
+        RTExt.mainConsumablesOnly = not RTExt.mainConsumablesOnly
+        RefreshMainView()
+    end)
 
-    local sessionDropdown = CreateCustomDropdown(MainTrackerFrame, 195, 24)
+    -- Row 2: Context Selectors (Session + Segment + Pagination) & Session/Segment Actions
+    local sessionDropdown = CreateCustomDropdown(MainTrackerFrame, 180, 24)
     sessionDropdown:SetPoint("TOPLEFT", MainTrackerFrame, "TOPLEFT", 18, -70)
 
-    local segmentDropdown = CreateCustomDropdown(MainTrackerFrame, 260, 24)
-    segmentDropdown:SetPoint("LEFT", sessionDropdown, "RIGHT", 10, 0)
+    local segmentDropdown = CreateCustomDropdown(MainTrackerFrame, 245, 24)
+    segmentDropdown:SetPoint("LEFT", sessionDropdown, "RIGHT", 6, 0)
 
     sessionDropdown.getItems = function()
         local list = {}
@@ -3258,7 +3493,7 @@ local function CreateMainTrackerFrame()
 
     local btnPrevPage = CreateFrame("Button", nil, MainTrackerFrame, "UIPanelButtonTemplate")
     btnPrevPage:SetSize(24, 24)
-    btnPrevPage:SetPoint("LEFT", segmentDropdown, "RIGHT", 8, 0)
+    btnPrevPage:SetPoint("LEFT", segmentDropdown, "RIGHT", 6, 0)
     btnPrevPage:SetText("<")
 
     local btnNextPage = CreateFrame("Button", nil, MainTrackerFrame, "UIPanelButtonTemplate")
@@ -3266,51 +3501,40 @@ local function CreateMainTrackerFrame()
     btnNextPage:SetPoint("LEFT", btnPrevPage, "RIGHT", 4, 0)
     btnNextPage:SetText(">")
 
-    local btnReport = CreateFrame("Button", nil, MainTrackerFrame, "UIPanelButtonTemplate")
-    btnReport:SetSize(90, 24)
-    btnReport:SetPoint("LEFT", btnNextPage, "RIGHT", 10, 0)
-    btnReport:SetText("Report Seg")
-    btnReport:SetScript("OnClick", function() CloseAllPanels(); ReportFrame:Show() end)
-
-    local btnBlacklistHub = CreateFrame("Button", nil, MainTrackerFrame, "UIPanelButtonTemplate")
-    btnBlacklistHub:SetSize(85, 24)
-    btnBlacklistHub:SetPoint("LEFT", btnReport, "RIGHT", 6, 0)
-    btnBlacklistHub:SetText("Blacklist")
-    btnBlacklistHub:SetScript("OnClick", function() CloseAllPanels(); BlacklistFrame:Show() end)
-
-    local btnCharacters = CreateFrame("Button", nil, MainTrackerFrame, "UIPanelButtonTemplate")
-    btnCharacters:SetSize(100, 22)
-    btnCharacters:SetPoint("TOPLEFT", MainTrackerFrame, "TOPLEFT", 18, -103)
-    btnCharacters:SetText("Characters")
-    btnCharacters:SetScript("OnClick", function() CloseAllPanels(); CharacterFrame:Show() end)
-
     local btnSaveSession = CreateFrame("Button", nil, MainTrackerFrame, "UIPanelButtonTemplate")
-    btnSaveSession:SetSize(100, 22)
-    btnSaveSession:SetPoint("LEFT", btnCharacters, "RIGHT", 6, 0)
+    btnSaveSession:SetSize(95, 24)
+    btnSaveSession:SetPoint("LEFT", btnNextPage, "RIGHT", 8, 0)
     btnSaveSession:SetText("Save Session")
 
     local btnDeleteSeg = CreateFrame("Button", nil, MainTrackerFrame, "UIPanelButtonTemplate")
-    btnDeleteSeg:SetSize(90, 22)
+    btnDeleteSeg:SetSize(88, 24)
     btnDeleteSeg:SetPoint("LEFT", btnSaveSession, "RIGHT", 6, 0)
     btnDeleteSeg:SetText("Delete Seg")
 
+    -- Row 3: Clean Navigation Bar
+    local btnReports = CreateFrame("Button", nil, MainTrackerFrame, "UIPanelButtonTemplate")
+    btnReports:SetSize(105, 22)
+    btnReports:SetPoint("TOPLEFT", MainTrackerFrame, "TOPLEFT", 18, -103)
+    btnReports:SetText("Reports")
+    btnReports:SetScript("OnClick", function() CloseAllPanels(); ReportFrame:Show() end)
+
+    local btnCharacters = CreateFrame("Button", nil, MainTrackerFrame, "UIPanelButtonTemplate")
+    btnCharacters:SetSize(105, 22)
+    btnCharacters:SetPoint("LEFT", btnReports, "RIGHT", 8, 0)
+    btnCharacters:SetText("Characters")
+    btnCharacters:SetScript("OnClick", function() CloseAllPanels(); CharacterFrame:Show() end)
+
+    local btnBlacklistHub = CreateFrame("Button", nil, MainTrackerFrame, "UIPanelButtonTemplate")
+    btnBlacklistHub:SetSize(100, 22)
+    btnBlacklistHub:SetPoint("LEFT", btnCharacters, "RIGHT", 8, 0)
+    btnBlacklistHub:SetText("Blacklist")
+    btnBlacklistHub:SetScript("OnClick", function() CloseAllPanels(); BlacklistFrame:Show() end)
+
     local btnConfig = CreateFrame("Button", nil, MainTrackerFrame, "UIPanelButtonTemplate")
-    btnConfig:SetSize(85, 22)
-    btnConfig:SetPoint("LEFT", btnDeleteSeg, "RIGHT", 6, 0)
+    btnConfig:SetSize(90, 22)
+    btnConfig:SetPoint("LEFT", btnBlacklistHub, "RIGHT", 8, 0)
     btnConfig:SetText("Config")
     btnConfig:SetScript("OnClick", function() CloseAllPanels(); ConfigFrame:Show() end)
-
-    local btnDeaths = CreateFrame("Button", nil, MainTrackerFrame, "UIPanelButtonTemplate")
-    btnDeaths:SetSize(85, 22)
-    btnDeaths:SetPoint("LEFT", btnConfig, "RIGHT", 6, 0)
-    btnDeaths:SetText("Deaths")
-    btnDeaths:SetScript("OnClick", function() CloseAllPanels(); DeathsFrame:Show() end)
-
-    local btnPotionsPanel = CreateFrame("Button", nil, MainTrackerFrame, "UIPanelButtonTemplate")
-    btnPotionsPanel:SetSize(90, 22)
-    btnPotionsPanel:SetPoint("LEFT", btnDeaths, "RIGHT", 6, 0)
-    btnPotionsPanel:SetText("Potions")
-    btnPotionsPanel:SetScript("OnClick", function() CloseAllPanels(); RTExt.PotionsFrame:Show() end)
 
     local viewBox = CreateWhiteBorderViewBox(MainTrackerFrame, -132, 38)
 
@@ -3385,7 +3609,8 @@ local function CreateMainTrackerFrame()
     btnSaveSession:SetScript("OnClick", function()
         HideAllCustomDropdownMenus()
         SaveCurrentLiveSession(true)
-        selectedSessionIndex = 1
+        -- Stay on Live Current Session after archiving
+        selectedSessionIndex = 0
         selectedSegmentIndex = 1
         segmentPage = 1
         RefreshMainView()
@@ -3400,30 +3625,52 @@ local function CreateMainTrackerFrame()
             selectedSegmentIndex = math.max(1, #segments)
         end
         local seg = segments[selectedSegmentIndex]
+        local segDur = seg and GetSegmentDuration(seg) or 0
 
         if currentView == "POTIONS" then
             btnPotions:LockHighlight()
             btnUtility:UnlockHighlight()
-            viewStatusText:SetText("|cff00FF00Viewing: Raider Potions, Flasks, Food & Buff Procs|r")
+            btnMainFilter:Show()
+            if RTExt.mainConsumablesOnly then
+                btnMainFilter:SetText("Filter: Consumables Only")
+                viewStatusText:SetText("|cff00FF00Consumables Only|r")
+            else
+                btnMainFilter:SetText("Filter: Everything")
+                viewStatusText:SetText("|cff00FF00Potions, Buffs & Procs|r")
+            end
         else
             btnPotions:UnlockHighlight()
             btnUtility:LockHighlight()
-            viewStatusText:SetText("|cff00CCFFViewing: Raider Utility Spells & Cooldowns Used|r")
+            btnMainFilter:Hide()
+            viewStatusText:SetText("|cff00CCFFRaid Utility & Cooldowns|r")
         end
 
         local lineIndex = 1
         if seg then
-            local dataSource = (currentView == "POTIONS") and seg.potionsAndBuffs or seg.raidUtility
+            local rawSource = (currentView == "POTIONS") and seg.potionsAndBuffs or seg.raidUtility
             local sortedPlayers = {}
-            for pName, entries in pairs(dataSource) do
-                if next(entries) ~= nil then
+            local filteredByPlayer = {}
+            for pName, entries in pairs(rawSource) do
+                local effectiveEntries = (currentView == "POTIONS")
+                    and RTExt.FilterPotionsAndBuffsMap(entries, RTExt.mainConsumablesOnly)
+                    or entries
+                if next(effectiveEntries) ~= nil then
+                    filteredByPlayer[pName] = effectiveEntries
                     table.insert(sortedPlayers, pName)
                 end
             end
             table.sort(sortedPlayers)
 
             if #sortedPlayers == 0 then
-                fontStrings[1]:SetText("|cff999999No " .. ((currentView == "POTIONS") and "potions/buffs" or "utility abilities") .. " recorded in this segment yet.|r")
+                local emptyMsg
+                if currentView == "POTIONS" and RTExt.mainConsumablesOnly then
+                    emptyMsg = "No consumables recorded in this segment yet."
+                elseif currentView == "POTIONS" then
+                    emptyMsg = "No potions/buffs recorded in this segment yet."
+                else
+                    emptyMsg = "No utility abilities recorded in this segment yet."
+                end
+                fontStrings[1]:SetText("|cff999999" .. emptyMsg .. "|r")
                 fontStrings[1]:Show()
                 lineIndex = 2
             else
@@ -3433,7 +3680,7 @@ local function CreateMainTrackerFrame()
 
                     local sortedEntries = {}
                     local totalActions = 0
-                    for buffName, count in pairs(dataSource[pName]) do
+                    for buffName, count in pairs(filteredByPlayer[pName]) do
                         table.insert(sortedEntries, { name = buffName, count = count })
                         totalActions = totalActions + count
                     end
@@ -3450,11 +3697,20 @@ local function CreateMainTrackerFrame()
                             local dpVals = (currentView == "UTILITY" and entry.name == "Demonic Pact" and seg.demonicPactValues) and seg.demonicPactValues[pName] or nil
                             if type(dpVals) == "table" and #dpVals > 0 then
                                 fontStrings[lineIndex]:SetText(string.format("   |cff808080-|r Demonic Pact (|cff00FF00%d|r): |cffFFD100%s|r", #dpVals, table.concat(dpVals, ", ")))
+                                fontStrings[lineIndex]:Show()
+                                lineIndex = lineIndex + 1
+                                local dpTimes = seg.demonicPactTimes and seg.demonicPactTimes[pName] or nil
+                                local summaryText = RTExt.FormatDemonicPactSummaryLine("", dpVals, dpTimes, segDur, entry.count)
+                                if summaryText and lineIndex <= 1500 then
+                                    fontStrings[lineIndex]:SetText("     |cffAAAAAA" .. summaryText .. "|r")
+                                    fontStrings[lineIndex]:Show()
+                                    lineIndex = lineIndex + 1
+                                end
                             else
                                 fontStrings[lineIndex]:SetText(string.format("   |cff808080-|r %s: |cff00FF00%d|r", entry.name, entry.count))
+                                fontStrings[lineIndex]:Show()
+                                lineIndex = lineIndex + 1
                             end
-                            fontStrings[lineIndex]:Show()
-                            lineIndex = lineIndex + 1
                         end
                     end
                 end
@@ -3475,7 +3731,7 @@ local function CreateMainTrackerFrame()
         if segmentPage <= 1 then btnPrevPage:Disable() else btnPrevPage:Enable() end
         if segmentPage >= totalPages then btnNextPage:Disable() else btnNextPage:Enable() end
 
-        sessionDropdown:SetText((selectedSessionIndex == 0) and "Live Current Session" or (RaidersTrackerDB.savedSessions[selectedSessionIndex] and RaidersTrackerDB.savedSessions[selectedSessionIndex].name or "Saved Session"))
+        RTExt.ApplySessionDropdownDisplay(sessionDropdown)
 
         local currentSegObj = segments[selectedSegmentIndex]
         if currentSegObj then
@@ -3505,76 +3761,6 @@ local function CreateMainTrackerFrame()
 end
 
 -------------------------------------------------------------------------------
--- Boss Potions Summary Panel Implementation
--------------------------------------------------------------------------------
-function RTExt.CreatePotionsFrame()
-    local frame = CreateRUTPanel("RTPotionsFrame", 640, 480, "Boss Fights Potions")
-    RTExt.PotionsFrame = frame
-
-    local currentText = ""
-
-    local infoLabel = frame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    infoLabel:SetPoint("TOPLEFT", frame, "TOPLEFT", 18, -36)
-    infoLabel:SetText("All potions, Flame Caps, Thistle Tea & combat consumables across all boss fights (Ctrl+A, Ctrl+C):")
-
-    local viewBox = CreateWhiteBorderViewBox(frame, -58, 46)
-
-    local scrollFrame = CreateFrame("ScrollFrame", "RTPotionsScrollFrame", viewBox, "UIPanelScrollFrameTemplate")
-    scrollFrame:SetPoint("TOPLEFT", viewBox, "TOPLEFT", 8, -8)
-    scrollFrame:SetPoint("BOTTOMRIGHT", viewBox, "BOTTOMRIGHT", -28, 8)
-
-    local editBox = CreateFrame("EditBox", "RTPotionsEditBox", scrollFrame)
-    editBox:SetMultiLine(true)
-    editBox:SetAutoFocus(false)
-    if editBox.SetMaxLetters then editBox:SetMaxLetters(0) end
-    if editBox.SetMaxBytes then editBox:SetMaxBytes(0) end
-    editBox:SetFontObject(GameFontHighlightSmall)
-    editBox:SetWidth(560)
-    editBox:SetHeight(330)
-    editBox:SetScript("OnEscapePressed", function(self)
-        self:ClearFocus()
-        frame:Hide()
-    end)
-    editBox:SetScript("OnChar", function(self)
-        self:SetText(currentText)
-    end)
-    scrollFrame:SetScrollChild(editBox)
-
-    viewBox:EnableMouse(true)
-    viewBox:SetScript("OnMouseDown", function() editBox:SetFocus() end)
-    scrollFrame:EnableMouse(true)
-    scrollFrame:SetScript("OnMouseDown", function() editBox:SetFocus() end)
-
-    local btnSelectAll = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
-    btnSelectAll:SetSize(115, 24)
-    btnSelectAll:SetPoint("BOTTOMLEFT", frame, "BOTTOMLEFT", 18, 14)
-    btnSelectAll:SetText("Select All")
-    btnSelectAll:SetScript("OnClick", function()
-        editBox:SetFocus()
-        editBox:HighlightText()
-    end)
-
-    local btnBackMain = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
-    btnBackMain:SetSize(130, 24)
-    btnBackMain:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", -18, 14)
-    btnBackMain:SetText("Cancel/Back")
-    btnBackMain:SetScript("OnClick", function()
-        CloseAllPanels()
-        MainTrackerFrame:Show()
-    end)
-
-    frame:SetScript("OnShow", function()
-        local activeSession = GetActiveSession()
-        currentText = RTExt.BuildBossPotionsReportText(activeSession)
-        editBox:SetText(currentText)
-        if scrollFrame.UpdateScrollChildRect then scrollFrame:UpdateScrollChildRect() end
-        scrollFrame:SetVerticalScroll(0)
-        editBox:SetFocus()
-        editBox:HighlightText()
-    end)
-end
-
--------------------------------------------------------------------------------
 -- Blacklist Panel Implementation
 -------------------------------------------------------------------------------
 local function CreateBlacklistFrame()
@@ -3600,7 +3786,7 @@ local function CreateBlacklistFrame()
 
     local btnBack = CreateFrame("Button", nil, BlacklistFrame, "UIPanelButtonTemplate")
     btnBack:SetSize(130, 24)
-    btnBack:SetPoint("BOTTOM", BlacklistFrame, "BOTTOM", 0, 14)
+    btnBack:SetPoint("BOTTOMLEFT", BlacklistFrame, "BOTTOMLEFT", 18, 14)
     btnBack:SetText("Back to Tracker")
     btnBack:SetScript("OnClick", function() CloseAllPanels(); MainTrackerFrame:Show() end)
 
@@ -3736,26 +3922,26 @@ function RTExt.CreateBlacklistExportFrame()
     viewBox:EnableMouse(true)
     viewBox:SetScript("OnMouseDown", function() editBox:SetFocus() end)
 
-    local btnSelectAll = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
-    btnSelectAll:SetSize(115, 24)
-    btnSelectAll:SetPoint("BOTTOMLEFT", frame, "BOTTOMLEFT", 18, 14)
-    btnSelectAll:SetText("Select All")
-    btnSelectAll:SetScript("OnClick", function()
-        editBox:SetFocus()
-        editBox:HighlightText()
-    end)
-
     local btnBackBL = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
     btnBackBL:SetSize(135, 24)
-    btnBackBL:SetPoint("LEFT", btnSelectAll, "RIGHT", 10, 0)
+    btnBackBL:SetPoint("BOTTOMLEFT", frame, "BOTTOMLEFT", 18, 14)
     btnBackBL:SetText("Back to Blacklist")
     btnBackBL:SetScript("OnClick", function() CloseAllPanels(); BlacklistFrame:Show() end)
 
     local btnBackTracker = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
     btnBackTracker:SetSize(130, 24)
-    btnBackTracker:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", -18, 14)
+    btnBackTracker:SetPoint("LEFT", btnBackBL, "RIGHT", 8, 0)
     btnBackTracker:SetText("Back to Tracker")
     btnBackTracker:SetScript("OnClick", function() CloseAllPanels(); MainTrackerFrame:Show() end)
+
+    local btnSelectAll = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
+    btnSelectAll:SetSize(115, 24)
+    btnSelectAll:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", -18, 14)
+    btnSelectAll:SetText("Select All")
+    btnSelectAll:SetScript("OnClick", function()
+        editBox:SetFocus()
+        editBox:HighlightText()
+    end)
 
     frame:SetScript("OnShow", function()
         local b64, count = RTExt.ExportBlacklistToBase64XML()
@@ -3816,26 +4002,26 @@ function RTExt.CreateBlacklistImportFrame()
     scrollFrame:EnableMouse(true)
     scrollFrame:SetScript("OnMouseDown", function() editBox:SetFocus() end)
 
-    local btnVerify = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
-    btnVerify:SetSize(100, 24)
-    btnVerify:SetPoint("BOTTOMLEFT", frame, "BOTTOMLEFT", 18, 14)
-    btnVerify:SetText("Verify")
+    local btnBackBL = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
+    btnBackBL:SetSize(135, 24)
+    btnBackBL:SetPoint("BOTTOMLEFT", frame, "BOTTOMLEFT", 18, 14)
+    btnBackBL:SetText("Back to Blacklist")
+    btnBackBL:SetScript("OnClick", function() CloseAllPanels(); BlacklistFrame:Show() end)
 
     local btnImport = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
     btnImport:SetSize(110, 24)
-    btnImport:SetPoint("LEFT", btnVerify, "RIGHT", 8, 0)
+    btnImport:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", -18, 14)
     btnImport:SetText("Import")
+
+    local btnVerify = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
+    btnVerify:SetSize(100, 24)
+    btnVerify:SetPoint("RIGHT", btnImport, "LEFT", -8, 0)
+    btnVerify:SetText("Verify")
 
     local btnClear = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
     btnClear:SetSize(80, 24)
-    btnClear:SetPoint("LEFT", btnImport, "RIGHT", 8, 0)
+    btnClear:SetPoint("RIGHT", btnVerify, "LEFT", -8, 0)
     btnClear:SetText("Clear")
-
-    local btnBackBL = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
-    btnBackBL:SetSize(135, 24)
-    btnBackBL:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", -18, 14)
-    btnBackBL:SetText("Back to Blacklist")
-    btnBackBL:SetScript("OnClick", function() CloseAllPanels(); BlacklistFrame:Show() end)
 
     btnClear:SetScript("OnClick", function()
         editBox:SetText("")
@@ -3929,26 +4115,26 @@ function RTExt.CreateBlacklistTextFrame()
     viewBox:EnableMouse(true)
     viewBox:SetScript("OnMouseDown", function() editBox:SetFocus() end)
 
-    local btnSelectAll = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
-    btnSelectAll:SetSize(115, 24)
-    btnSelectAll:SetPoint("BOTTOMLEFT", frame, "BOTTOMLEFT", 18, 14)
-    btnSelectAll:SetText("Select All")
-    btnSelectAll:SetScript("OnClick", function()
-        editBox:SetFocus()
-        editBox:HighlightText()
-    end)
-
     local btnBackBL = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
     btnBackBL:SetSize(135, 24)
-    btnBackBL:SetPoint("LEFT", btnSelectAll, "RIGHT", 10, 0)
+    btnBackBL:SetPoint("BOTTOMLEFT", frame, "BOTTOMLEFT", 18, 14)
     btnBackBL:SetText("Back to Blacklist")
     btnBackBL:SetScript("OnClick", function() CloseAllPanels(); BlacklistFrame:Show() end)
 
     local btnBackTracker = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
     btnBackTracker:SetSize(130, 24)
-    btnBackTracker:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", -18, 14)
+    btnBackTracker:SetPoint("LEFT", btnBackBL, "RIGHT", 8, 0)
     btnBackTracker:SetText("Back to Tracker")
     btnBackTracker:SetScript("OnClick", function() CloseAllPanels(); MainTrackerFrame:Show() end)
+
+    local btnSelectAll = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
+    btnSelectAll:SetSize(115, 24)
+    btnSelectAll:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", -18, 14)
+    btnSelectAll:SetText("Select All")
+    btnSelectAll:SetScript("OnClick", function()
+        editBox:SetFocus()
+        editBox:HighlightText()
+    end)
 
     frame:SetScript("OnShow", function()
         currentText = RTExt.BuildBlacklistPlainText()
@@ -4007,9 +4193,16 @@ local function CreateDeathsFrame()
 
     local btnBack = CreateFrame("Button", nil, DeathsFrame, "UIPanelButtonTemplate")
     btnBack:SetSize(130, 24)
-    btnBack:SetPoint("BOTTOM", DeathsFrame, "BOTTOM", 0, 14)
-    btnBack:SetText("Back to Tracker")
-    btnBack:SetScript("OnClick", function() CloseAllPanels(); MainTrackerFrame:Show() end)
+    btnBack:SetPoint("BOTTOMLEFT", DeathsFrame, "BOTTOMLEFT", 18, 14)
+    btnBack:SetText("Back to Reports")
+    btnBack:SetScript("OnClick", function()
+        if RTExt.OpenReportPanel then
+            RTExt.OpenReportPanel("DEATHS")
+        else
+            CloseAllPanels()
+            ReportFrame:Show()
+        end
+    end)
 
     local viewBox = CreateWhiteBorderViewBox(DeathsFrame, -66, 46)
 
@@ -4107,17 +4300,45 @@ local function CreateDeathLogFrame()
     local headerLabel = DeathLogFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
     headerLabel:SetPoint("TOPLEFT", DeathLogFrame, "TOPLEFT", 20, -38)
 
+    local btnLogCurSeg = CreateFrame("Button", nil, DeathLogFrame, "UIPanelButtonTemplate")
+    btnLogCurSeg:SetSize(120, 22)
+    btnLogCurSeg:SetPoint("TOPRIGHT", DeathLogFrame, "TOPRIGHT", -18, -35)
+    btnLogCurSeg:SetText("Current Segment")
+    btnLogCurSeg:SetScript("OnClick", function()
+        deathsScopeAllSession = false
+        RefreshDeathLogView()
+    end)
+
+    local btnLogAllSegs = CreateFrame("Button", nil, DeathLogFrame, "UIPanelButtonTemplate")
+    btnLogAllSegs:SetSize(105, 22)
+    btnLogAllSegs:SetPoint("RIGHT", btnLogCurSeg, "LEFT", -6, 0)
+    btnLogAllSegs:SetText("All Segments")
+    btnLogAllSegs:SetScript("OnClick", function()
+        deathsScopeAllSession = true
+        RefreshDeathLogView()
+    end)
+
+    headerLabel:SetPoint("RIGHT", btnLogAllSegs, "LEFT", -8, 0)
+    headerLabel:SetJustifyH("LEFT")
+
     local btnBackDeaths = CreateFrame("Button", nil, DeathLogFrame, "UIPanelButtonTemplate")
-    btnBackDeaths:SetSize(130, 24)
+    btnBackDeaths:SetSize(125, 24)
     btnBackDeaths:SetPoint("BOTTOMLEFT", DeathLogFrame, "BOTTOMLEFT", 18, 14)
     btnBackDeaths:SetText("Back to Deaths")
     btnBackDeaths:SetScript("OnClick", function() CloseAllPanels(); DeathsFrame:Show() end)
 
-    local btnBackTracker = CreateFrame("Button", nil, DeathLogFrame, "UIPanelButtonTemplate")
-    btnBackTracker:SetSize(130, 24)
-    btnBackTracker:SetPoint("LEFT", btnBackDeaths, "RIGHT", 10, 0)
-    btnBackTracker:SetText("Back to Tracker")
-    btnBackTracker:SetScript("OnClick", function() CloseAllPanels(); MainTrackerFrame:Show() end)
+    local btnBackReports = CreateFrame("Button", nil, DeathLogFrame, "UIPanelButtonTemplate")
+    btnBackReports:SetSize(125, 24)
+    btnBackReports:SetPoint("LEFT", btnBackDeaths, "RIGHT", 8, 0)
+    btnBackReports:SetText("Back to Reports")
+    btnBackReports:SetScript("OnClick", function()
+        if RTExt.OpenReportPanel then
+            RTExt.OpenReportPanel("DEATHS")
+        else
+            CloseAllPanels()
+            ReportFrame:Show()
+        end
+    end)
 
     local footerText = DeathLogFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
     footerText:SetPoint("BOTTOMRIGHT", DeathLogFrame, "BOTTOMRIGHT", -20, 18)
@@ -4144,13 +4365,22 @@ local function CreateDeathLogFrame()
 
     RefreshDeathLogView = function()
         if not DeathLogFrame or not DeathLogFrame:IsShown() then return end
+        if deathsScopeAllSession then
+            btnLogAllSegs:LockHighlight()
+            btnLogCurSeg:UnlockHighlight()
+        else
+            btnLogAllSegs:UnlockHighlight()
+            btnLogCurSeg:LockHighlight()
+        end
+
         local pName = selectedDeathPlayer or "Unknown"
         local deathsByPlayer, playerClasses = CollectDeathsForActiveScope()
         local pClass = playerClasses[pName] or GetSafePlayerClass(pName)
         local hexColor = GetPlayerClassColor(pClass)
         local pDeaths = deathsByPlayer[pName] or {}
+        local scopeTag = deathsScopeAllSession and "All Segments" or "Current Segment"
 
-        headerLabel:SetText(string.format("Detailed Death Log for %s  |cffFFFF00(%d Total)|r", ColorizeText(pName, hexColor), #pDeaths))
+        headerLabel:SetText(string.format("%s |cffFFFF00(%d - %s)|r", ColorizeText(pName, hexColor), #pDeaths, scopeTag))
 
         if #pDeaths == 0 then
             logLines[1]:SetText("|cff999999No deaths recorded for this player in the selected scope.|r")
@@ -4194,10 +4424,10 @@ end
 -- Character Panel Implementation (With Multi-Name History & Class Blacklisting)
 -------------------------------------------------------------------------------
 function RTExt.CountActiveSessionPlayers(activeSession, playerMap)
-    if not activeSession or activeSession ~= currentSession then
-        return 0
-    end
     local activeSet = {}
+    if not activeSession or activeSession ~= currentSession then
+        return 0, activeSet
+    end
     local numRaid = GetNumRaidMembers()
     if numRaid > 0 then
         for i = 1, numRaid do
@@ -4240,35 +4470,53 @@ function RTExt.CountActiveSessionPlayers(activeSession, playerMap)
     end
     local count = 0
     for _ in pairs(activeSet) do count = count + 1 end
-    return count
+    return count, activeSet
 end
 
 local function CreateCharacterFrame()
-    CharacterFrame = CreateRUTPanel("RTCharacterFrame", 580, 440, "Session Characters")
+    CharacterFrame = CreateRUTPanel("RTCharacterFrame", 580, 456, "Session Characters")
 
     local playerCountLabel = CharacterFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
     playerCountLabel:SetPoint("TOPLEFT", CharacterFrame, "TOPLEFT", 18, -34)
-    playerCountLabel:SetPoint("TOPRIGHT", CharacterFrame, "TOPRIGHT", -18, -34)
+    playerCountLabel:SetPoint("TOPRIGHT", CharacterFrame, "TOPRIGHT", -240, -34)
     playerCountLabel:SetJustifyH("LEFT")
 
-    local zoneHeaderLabel = CharacterFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    zoneHeaderLabel:SetPoint("TOPLEFT", CharacterFrame, "TOPLEFT", 18, -50)
-    zoneHeaderLabel:SetPoint("TOPRIGHT", CharacterFrame, "TOPRIGHT", -18, -50)
-    zoneHeaderLabel:SetJustifyH("LEFT")
+    local btnCharActiveFilter = CreateFrame("Button", nil, CharacterFrame, "UIPanelButtonTemplate")
+    btnCharActiveFilter:SetSize(118, 22)
+    btnCharActiveFilter:SetPoint("TOPRIGHT", CharacterFrame, "TOPRIGHT", -18, -32)
+    btnCharActiveFilter:SetText("Show: All")
+    btnCharActiveFilter:SetScript("OnClick", function()
+        RTExt.charActiveOnly = not RTExt.charActiveOnly
+        RefreshCharactersView()
+    end)
 
-    local btnExportChars = CreateFrame("Button", nil, CharacterFrame, "UIPanelButtonTemplate")
-    btnExportChars:SetSize(145, 24)
-    btnExportChars:SetPoint("BOTTOMLEFT", CharacterFrame, "BOTTOMLEFT", 18, 14)
-    btnExportChars:SetText("Export Characters")
-    btnExportChars:SetScript("OnClick", function() CloseAllPanels(); RTExt.CharacterExportFrame:Show() end)
+    local btnCharSort = CreateFrame("Button", nil, CharacterFrame, "UIPanelButtonTemplate")
+    btnCharSort:SetSize(96, 22)
+    btnCharSort:SetPoint("RIGHT", btnCharActiveFilter, "LEFT", -6, 0)
+    btnCharSort:SetText("Sort: Name")
+    btnCharSort:SetScript("OnClick", function()
+        RTExt.charSortByTime = not RTExt.charSortByTime
+        RefreshCharactersView()
+    end)
+
+    local zoneHeaderLabel = CharacterFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    zoneHeaderLabel:SetPoint("TOPLEFT", CharacterFrame, "TOPLEFT", 18, -56)
+    zoneHeaderLabel:SetPoint("TOPRIGHT", CharacterFrame, "TOPRIGHT", -18, -56)
+    zoneHeaderLabel:SetJustifyH("LEFT")
 
     local btnBack = CreateFrame("Button", nil, CharacterFrame, "UIPanelButtonTemplate")
     btnBack:SetSize(130, 24)
-    btnBack:SetPoint("BOTTOMRIGHT", CharacterFrame, "BOTTOMRIGHT", -18, 14)
+    btnBack:SetPoint("BOTTOMLEFT", CharacterFrame, "BOTTOMLEFT", 18, 14)
     btnBack:SetText("Back to Tracker")
     btnBack:SetScript("OnClick", function() CloseAllPanels(); MainTrackerFrame:Show() end)
 
-    local viewBox = CreateWhiteBorderViewBox(CharacterFrame, -68, 46)
+    local btnExportChars = CreateFrame("Button", nil, CharacterFrame, "UIPanelButtonTemplate")
+    btnExportChars:SetSize(145, 24)
+    btnExportChars:SetPoint("BOTTOMRIGHT", CharacterFrame, "BOTTOMRIGHT", -18, 14)
+    btnExportChars:SetText("Export Characters")
+    btnExportChars:SetScript("OnClick", function() CloseAllPanels(); RTExt.CharacterExportFrame:Show() end)
+
+    local viewBox = CreateWhiteBorderViewBox(CharacterFrame, -74, 46)
 
     local scrollFrame = CreateFrame("ScrollFrame", "RTCharScrollFrame", viewBox, "UIPanelScrollFrameTemplate")
     scrollFrame:SetPoint("TOPLEFT", viewBox, "TOPLEFT", 8, -8)
@@ -4457,16 +4705,41 @@ local function CreateCharacterFrame()
             end
         end
 
-        local activeCount = RTExt.CountActiveSessionPlayers(activeSession, playerMap)
+        local activeCount, activeSet = RTExt.CountActiveSessionPlayers(activeSession, playerMap)
 
+        local totalPlayersCount = 0
         local sortedPlayers = {}
-        for pName in pairs(playerMap) do table.insert(sortedPlayers, pName) end
-        table.sort(sortedPlayers)
+        local playerZoneSecs = {}
+        for pName in pairs(playerMap) do
+            totalPlayersCount = totalPlayersCount + 1
+            local zSecs = 0
+            if activeSession and activeSession.zoneTimes and activeSession.zoneTimes[pName] and majZone then
+                zSecs = RTExt.GetZoneTimeTotal(activeSession.zoneTimes[pName][majZone])
+            end
+            playerZoneSecs[pName] = zSecs
+            if (not RTExt.charActiveOnly) or activeSet[pName] then
+                table.insert(sortedPlayers, pName)
+            end
+        end
 
-        playerCountLabel:SetText(string.format("Players: |cff00FF00Active: %d|r  |  |cffFFFFFFTotal: %d|r", activeCount, #sortedPlayers))
+        if RTExt.charSortByTime then
+            btnCharSort:SetText("Sort: Time")
+            table.sort(sortedPlayers, function(a, b)
+                local ta, tb = playerZoneSecs[a] or 0, playerZoneSecs[b] or 0
+                if ta ~= tb then return ta > tb end
+                return a < b
+            end)
+        else
+            btnCharSort:SetText("Sort: Name")
+            table.sort(sortedPlayers)
+        end
+
+        btnCharActiveFilter:SetText(RTExt.charActiveOnly and "Show: Active Only" or "Show: All")
+        playerCountLabel:SetText(string.format("Players: |cff00FF00Active: %d|r  |  |cffFFFFFFTotal: %d|r", activeCount, totalPlayersCount))
 
         if #sortedPlayers == 0 then
             for i = 1, 100 do rows[i]:Hide() end
+            emptyLabel:SetText(RTExt.charActiveOnly and "|cff999999No active players in group right now.|r" or "|cff999999No characters recorded in this session yet.|r")
             emptyLabel:Show()
             scrollContent:SetHeight(315)
             return
@@ -4543,26 +4816,26 @@ function RTExt.CreateCharacterExportFrame()
     viewBox:EnableMouse(true)
     viewBox:SetScript("OnMouseDown", function() editBox:SetFocus() end)
 
-    local btnSelectAll = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
-    btnSelectAll:SetSize(110, 24)
-    btnSelectAll:SetPoint("BOTTOMLEFT", frame, "BOTTOMLEFT", 18, 14)
-    btnSelectAll:SetText("Select All")
-    btnSelectAll:SetScript("OnClick", function()
-        editBox:SetFocus()
-        editBox:HighlightText()
-    end)
-
     local btnBackChars = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
     btnBackChars:SetSize(145, 24)
-    btnBackChars:SetPoint("LEFT", btnSelectAll, "RIGHT", 10, 0)
+    btnBackChars:SetPoint("BOTTOMLEFT", frame, "BOTTOMLEFT", 18, 14)
     btnBackChars:SetText("Back to Characters")
     btnBackChars:SetScript("OnClick", function() CloseAllPanels(); CharacterFrame:Show() end)
 
     local btnBackTracker = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
     btnBackTracker:SetSize(130, 24)
-    btnBackTracker:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", -18, 14)
+    btnBackTracker:SetPoint("LEFT", btnBackChars, "RIGHT", 8, 0)
     btnBackTracker:SetText("Back to Tracker")
     btnBackTracker:SetScript("OnClick", function() CloseAllPanels(); MainTrackerFrame:Show() end)
+
+    local btnSelectAll = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
+    btnSelectAll:SetSize(110, 24)
+    btnSelectAll:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", -18, 14)
+    btnSelectAll:SetText("Select All")
+    btnSelectAll:SetScript("OnClick", function()
+        editBox:SetFocus()
+        editBox:HighlightText()
+    end)
 
     frame:SetScript("OnShow", function()
         local activeSession = GetActiveSession()
@@ -4625,188 +4898,384 @@ function RTExt.CreateCharacterExportFrame()
 end
 
 -------------------------------------------------------------------------------
--- Multi-Panel Reporting Hub (Flush Left, Clean Fails & Line Limits)
+-- Multi-Panel Reporting Hub (5-Tab Hub, Context Dropdowns, Filters & Broadcast Guards)
 -------------------------------------------------------------------------------
 local function CreateReportFrame()
-    ReportFrame = CreateRUTPanel("RTReportFrame", 680, 540, "Report Segment Hub")
+    ReportFrame = CreateRUTPanel("RTReportFrame", 740, 560, "Reports Hub")
 
-    local activeReportPanel = "ALL"
-    local activeAllFormat = "PLAIN"
-    local activeCharSubMode = "BUFFS"
-    local activeFailSubMode = "EARLY"
-    local failLineLimit = 10
-    local selectedReportChar = nil
-    local currentPreviewText = ""
-    local currentRaidChatLines = {}
+    -- Group widget references & state into a single table to stay well below Lua 5.1's 60-upvalue limit
+    local ui = {
+        activeReportPanel = "ALL",
+        activeAllFormat = "PLAIN",
+        activeCharSubMode = "BUFFS",
+        activeFailSubMode = "EARLY",
+        failLineLimit = 10,
+        selectedReportChar = nil,
+        currentPreviewText = "",
+        currentRaidChatLines = {},
+    }
 
-    local GenerateReport
+    RTExt.OpenReportPanel = function(panelKey)
+        if panelKey then
+            ui.activeReportPanel = panelKey
+        end
+        CloseAllPanels()
+        ReportFrame:Show()
+    end
 
-    local btnPanelAll = CreateFrame("Button", nil, ReportFrame, "UIPanelButtonTemplate")
-    btnPanelAll:SetSize(130, 24)
-    btnPanelAll:SetPoint("TOPLEFT", ReportFrame, "TOPLEFT", 18, -34)
-    btnPanelAll:SetText("1. ALL Data")
+    -- Row 1: Synced Session & Segment Selector + Pagination
+    ui.sessionDropdown = CreateCustomDropdown(ReportFrame, 195, 24)
+    ui.sessionDropdown:SetPoint("TOPLEFT", ReportFrame, "TOPLEFT", 18, -34)
 
-    local btnPanelChar = CreateFrame("Button", nil, ReportFrame, "UIPanelButtonTemplate")
-    btnPanelChar:SetSize(130, 24)
-    btnPanelChar:SetPoint("LEFT", btnPanelAll, "RIGHT", 6, 0)
-    btnPanelChar:SetText("2. Character")
+    ui.segmentDropdown = CreateCustomDropdown(ReportFrame, 300, 24)
+    ui.segmentDropdown:SetPoint("LEFT", ui.sessionDropdown, "RIGHT", 8, 0)
 
-    local btnPanelFails = CreateFrame("Button", nil, ReportFrame, "UIPanelButtonTemplate")
-    btnPanelFails:SetSize(130, 24)
-    btnPanelFails:SetPoint("LEFT", btnPanelChar, "RIGHT", 6, 0)
-    btnPanelFails:SetText("3. Raid Fails")
+    ui.btnPrevPage = CreateFrame("Button", nil, ReportFrame, "UIPanelButtonTemplate")
+    ui.btnPrevPage:SetSize(24, 24)
+    ui.btnPrevPage:SetPoint("LEFT", ui.segmentDropdown, "RIGHT", 6, 0)
+    ui.btnPrevPage:SetText("<")
 
-    local btnPanelDeaths = CreateFrame("Button", nil, ReportFrame, "UIPanelButtonTemplate")
-    btnPanelDeaths:SetSize(145, 24)
-    btnPanelDeaths:SetPoint("LEFT", btnPanelFails, "RIGHT", 6, 0)
-    btnPanelDeaths:SetText("4. Suspicious Deaths")
+    ui.btnNextPage = CreateFrame("Button", nil, ReportFrame, "UIPanelButtonTemplate")
+    ui.btnNextPage:SetSize(24, 24)
+    ui.btnNextPage:SetPoint("LEFT", ui.btnPrevPage, "RIGHT", 4, 0)
+    ui.btnNextPage:SetText(">")
 
-    local subFrameAll = CreateFrame("Frame", nil, ReportFrame)
-    subFrameAll:SetSize(640, 28)
-    subFrameAll:SetPoint("TOPLEFT", ReportFrame, "TOPLEFT", 18, -62)
+    ui.sessionDropdown.getItems = function()
+        local list = {}
+        table.insert(list, {
+            text = "Live Current Session",
+            checked = (selectedSessionIndex == 0),
+            func = function()
+                selectedSessionIndex = 0
+                selectedSegmentIndex = 1
+                segmentPage = 1
+                ui.selectedReportChar = nil
+                ui.GenerateReport()
+            end
+        })
+        for idx, sess in ipairs(RaidersTrackerDB.savedSessions) do
+            local capturedIdx = idx
+            table.insert(list, {
+                text = sess.name or ("Saved Session " .. capturedIdx),
+                checked = (selectedSessionIndex == capturedIdx),
+                func = function()
+                    selectedSessionIndex = capturedIdx
+                    selectedSegmentIndex = 1
+                    segmentPage = 1
+                    ui.selectedReportChar = nil
+                    ui.GenerateReport()
+                end
+            })
+        end
+        return list
+    end
 
-    local chkPlain = CreateFrame("CheckButton", nil, subFrameAll, "UICheckButtonTemplate")
-    chkPlain:SetPoint("LEFT", subFrameAll, "LEFT", 0, 0)
-    chkPlain.text = chkPlain:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    chkPlain.text:SetPoint("LEFT", chkPlain, "RIGHT", 2, 0)
-    chkPlain.text:SetText("Plain Text")
-    chkPlain:SetChecked(true)
+    ui.segmentDropdown.getItems = function()
+        local list = {}
+        local activeSession = GetActiveSession()
+        local segs = (activeSession and activeSession.segments) or {}
+        local startIndex = (segmentPage - 1) * 25 + 1
+        local endIndex = math.min(#segs, segmentPage * 25)
 
-    local chkDiscord = CreateFrame("CheckButton", nil, subFrameAll, "UICheckButtonTemplate")
-    chkDiscord:SetPoint("LEFT", chkPlain.text, "RIGHT", 16, 0)
-    chkDiscord.text = chkDiscord:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    chkDiscord.text:SetPoint("LEFT", chkDiscord, "RIGHT", 2, 0)
-    chkDiscord.text:SetText("Discord Markdown")
+        for i = startIndex, endIndex do
+            local capturedIndex = i
+            local s = segs[capturedIndex]
+            local segLabel = string.format("%s (%s)", s.name or "TRASH", s.difficulty or "")
+            table.insert(list, {
+                text = segLabel,
+                checked = (selectedSegmentIndex == capturedIndex),
+                func = function()
+                    selectedSegmentIndex = capturedIndex
+                    ui.GenerateReport()
+                end
+            })
+        end
+        return list
+    end
 
-    local chkHTML = CreateFrame("CheckButton", nil, subFrameAll, "UICheckButtonTemplate")
-    chkHTML:SetPoint("LEFT", chkDiscord.text, "RIGHT", 16, 0)
-    chkHTML.text = chkHTML:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    chkHTML.text:SetPoint("LEFT", chkHTML, "RIGHT", 2, 0)
-    chkHTML.text:SetText("Export as HTML")
+    ui.btnPrevPage:SetScript("OnClick", function()
+        HideAllCustomDropdownMenus()
+        if segmentPage > 1 then segmentPage = segmentPage - 1; ui.GenerateReport() end
+    end)
 
-    local copyHint = subFrameAll:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-    copyHint:SetPoint("LEFT", chkHTML.text, "RIGHT", 14, 0)
-    copyHint:SetText("|cff888888(Ctrl+A, Ctrl+C to copy)|r")
+    ui.btnNextPage:SetScript("OnClick", function()
+        HideAllCustomDropdownMenus()
+        local activeSession = GetActiveSession()
+        local totalPages = math.ceil(#(activeSession and activeSession.segments or {}) / 25)
+        if segmentPage < totalPages then segmentPage = segmentPage + 1; ui.GenerateReport() end
+    end)
 
-    local subFrameChar = CreateFrame("Frame", nil, ReportFrame)
-    subFrameChar:SetSize(640, 28)
-    subFrameChar:SetPoint("TOPLEFT", ReportFrame, "TOPLEFT", 18, -62)
-    subFrameChar:Hide()
+    -- Row 2: 5 Report Tabs
+    ui.btnPanelAll = CreateFrame("Button", nil, ReportFrame, "UIPanelButtonTemplate")
+    ui.btnPanelAll:SetSize(124, 24)
+    ui.btnPanelAll:SetPoint("TOPLEFT", ReportFrame, "TOPLEFT", 18, -65)
+    ui.btnPanelAll:SetText("1. ALL Data")
 
-    local charLabel = subFrameChar:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    charLabel:SetPoint("LEFT", subFrameChar, "LEFT", 2, 0)
+    ui.btnPanelChar = CreateFrame("Button", nil, ReportFrame, "UIPanelButtonTemplate")
+    ui.btnPanelChar:SetSize(124, 24)
+    ui.btnPanelChar:SetPoint("LEFT", ui.btnPanelAll, "RIGHT", 6, 0)
+    ui.btnPanelChar:SetText("2. Character")
+
+    ui.btnPanelFails = CreateFrame("Button", nil, ReportFrame, "UIPanelButtonTemplate")
+    ui.btnPanelFails:SetSize(124, 24)
+    ui.btnPanelFails:SetPoint("LEFT", ui.btnPanelChar, "RIGHT", 6, 0)
+    ui.btnPanelFails:SetText("3. Raid Fails")
+
+    ui.btnPanelDeaths = CreateFrame("Button", nil, ReportFrame, "UIPanelButtonTemplate")
+    ui.btnPanelDeaths:SetSize(124, 24)
+    ui.btnPanelDeaths:SetPoint("LEFT", ui.btnPanelFails, "RIGHT", 6, 0)
+    ui.btnPanelDeaths:SetText("4. Deaths")
+
+    ui.btnPanelPotions = CreateFrame("Button", nil, ReportFrame, "UIPanelButtonTemplate")
+    ui.btnPanelPotions:SetSize(134, 24)
+    ui.btnPanelPotions:SetPoint("LEFT", ui.btnPanelDeaths, "RIGHT", 6, 0)
+    ui.btnPanelPotions:SetText("5. Boss Potions")
+
+    -- Row 3: Tab-Specific Options
+    ui.subFrameAll = CreateFrame("Frame", nil, ReportFrame)
+    ui.subFrameAll:SetSize(704, 28)
+    ui.subFrameAll:SetPoint("TOPLEFT", ReportFrame, "TOPLEFT", 18, -94)
+
+    ui.chkPlain = CreateFrame("CheckButton", nil, ui.subFrameAll, "UICheckButtonTemplate")
+    ui.chkPlain:SetPoint("LEFT", ui.subFrameAll, "LEFT", 0, 0)
+    ui.chkPlain.text = ui.chkPlain:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    ui.chkPlain.text:SetPoint("LEFT", ui.chkPlain, "RIGHT", 2, 0)
+    ui.chkPlain.text:SetText("Plain Text")
+    ui.chkPlain:SetChecked(true)
+
+    ui.chkDiscord = CreateFrame("CheckButton", nil, ui.subFrameAll, "UICheckButtonTemplate")
+    ui.chkDiscord:SetPoint("LEFT", ui.chkPlain.text, "RIGHT", 14, 0)
+    ui.chkDiscord.text = ui.chkDiscord:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    ui.chkDiscord.text:SetPoint("LEFT", ui.chkDiscord, "RIGHT", 2, 0)
+    ui.chkDiscord.text:SetText("Discord Markdown")
+
+    ui.chkHTML = CreateFrame("CheckButton", nil, ui.subFrameAll, "UICheckButtonTemplate")
+    ui.chkHTML:SetPoint("LEFT", ui.chkDiscord.text, "RIGHT", 14, 0)
+    ui.chkHTML.text = ui.chkHTML:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    ui.chkHTML.text:SetPoint("LEFT", ui.chkHTML, "RIGHT", 2, 0)
+    ui.chkHTML.text:SetText("Export as HTML")
+
+    ui.btnAllFilter = CreateFrame("Button", nil, ui.subFrameAll, "UIPanelButtonTemplate")
+    ui.btnAllFilter:SetSize(165, 22)
+    ui.btnAllFilter:SetPoint("RIGHT", ui.subFrameAll, "RIGHT", 0, 0)
+    ui.btnAllFilter:SetText("Filter: Everything")
+    ui.btnAllFilter:SetScript("OnClick", function()
+        RTExt.reportConsumablesOnly = not RTExt.reportConsumablesOnly
+        ui.GenerateReport()
+    end)
+
+    ui.subFrameChar = CreateFrame("Frame", nil, ReportFrame)
+    ui.subFrameChar:SetSize(704, 28)
+    ui.subFrameChar:SetPoint("TOPLEFT", ReportFrame, "TOPLEFT", 18, -94)
+    ui.subFrameChar:Hide()
+
+    local charLabel = ui.subFrameChar:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    charLabel:SetPoint("LEFT", ui.subFrameChar, "LEFT", 2, 0)
     charLabel:SetText("Raider:")
 
-    local charDropdown = CreateCustomDropdown(subFrameChar, 160, 24)
-    charDropdown:SetPoint("LEFT", charLabel, "RIGHT", 8, 0)
+    ui.charDropdown = CreateCustomDropdown(ui.subFrameChar, 155, 24)
+    ui.charDropdown:SetPoint("LEFT", charLabel, "RIGHT", 6, 0)
 
-    local btnCharBuffs = CreateFrame("Button", nil, subFrameChar, "UIPanelButtonTemplate")
-    btnCharBuffs:SetSize(165, 24)
-    btnCharBuffs:SetPoint("LEFT", charDropdown, "RIGHT", 10, 0)
-    btnCharBuffs:SetText("Buffs & Utility")
+    ui.btnCharBuffs = CreateFrame("Button", nil, ui.subFrameChar, "UIPanelButtonTemplate")
+    ui.btnCharBuffs:SetSize(120, 24)
+    ui.btnCharBuffs:SetPoint("LEFT", ui.charDropdown, "RIGHT", 8, 0)
+    ui.btnCharBuffs:SetText("Buffs & Utility")
 
-    local btnCharFails = CreateFrame("Button", nil, subFrameChar, "UIPanelButtonTemplate")
-    btnCharFails:SetSize(130, 24)
-    btnCharFails:SetPoint("LEFT", btnCharBuffs, "RIGHT", 8, 0)
-    btnCharFails:SetText("Character Fails")
+    ui.btnCharFails = CreateFrame("Button", nil, ui.subFrameChar, "UIPanelButtonTemplate")
+    ui.btnCharFails:SetSize(115, 24)
+    ui.btnCharFails:SetPoint("LEFT", ui.btnCharBuffs, "RIGHT", 6, 0)
+    ui.btnCharFails:SetText("Character Fails")
 
-    local subFrameFails = CreateFrame("Frame", nil, ReportFrame)
-    subFrameFails:SetSize(640, 28)
-    subFrameFails:SetPoint("TOPLEFT", ReportFrame, "TOPLEFT", 18, -62)
-    subFrameFails:Hide()
+    ui.btnCharFilter = CreateFrame("Button", nil, ui.subFrameChar, "UIPanelButtonTemplate")
+    ui.btnCharFilter:SetSize(165, 22)
+    ui.btnCharFilter:SetPoint("RIGHT", ui.subFrameChar, "RIGHT", 0, 0)
+    ui.btnCharFilter:SetText("Filter: Everything")
+    ui.btnCharFilter:SetScript("OnClick", function()
+        RTExt.reportConsumablesOnly = not RTExt.reportConsumablesOnly
+        ui.GenerateReport()
+    end)
 
-    local btnFailEarly = CreateFrame("Button", nil, subFrameFails, "UIPanelButtonTemplate")
-    btnFailEarly:SetSize(95, 24)
-    btnFailEarly:SetPoint("LEFT", subFrameFails, "LEFT", 0, 0)
-    btnFailEarly:SetText("1. Early Deaths")
+    ui.subFrameFails = CreateFrame("Frame", nil, ReportFrame)
+    ui.subFrameFails:SetSize(704, 28)
+    ui.subFrameFails:SetPoint("TOPLEFT", ReportFrame, "TOPLEFT", 18, -94)
+    ui.subFrameFails:Hide()
 
-    local btnFailSlack = CreateFrame("Button", nil, subFrameFails, "UIPanelButtonTemplate")
-    btnFailSlack:SetSize(100, 24)
-    btnFailSlack:SetPoint("LEFT", btnFailEarly, "RIGHT", 4, 0)
-    btnFailSlack:SetText("2. Slackers")
+    ui.btnFailEarly = CreateFrame("Button", nil, ui.subFrameFails, "UIPanelButtonTemplate")
+    ui.btnFailEarly:SetSize(110, 24)
+    ui.btnFailEarly:SetPoint("LEFT", ui.subFrameFails, "LEFT", 0, 0)
+    ui.btnFailEarly:SetText("1. Early Deaths")
 
-    local btnFailCds = CreateFrame("Button", nil, subFrameFails, "UIPanelButtonTemplate")
-    btnFailCds:SetSize(95, 24)
-    btnFailCds:SetPoint("LEFT", btnFailSlack, "RIGHT", 4, 0)
-    btnFailCds:SetText("3. CD Fails")
+    ui.btnFailSlack = CreateFrame("Button", nil, ui.subFrameFails, "UIPanelButtonTemplate")
+    ui.btnFailSlack:SetSize(105, 24)
+    ui.btnFailSlack:SetPoint("LEFT", ui.btnFailEarly, "RIGHT", 6, 0)
+    ui.btnFailSlack:SetText("2. Slackers")
 
-    local limitDropdown = CreateCustomDropdown(subFrameFails, 100, 24)
-    limitDropdown:SetPoint("LEFT", btnFailCds, "RIGHT", 10, 0)
+    ui.btnFailCds = CreateFrame("Button", nil, ui.subFrameFails, "UIPanelButtonTemplate")
+    ui.btnFailCds:SetSize(100, 24)
+    ui.btnFailCds:SetPoint("LEFT", ui.btnFailSlack, "RIGHT", 6, 0)
+    ui.btnFailCds:SetText("3. CD Fails")
 
-    limitDropdown.getItems = function()
+    ui.limitDropdown = CreateCustomDropdown(ui.subFrameFails, 100, 24)
+    ui.limitDropdown:SetPoint("LEFT", ui.btnFailCds, "RIGHT", 10, 0)
+
+    ui.limitDropdown.getItems = function()
         return {
-            { text = "5 lines", checked = (failLineLimit == 5), func = function() failLineLimit = 5; GenerateReport() end },
-            { text = "10 lines", checked = (failLineLimit == 10), func = function() failLineLimit = 10; GenerateReport() end },
-            { text = "20 lines", checked = (failLineLimit == 20), func = function() failLineLimit = 20; GenerateReport() end },
-            { text = "All lines", checked = (failLineLimit == 9999), func = function() failLineLimit = 9999; GenerateReport() end },
+            { text = "5 lines", checked = (ui.failLineLimit == 5), func = function() ui.failLineLimit = 5; ui.GenerateReport() end },
+            { text = "10 lines", checked = (ui.failLineLimit == 10), func = function() ui.failLineLimit = 10; ui.GenerateReport() end },
+            { text = "20 lines", checked = (ui.failLineLimit == 20), func = function() ui.failLineLimit = 20; ui.GenerateReport() end },
+            { text = "All lines", checked = (ui.failLineLimit == 9999), func = function() ui.failLineLimit = 9999; ui.GenerateReport() end },
         }
     end
-    limitDropdown:SetText(failLineLimit == 9999 and "All lines" or (failLineLimit .. " lines"))
+    ui.limitDropdown:SetText(ui.failLineLimit == 9999 and "All lines" or (ui.failLineLimit .. " lines"))
 
-    local subFrameInfo = CreateFrame("Frame", nil, ReportFrame)
-    subFrameInfo:SetSize(640, 28)
-    subFrameInfo:SetPoint("TOPLEFT", ReportFrame, "TOPLEFT", 18, -62)
-    subFrameInfo:Hide()
+    ui.subFrameDeaths = CreateFrame("Frame", nil, ReportFrame)
+    ui.subFrameDeaths:SetSize(704, 28)
+    ui.subFrameDeaths:SetPoint("TOPLEFT", ReportFrame, "TOPLEFT", 18, -94)
+    ui.subFrameDeaths:Hide()
 
-    local infoBannerText = subFrameInfo:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    infoBannerText:SetPoint("LEFT", subFrameInfo, "LEFT", 4, 0)
+    local deathsBannerText = ui.subFrameDeaths:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    deathsBannerText:SetPoint("LEFT", ui.subFrameDeaths, "LEFT", 2, 0)
+    deathsBannerText:SetText("|cffFFFF00Chronological Suspicious Deaths & Unused Defensives|r")
 
-    local viewBox = CreateWhiteBorderViewBox(ReportFrame, -94, 46)
+    ui.btnOpenDeathsViewer = CreateFrame("Button", nil, ui.subFrameDeaths, "UIPanelButtonTemplate")
+    ui.btnOpenDeathsViewer:SetSize(150, 24)
+    ui.btnOpenDeathsViewer:SetPoint("RIGHT", ui.subFrameDeaths, "RIGHT", 0, 0)
+    ui.btnOpenDeathsViewer:SetText("Deaths & Death Log")
+    ui.btnOpenDeathsViewer:SetScript("OnClick", function()
+        CloseAllPanels()
+        DeathsFrame:Show()
+    end)
 
-    local scrollFrame = CreateFrame("ScrollFrame", "RTReportScrollFrame", viewBox, "UIPanelScrollFrameTemplate")
-    scrollFrame:SetPoint("TOPLEFT", viewBox, "TOPLEFT", 8, -8)
-    scrollFrame:SetPoint("BOTTOMRIGHT", viewBox, "BOTTOMRIGHT", -28, 8)
+    ui.subFramePotions = CreateFrame("Frame", nil, ReportFrame)
+    ui.subFramePotions:SetSize(704, 28)
+    ui.subFramePotions:SetPoint("TOPLEFT", ReportFrame, "TOPLEFT", 18, -94)
+    ui.subFramePotions:Hide()
 
-    local editBox = CreateFrame("EditBox", "RTReportEditBox", scrollFrame)
-    editBox:SetMultiLine(true)
-    editBox:SetAutoFocus(false)
-    if editBox.SetMaxLetters then editBox:SetMaxLetters(0) end
-    if editBox.SetMaxBytes then editBox:SetMaxBytes(0) end
-    editBox:SetFontObject(GameFontHighlightSmall)
-    editBox:SetWidth(600)
-    editBox:SetScript("OnEscapePressed", function(self)
+    ui.btnPotionsScope = CreateFrame("Button", nil, ui.subFramePotions, "UIPanelButtonTemplate")
+    ui.btnPotionsScope:SetSize(225, 24)
+    ui.btnPotionsScope:SetPoint("LEFT", ui.subFramePotions, "LEFT", 0, 0)
+    ui.btnPotionsScope:SetText("Scope: All Boss Fights (Session)")
+    ui.btnPotionsScope:SetScript("OnClick", function()
+        RTExt.bossPotionsAllFights = not RTExt.bossPotionsAllFights
+        ui.GenerateReport()
+    end)
+
+    local potionsHintText = ui.subFramePotions:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    potionsHintText:SetPoint("LEFT", ui.btnPotionsScope, "RIGHT", 12, 0)
+    potionsHintText:SetText("|cffCCCCCCIncludes all combat potions, Flame Caps, Thistle Tea & Runes|r")
+
+    local viewBox = CreateWhiteBorderViewBox(ReportFrame, -126, 46)
+
+    ui.scrollFrame = CreateFrame("ScrollFrame", "RTReportScrollFrame", viewBox, "UIPanelScrollFrameTemplate")
+    ui.scrollFrame:SetPoint("TOPLEFT", viewBox, "TOPLEFT", 8, -8)
+    ui.scrollFrame:SetPoint("BOTTOMRIGHT", viewBox, "BOTTOMRIGHT", -28, 8)
+
+    ui.editBox = CreateFrame("EditBox", "RTReportEditBox", ui.scrollFrame)
+    ui.editBox:SetMultiLine(true)
+    ui.editBox:SetAutoFocus(false)
+    if ui.editBox.SetMaxLetters then ui.editBox:SetMaxLetters(0) end
+    if ui.editBox.SetMaxBytes then ui.editBox:SetMaxBytes(0) end
+    ui.editBox:SetFontObject(GameFontHighlightSmall)
+    ui.editBox:SetWidth(660)
+    ui.editBox:SetScript("OnEscapePressed", function(self)
         self:ClearFocus()
         ReportFrame:Hide()
     end)
-    editBox:SetScript("OnChar", function(self)
-        self:SetText(currentPreviewText)
+    ui.editBox:SetScript("OnChar", function(self)
+        self:SetText(ui.currentPreviewText)
     end)
-    scrollFrame:SetScrollChild(editBox)
+    ui.scrollFrame:SetScrollChild(ui.editBox)
 
+    viewBox:EnableMouse(true)
+    viewBox:SetScript("OnMouseDown", function() ui.editBox:SetFocus() end)
+
+    -- Standardized Bottom Bar: Back on BOTTOMLEFT, Footer centered, Select All + Send/Stop on BOTTOMRIGHT
     local btnBack = CreateFrame("Button", nil, ReportFrame, "UIPanelButtonTemplate")
-    btnBack:SetSize(135, 24)
+    btnBack:SetSize(130, 24)
     btnBack:SetPoint("BOTTOMLEFT", ReportFrame, "BOTTOMLEFT", 18, 14)
-    btnBack:SetText("Cancel / Back")
+    btnBack:SetText("Back to Tracker")
     btnBack:SetScript("OnClick", function() CloseAllPanels(); MainTrackerFrame:Show() end)
 
-    local btnSendRaid = CreateFrame("Button", nil, ReportFrame, "UIPanelButtonTemplate")
-    btnSendRaid:SetSize(145, 24)
-    btnSendRaid:SetPoint("LEFT", btnBack, "RIGHT", 10, 0)
-    btnSendRaid:SetText("Send to Raid")
-    btnSendRaid:SetScript("OnClick", function()
-        if #currentRaidChatLines > 0 then
-            EnqueueRaidChatLines(currentRaidChatLines)
-        end
+    ui.btnSendRaid = CreateFrame("Button", nil, ReportFrame, "UIPanelButtonTemplate")
+    ui.btnSendRaid:SetSize(135, 24)
+    ui.btnSendRaid:SetPoint("BOTTOMRIGHT", ReportFrame, "BOTTOMRIGHT", -18, 14)
+    ui.btnSendRaid:SetText("Send to Raid")
+
+    local btnSelectAll = CreateFrame("Button", nil, ReportFrame, "UIPanelButtonTemplate")
+    btnSelectAll:SetSize(105, 24)
+    btnSelectAll:SetPoint("RIGHT", ui.btnSendRaid, "LEFT", -8, 0)
+    btnSelectAll:SetText("Select All")
+    btnSelectAll:SetScript("OnClick", function()
+        ui.editBox:SetFocus()
+        ui.editBox:HighlightText()
     end)
 
     local footerText = ReportFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    footerText:SetPoint("BOTTOMRIGHT", ReportFrame, "BOTTOMRIGHT", -20, 18)
+    footerText:SetPoint("BOTTOM", ReportFrame, "BOTTOM", -25, 18)
     footerText:SetText(GetFooterText())
 
-    local function EscapeHTML(str)
+    ui.UpdateSendRaidButton = function()
+        if RTExt.IsRaidChatQueueActive() then
+            ui.btnSendRaid:SetText("|cffFF4444Stop Sending|r")
+        else
+            ui.btnSendRaid:SetText("Send to Raid")
+        end
+    end
+
+    RTExt.OnRaidChatQueueStateChanged = function()
+        ui.UpdateSendRaidButton()
+    end
+
+    StaticPopupDialogs["RT_CONFIRM_LARGE_RAID_SEND"] = {
+        text = "This report contains %d lines.\n\nAre you sure you want to send it to Raid/Party chat?",
+        button1 = "Send",
+        button2 = "Cancel",
+        OnAccept = function()
+            if RTExt.pendingLargeRaidLines and #RTExt.pendingLargeRaidLines > 0 then
+                local linesToSend = RTExt.pendingLargeRaidLines
+                RTExt.pendingLargeRaidLines = nil
+                EnqueueRaidChatLines(linesToSend)
+                ui.UpdateSendRaidButton()
+            end
+        end,
+        OnCancel = function()
+            RTExt.pendingLargeRaidLines = nil
+        end,
+        timeout = 0,
+        whileDead = true,
+        hideOnEscape = true,
+    }
+
+    ui.btnSendRaid:SetScript("OnClick", function()
+        if RTExt.IsRaidChatQueueActive() then
+            RTExt.StopRaidChatQueue()
+            AnnounceLocalChat("Stopped sending raid chat report.")
+            return
+        end
+        if #ui.currentRaidChatLines == 0 then return end
+        if #ui.currentRaidChatLines > 25 then
+            RTExt.pendingLargeRaidLines = ui.currentRaidChatLines
+            StaticPopup_Show("RT_CONFIRM_LARGE_RAID_SEND", #ui.currentRaidChatLines)
+        else
+            EnqueueRaidChatLines(ui.currentRaidChatLines)
+            ui.UpdateSendRaidButton()
+        end
+    end)
+
+    ui.EscapeHTML = function(str)
         if not str then return "" end
         return str:gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;"):gsub('"', "&quot;")
     end
 
-    local function ConvertWoWColorsToHTML(str)
+    ui.ConvertWoWColorsToHTML = function(str)
         if not str then return "" end
-        local escaped = EscapeHTML(str)
+        local escaped = ui.EscapeHTML(str)
         escaped = escaped:gsub("|c%x%x(%x%x%x%x%x%x)(.-)|r", '<span style="color: #%1; font-weight: bold;">%2</span>')
         escaped = escaped:gsub("|c%x%x%x%x%x%x%x%x", ""):gsub("|r", "")
         return escaped
     end
 
-    local function BuildAllDataPlainLines(seg, presentList, presentMap, deathPlayers, totalSegDeaths, potPlayers, utilPlayers)
+    ui.BuildAllDataPlainLines = function(seg, segDur, presentList, presentMap, deathPlayers, totalSegDeaths, potPlayers, filteredPotByPlayer, utilPlayers, consumablesOnly)
         local rLines = BuildStandardRaidHeaderLines(seg)
         table.insert(rLines, "")
         table.insert(rLines, string.format("--- 1. Characters Present (%d) ---", #presentList))
@@ -4842,14 +5311,14 @@ local function CreateReportFrame()
             end
         end
         table.insert(rLines, "")
-        table.insert(rLines, "--- 3. Potions & Buffs ---")
+        table.insert(rLines, consumablesOnly and "--- 3. Consumables Only ---" or "--- 3. Potions & Buffs ---")
         if #potPlayers == 0 then
             table.insert(rLines, "None")
         else
             for _, pName in ipairs(potPlayers) do
                 local pClass = presentMap[pName] or string.upper(seg.players[pName] or "WARRIOR")
                 table.insert(rLines, string.format("%s (%s)", pName, pClass))
-                for _, cLine in ipairs(BuildCondensedEntryLines(seg.potionsAndBuffs[pName], "- ")) do
+                for _, cLine in ipairs(BuildCondensedEntryLines(filteredPotByPlayer[pName], "- ")) do
                     table.insert(rLines, cLine)
                 end
             end
@@ -4863,7 +5332,8 @@ local function CreateReportFrame()
                 local pClass = presentMap[pName] or string.upper(seg.players[pName] or "WARRIOR")
                 table.insert(rLines, string.format("%s (%s):", pName, pClass))
                 local dpVals = seg.demonicPactValues and seg.demonicPactValues[pName] or nil
-                for _, cLine in ipairs(BuildCondensedEntryLines(seg.raidUtility[pName], "- ", dpVals)) do
+                local dpTimes = seg.demonicPactTimes and seg.demonicPactTimes[pName] or nil
+                for _, cLine in ipairs(BuildCondensedEntryLines(seg.raidUtility[pName], "- ", dpVals, dpTimes, segDur)) do
                     table.insert(rLines, cLine)
                 end
             end
@@ -4871,7 +5341,7 @@ local function CreateReportFrame()
         return rLines
     end
 
-    local function BuildSingleCharacterFails(seg, pName, pClass, segDur, maxPossible30s, enrageStr, totalEnrages, detectedTanks)
+    ui.BuildSingleCharacterFails = function(seg, pName, pClass, segDur, maxPossible30s, enrageStr, totalEnrages, detectedTanks)
         local fails = {}
         local hasFlask, hasFood, potCount = GetPlayerConsumableStatus(seg, pName)
         if not hasFlask then table.insert(fails, { text = "Missing Flask / Elixir", severity = 3 }) end
@@ -4939,81 +5409,138 @@ local function CreateReportFrame()
         return fails
     end
 
-    GenerateReport = function()
+    ui.GenerateReport = function()
         HideAllCustomDropdownMenus()
+        ui.UpdateSendRaidButton()
+
         local activeSession = GetActiveSession()
-        local seg = (activeSession and activeSession.segments or {})[selectedSegmentIndex]
+        local segments = (activeSession and activeSession.segments) or {}
+        if selectedSegmentIndex > #segments then
+            selectedSegmentIndex = math.max(1, #segments)
+        end
+        local seg = segments[selectedSegmentIndex]
 
-        btnPanelAll:UnlockHighlight()
-        btnPanelChar:UnlockHighlight()
-        btnPanelFails:UnlockHighlight()
-        btnPanelDeaths:UnlockHighlight()
-        subFrameAll:Hide()
-        subFrameChar:Hide()
-        subFrameFails:Hide()
-        subFrameInfo:Hide()
+        -- Update top synced context dropdowns
+        RTExt.ApplySessionDropdownDisplay(ui.sessionDropdown)
+        local totalPages = math.max(1, math.ceil(#segments / 25))
+        if segmentPage > totalPages then segmentPage = totalPages end
 
-        if activeReportPanel == "ALL" then
-            btnPanelAll:LockHighlight()
-            subFrameAll:Show()
-        elseif activeReportPanel == "CHAR" then
-            btnPanelChar:LockHighlight()
-            subFrameChar:Show()
-            if activeCharSubMode == "BUFFS" then
-                btnCharBuffs:LockHighlight()
-                btnCharFails:UnlockHighlight()
+        local isSessionWidePotions = (ui.activeReportPanel == "POTIONS" and RTExt.bossPotionsAllFights)
+        if isSessionWidePotions then
+            ui.segmentDropdown:SetText("|cff888888All Boss Fights (Session)|r")
+            ui.segmentDropdown:SetDisabledState(true)
+            ui.btnPrevPage:Disable()
+            ui.btnNextPage:Disable()
+        else
+            ui.segmentDropdown:SetDisabledState(false)
+            if seg then
+                ui.segmentDropdown:SetText(string.format("%s (%s)", seg.name or "TRASH", seg.difficulty or GetRaidDifficultySuffix()))
             else
-                btnCharBuffs:UnlockHighlight()
-                btnCharFails:LockHighlight()
+                ui.segmentDropdown:SetText("No Segments")
             end
-        elseif activeReportPanel == "FAILS" then
-            btnPanelFails:LockHighlight()
-            subFrameFails:Show()
-            btnFailEarly:UnlockHighlight()
-            btnFailSlack:UnlockHighlight()
-            btnFailCds:UnlockHighlight()
-            if activeFailSubMode == "EARLY" then btnFailEarly:LockHighlight()
-            elseif activeFailSubMode == "SLACKERS" then btnFailSlack:LockHighlight()
-            else btnFailCds:LockHighlight() end
-            limitDropdown:SetText(failLineLimit == 9999 and "All lines" or (failLineLimit .. " lines"))
-        elseif activeReportPanel == "DEATHS" then
-            btnPanelDeaths:LockHighlight()
-            subFrameInfo:Show()
-            infoBannerText:SetText("|cffFFFF00Viewing: Chronological Suspicious Deaths Breakdown & Unused Defensives|r")
+            if segmentPage <= 1 then ui.btnPrevPage:Disable() else ui.btnPrevPage:Enable() end
+            if segmentPage >= totalPages then ui.btnNextPage:Disable() else ui.btnNextPage:Enable() end
+        end
+
+        ui.btnPanelAll:UnlockHighlight()
+        ui.btnPanelChar:UnlockHighlight()
+        ui.btnPanelFails:UnlockHighlight()
+        ui.btnPanelDeaths:UnlockHighlight()
+        ui.btnPanelPotions:UnlockHighlight()
+        ui.subFrameAll:Hide()
+        ui.subFrameChar:Hide()
+        ui.subFrameFails:Hide()
+        ui.subFrameDeaths:Hide()
+        ui.subFramePotions:Hide()
+
+        local filterLabel = RTExt.reportConsumablesOnly and "Filter: Consumables Only" or "Filter: Everything"
+        ui.btnAllFilter:SetText(filterLabel)
+        ui.btnCharFilter:SetText(filterLabel)
+
+        if ui.activeReportPanel == "ALL" then
+            ui.btnPanelAll:LockHighlight()
+            ui.subFrameAll:Show()
+        elseif ui.activeReportPanel == "CHAR" then
+            ui.btnPanelChar:LockHighlight()
+            ui.subFrameChar:Show()
+            if ui.activeCharSubMode == "BUFFS" then
+                ui.btnCharBuffs:LockHighlight()
+                ui.btnCharFails:UnlockHighlight()
+                ui.btnCharFilter:Show()
+            else
+                ui.btnCharBuffs:UnlockHighlight()
+                ui.btnCharFails:LockHighlight()
+                ui.btnCharFilter:Hide()
+            end
+        elseif ui.activeReportPanel == "FAILS" then
+            ui.btnPanelFails:LockHighlight()
+            ui.subFrameFails:Show()
+            ui.btnFailEarly:UnlockHighlight()
+            ui.btnFailSlack:UnlockHighlight()
+            ui.btnFailCds:UnlockHighlight()
+            if ui.activeFailSubMode == "EARLY" then ui.btnFailEarly:LockHighlight()
+            elseif ui.activeFailSubMode == "SLACKERS" then ui.btnFailSlack:LockHighlight()
+            else ui.btnFailCds:LockHighlight() end
+            ui.limitDropdown:SetText(ui.failLineLimit == 9999 and "All lines" or (ui.failLineLimit .. " lines"))
+        elseif ui.activeReportPanel == "DEATHS" then
+            ui.btnPanelDeaths:LockHighlight()
+            ui.subFrameDeaths:Show()
+        elseif ui.activeReportPanel == "POTIONS" then
+            ui.btnPanelPotions:LockHighlight()
+            ui.subFramePotions:Show()
+            ui.btnPotionsScope:SetText(RTExt.bossPotionsAllFights and "Scope: All Boss Fights (Session)" or "Scope: Selected Segment")
+        end
+
+        if ui.activeReportPanel == "POTIONS" then
+            local lines
+            if RTExt.bossPotionsAllFights then
+                lines = RTExt.BuildBossPotionsReportLines(activeSession, nil)
+            elseif seg then
+                lines = RTExt.BuildBossPotionsReportLines(activeSession, seg)
+            else
+                lines = { "No Segment Selected" }
+            end
+            ui.currentRaidChatLines = lines
+            ui.currentPreviewText = table.concat(lines, "\n")
+            ui.editBox:SetText(ui.currentPreviewText)
+            if ui.scrollFrame.UpdateScrollChildRect then ui.scrollFrame:UpdateScrollChildRect() end
+            ui.scrollFrame:SetVerticalScroll(0)
+            ui.editBox:ClearFocus()
+            return
         end
 
         if not seg then
-            currentPreviewText = "No Segment Selected"
-            currentRaidChatLines = {}
-            editBox:SetText(currentPreviewText)
+            ui.currentPreviewText = "No Segment Selected"
+            ui.currentRaidChatLines = {}
+            ui.editBox:SetText(ui.currentPreviewText)
             return
         end
 
         local presentList, presentMap = CollectPresentPlayersInSegment(seg)
-        if not selectedReportChar or not presentMap[selectedReportChar] then
-            selectedReportChar = presentList[1]
+        if not ui.selectedReportChar or not presentMap[ui.selectedReportChar] then
+            ui.selectedReportChar = presentList[1]
         end
 
-        charDropdown.getItems = function()
+        ui.charDropdown.getItems = function()
             local items = {}
             for _, pName in ipairs(presentList) do
                 local capturedName = pName
                 local pClass = presentMap[capturedName] or "WARRIOR"
                 table.insert(items, {
                     text = string.format("%s (%s)", capturedName, pClass),
-                    checked = (selectedReportChar == capturedName),
+                    checked = (ui.selectedReportChar == capturedName),
                     func = function()
-                        selectedReportChar = capturedName
-                        GenerateReport()
+                        ui.selectedReportChar = capturedName
+                        ui.GenerateReport()
                     end
                 })
             end
             return items
         end
-        if selectedReportChar then
-            charDropdown:SetText(string.format("%s (%s)", selectedReportChar, presentMap[selectedReportChar] or "WARRIOR"))
+        if ui.selectedReportChar then
+            ui.charDropdown:SetText(string.format("%s (%s)", ui.selectedReportChar, presentMap[ui.selectedReportChar] or "WARRIOR"))
         else
-            charDropdown:SetText("No Characters")
+            ui.charDropdown:SetText("No Characters")
         end
 
         local segDur = GetSegmentDuration(seg)
@@ -5021,7 +5548,7 @@ local function CreateReportFrame()
         local enrageStr, totalEnrages = GetEnrageSummaryString(seg)
         local detectedTanks = DetectSegmentTanks(seg, presentMap)
 
-        if activeReportPanel == "ALL" then
+        if ui.activeReportPanel == "ALL" then
             local deathPlayers = {}
             local totalSegDeaths = 0
             for pName, dList in pairs(seg.deaths or {}) do
@@ -5036,8 +5563,13 @@ local function CreateReportFrame()
             end)
 
             local potPlayers = {}
+            local filteredPotByPlayer = {}
             for pName, entries in pairs(seg.potionsAndBuffs or {}) do
-                if next(entries) ~= nil then table.insert(potPlayers, pName) end
+                local eff = RTExt.FilterPotionsAndBuffsMap(entries, RTExt.reportConsumablesOnly)
+                if next(eff) ~= nil then
+                    filteredPotByPlayer[pName] = eff
+                    table.insert(potPlayers, pName)
+                end
             end
             table.sort(potPlayers)
 
@@ -5047,22 +5579,22 @@ local function CreateReportFrame()
             end
             table.sort(utilPlayers)
 
-            currentRaidChatLines = BuildAllDataPlainLines(seg, presentList, presentMap, deathPlayers, totalSegDeaths, potPlayers, utilPlayers)
+            ui.currentRaidChatLines = ui.BuildAllDataPlainLines(seg, segDur, presentList, presentMap, deathPlayers, totalSegDeaths, potPlayers, filteredPotByPlayer, utilPlayers, RTExt.reportConsumablesOnly)
 
             local segZone = seg.zone or GetCurrentZoneSafe()
             local segDiff = seg.difficulty or GetRaidDifficultySuffix()
             local segName = seg.name or "TRASH"
             local header = string.format("[%s %s] - %s (Full Segment Report)", segZone, segDiff, segName)
 
-            if activeAllFormat == "HTML" then
+            if ui.activeAllFormat == "HTML" then
                 local lines = {
                     "<!DOCTYPE html>", "<html>", "<head>", '  <meta charset="UTF-8">',
-                    "  <title>Raiders Tracker by Copper - " .. EscapeHTML(header) .. "</title>",
+                    "  <title>Raiders Tracker by Copper - " .. ui.EscapeHTML(header) .. "</title>",
                     "</head>",
                     '<body style="background-color: #141419; color: #E0E0E0; font-family: Arial, Helvetica, sans-serif; line-height: 1.5; padding: 20px;">',
                     '  <h1 style="color: #00FF00; margin-bottom: 4px;">Raiders Tracker by Copper</h1>',
-                    string.format('  <p style="margin-top: 0; margin-bottom: 18px;">%s<a href="%s" target="_blank" style="color: #69CCF0; text-decoration: underline;">%s</a></p>', (GetAddonVersion() ~= "" and ("Version " .. EscapeHTML(GetAddonVersion()) .. " &mdash; ") or ""), GITHUB_URL, GITHUB_URL),
-                    string.format('  <h1 style="color: #FFFFFF; border-bottom: 1px solid #444444; padding-bottom: 6px;">%s</h1>', EscapeHTML(header)),
+                    string.format('  <p style="margin-top: 0; margin-bottom: 18px;">%s<a href="%s" target="_blank" style="color: #69CCF0; text-decoration: underline;">%s</a></p>', (GetAddonVersion() ~= "" and ("Version " .. ui.EscapeHTML(GetAddonVersion()) .. " &mdash; ") or ""), GITHUB_URL, GITHUB_URL),
+                    string.format('  <h1 style="color: #FFFFFF; border-bottom: 1px solid #444444; padding-bottom: 6px;">%s</h1>', ui.EscapeHTML(header)),
                     string.format('  <h1 style="color: #FFD100; font-size: 1.35em; margin-top: 24px;">1. Characters Present (%d)</h1>', #presentList),
                     "  <ul>"
                 }
@@ -5072,7 +5604,7 @@ local function CreateReportFrame()
                     for _, pName in ipairs(presentList) do
                         local pClass = presentMap[pName] or "WARRIOR"
                         local hexColor = GetPlayerClassColor(pClass)
-                        table.insert(lines, string.format('    <li><span style="color: #%s; font-weight: bold;">%s</span> (%s)</li>', hexColor, EscapeHTML(pName), EscapeHTML(pClass)))
+                        table.insert(lines, string.format('    <li><span style="color: #%s; font-weight: bold;">%s</span> (%s)</li>', hexColor, ui.EscapeHTML(pName), ui.EscapeHTML(pClass)))
                     end
                 end
                 table.insert(lines, "  </ul>")
@@ -5086,7 +5618,7 @@ local function CreateReportFrame()
                         local pClass = presentMap[pName] or string.upper(GetSafePlayerClass(pName))
                         local hexColor = GetPlayerClassColor(pClass)
                         local deathWord = (dPlayer.count == 1) and "Death" or "Deaths"
-                        table.insert(lines, string.format('    <li><span style="color: #%s; font-weight: bold;">%s</span> (%s) &mdash; <span style="color: #FFFF00; font-weight: bold;">%d %s</span>', hexColor, EscapeHTML(pName), EscapeHTML(pClass), dPlayer.count, deathWord))
+                        table.insert(lines, string.format('    <li><span style="color: #%s; font-weight: bold;">%s</span> (%s) &mdash; <span style="color: #FFFF00; font-weight: bold;">%d %s</span>', hexColor, ui.EscapeHTML(pName), ui.EscapeHTML(pClass), dPlayer.count, deathWord))
                         table.insert(lines, "      <ul>")
                         for idx, d in ipairs(dPlayer.list) do
                             local killer = StripColorCodes(d.killer or "Unknown Mob")
@@ -5100,7 +5632,7 @@ local function CreateReportFrame()
                             if overkill > 0 then dmgText = string.format("%d dmg (%d overkill)", amount, overkill) end
                             table.insert(lines, string.format(
                                 '        <li>%d. [%s] Killed by <span style="color: #FFFF00;">%s</span> | Ability: <span style="color: #FFD100;">%s</span> | Damage: <span style="color: #FFFF00;">%s</span></li>',
-                                idx, EscapeHTML(stamp), EscapeHTML(killer), EscapeHTML(ability), EscapeHTML(dmgText)
+                                idx, ui.EscapeHTML(stamp), ui.EscapeHTML(killer), ui.EscapeHTML(ability), ui.EscapeHTML(dmgText)
                             ))
                         end
                         table.insert(lines, "      </ul>")
@@ -5108,7 +5640,9 @@ local function CreateReportFrame()
                     end
                 end
                 table.insert(lines, "  </ul>")
-                table.insert(lines, '  <h1 style="color: #FFD100; font-size: 1.35em; margin-top: 24px;">3. Potions &amp; Buffs</h1>')
+                table.insert(lines, RTExt.reportConsumablesOnly
+                    and '  <h1 style="color: #FFD100; font-size: 1.35em; margin-top: 24px;">3. Consumables Only</h1>'
+                    or '  <h1 style="color: #FFD100; font-size: 1.35em; margin-top: 24px;">3. Potions &amp; Buffs</h1>')
                 table.insert(lines, "  <ul>")
                 if #potPlayers == 0 then
                     table.insert(lines, "    <li>None</li>")
@@ -5116,15 +5650,15 @@ local function CreateReportFrame()
                     for _, pName in ipairs(potPlayers) do
                         local pClass = presentMap[pName] or string.upper(seg.players[pName] or "WARRIOR")
                         local hexColor = GetPlayerClassColor(pClass)
-                        table.insert(lines, string.format('    <li><span style="color: #%s; font-weight: bold;">%s</span> (%s)', hexColor, EscapeHTML(pName), EscapeHTML(pClass)))
+                        table.insert(lines, string.format('    <li><span style="color: #%s; font-weight: bold;">%s</span> (%s)', hexColor, ui.EscapeHTML(pName), ui.EscapeHTML(pClass)))
                         table.insert(lines, "      <ul>")
                         local sortedEntries = {}
-                        for buffName, count in pairs(seg.potionsAndBuffs[pName]) do
+                        for buffName, count in pairs(filteredPotByPlayer[pName]) do
                             table.insert(sortedEntries, { rawName = buffName, cleanName = StripColorCodes(buffName), count = count })
                         end
                         table.sort(sortedEntries, function(a, b) return a.cleanName < b.cleanName end)
                         for _, entry in ipairs(sortedEntries) do
-                            table.insert(lines, string.format('        <li>%s: <span style="color: #00FF00; font-weight: bold;">%d</span></li>', ConvertWoWColorsToHTML(entry.rawName), entry.count))
+                            table.insert(lines, string.format('        <li>%s: <span style="color: #00FF00; font-weight: bold;">%d</span></li>', ui.ConvertWoWColorsToHTML(entry.rawName), entry.count))
                         end
                         table.insert(lines, "      </ul>")
                         table.insert(lines, "    </li>")
@@ -5139,7 +5673,7 @@ local function CreateReportFrame()
                     for _, pName in ipairs(utilPlayers) do
                         local pClass = presentMap[pName] or string.upper(seg.players[pName] or "WARRIOR")
                         local hexColor = GetPlayerClassColor(pClass)
-                        table.insert(lines, string.format('    <li><span style="color: #%s; font-weight: bold;">%s</span> (%s)', hexColor, EscapeHTML(pName), EscapeHTML(pClass)))
+                        table.insert(lines, string.format('    <li><span style="color: #%s; font-weight: bold;">%s</span> (%s)', hexColor, ui.EscapeHTML(pName), ui.EscapeHTML(pClass)))
                         table.insert(lines, "      <ul>")
                         local sortedEntries = {}
                         for utilName, count in pairs(seg.raidUtility[pName]) do
@@ -5147,11 +5681,14 @@ local function CreateReportFrame()
                         end
                         table.sort(sortedEntries, function(a, b) return a.cleanName < b.cleanName end)
                         local dpVals = seg.demonicPactValues and seg.demonicPactValues[pName] or nil
+                        local dpTimes = seg.demonicPactTimes and seg.demonicPactTimes[pName] or nil
                         for _, entry in ipairs(sortedEntries) do
                             if entry.cleanName == "Demonic Pact" and type(dpVals) == "table" and #dpVals > 0 then
-                                table.insert(lines, string.format('        <li>Demonic Pact (<span style="color: #00FF00; font-weight: bold;">%d</span>): %s</li>', #dpVals, EscapeHTML(table.concat(dpVals, ", "))))
+                                local summaryText = RTExt.FormatDemonicPactSummaryLine("", dpVals, dpTimes, segDur, entry.count)
+                                local summaryHtml = summaryText and ('<br><span style="color: #AAAAAA; font-size: 0.9em;">' .. ui.EscapeHTML(summaryText) .. '</span>') or ""
+                                table.insert(lines, string.format('        <li>Demonic Pact (<span style="color: #00FF00; font-weight: bold;">%d</span>): %s%s</li>', #dpVals, ui.EscapeHTML(table.concat(dpVals, ", ")), summaryHtml))
                             else
-                                table.insert(lines, string.format('        <li>%s: <span style="color: #00FF00; font-weight: bold;">%d</span></li>', ConvertWoWColorsToHTML(entry.rawName), entry.count))
+                                table.insert(lines, string.format('        <li>%s: <span style="color: #00FF00; font-weight: bold;">%d</span></li>', ui.ConvertWoWColorsToHTML(entry.rawName), entry.count))
                             end
                         end
                         table.insert(lines, "      </ul>")
@@ -5161,9 +5698,9 @@ local function CreateReportFrame()
                 table.insert(lines, "  </ul>")
                 table.insert(lines, "</body>")
                 table.insert(lines, "</html>")
-                currentPreviewText = table.concat(lines, "\n")
+                ui.currentPreviewText = table.concat(lines, "\n")
 
-            elseif activeAllFormat == "DISCORD" then
+            elseif ui.activeAllFormat == "DISCORD" then
                 local lines = {
                     string.format("=== Raiders Tracker%s by %s ===", RTExt.GetVersionTag(), AUTHOR),
                     GITHUB_URL,
@@ -5203,14 +5740,14 @@ local function CreateReportFrame()
                     end
                 end
                 table.insert(lines, "")
-                table.insert(lines, "--- 3. Potions & Buffs ---")
+                table.insert(lines, RTExt.reportConsumablesOnly and "--- 3. Consumables Only ---" or "--- 3. Potions & Buffs ---")
                 if #potPlayers == 0 then
                     table.insert(lines, "None")
                 else
                     for _, pName in ipairs(potPlayers) do
                         local pClass = presentMap[pName] or string.upper(seg.players[pName] or "WARRIOR")
                         table.insert(lines, string.format("**%s (%s)**", pName, pClass))
-                        for _, cLine in ipairs(BuildCondensedEntryLines(seg.potionsAndBuffs[pName], "- ")) do
+                        for _, cLine in ipairs(BuildCondensedEntryLines(filteredPotByPlayer[pName], "- ")) do
                             table.insert(lines, cLine)
                         end
                     end
@@ -5224,34 +5761,37 @@ local function CreateReportFrame()
                         local pClass = presentMap[pName] or string.upper(seg.players[pName] or "WARRIOR")
                         table.insert(lines, string.format("**%s (%s):**", pName, pClass))
                         local dpVals = seg.demonicPactValues and seg.demonicPactValues[pName] or nil
-                        for _, cLine in ipairs(BuildCondensedEntryLines(seg.raidUtility[pName], "- ", dpVals)) do
+                        local dpTimes = seg.demonicPactTimes and seg.demonicPactTimes[pName] or nil
+                        for _, cLine in ipairs(BuildCondensedEntryLines(seg.raidUtility[pName], "- ", dpVals, dpTimes, segDur)) do
                             table.insert(lines, cLine)
                         end
                     end
                 end
-                currentPreviewText = table.concat(lines, "\n")
+                ui.currentPreviewText = table.concat(lines, "\n")
             else
-                currentPreviewText = table.concat(currentRaidChatLines, "\n")
+                ui.currentPreviewText = table.concat(ui.currentRaidChatLines, "\n")
             end
 
-        elseif activeReportPanel == "CHAR" then
+        elseif ui.activeReportPanel == "CHAR" then
             local lines = BuildStandardRaidHeaderLines(seg)
-            if not selectedReportChar then
+            if not ui.selectedReportChar then
                 table.insert(lines, "No Character Selected in Segment.")
             else
-                local pName = selectedReportChar
+                local pName = ui.selectedReportChar
                 local pClass = presentMap[pName] or string.upper(GetSafePlayerClass(pName))
-                if activeCharSubMode == "BUFFS" then
+                if ui.activeCharSubMode == "BUFFS" then
                     table.insert(lines, string.format("--- Character Buffs & Utility: %s (%s) ---", pName, pClass))
-                    local potLines = BuildCondensedEntryLines((seg.potionsAndBuffs or {})[pName], "- ")
-                    table.insert(lines, "[Potions & Buffs]")
+                    local filteredPots = RTExt.FilterPotionsAndBuffsMap((seg.potionsAndBuffs or {})[pName], RTExt.reportConsumablesOnly)
+                    local potLines = BuildCondensedEntryLines(filteredPots, "- ")
+                    table.insert(lines, RTExt.reportConsumablesOnly and "[Consumables Only]" or "[Potions & Buffs]")
                     if #potLines == 0 then
                         table.insert(lines, "- None recorded")
                     else
                         for _, l in ipairs(potLines) do table.insert(lines, l) end
                     end
                     local dpVals = seg.demonicPactValues and seg.demonicPactValues[pName] or nil
-                    local utilLines = BuildCondensedEntryLines((seg.raidUtility or {})[pName], "- ", dpVals)
+                    local dpTimes = seg.demonicPactTimes and seg.demonicPactTimes[pName] or nil
+                    local utilLines = BuildCondensedEntryLines((seg.raidUtility or {})[pName], "- ", dpVals, dpTimes, segDur)
                     table.insert(lines, "[Raid Utility Used]")
                     if #utilLines == 0 then
                         table.insert(lines, "- None recorded")
@@ -5260,7 +5800,7 @@ local function CreateReportFrame()
                     end
                 else
                     table.insert(lines, string.format("--- Character Fails Report: %s (%s) ---", pName, pClass))
-                    local fails = BuildSingleCharacterFails(seg, pName, pClass, segDur, maxPossible30s, enrageStr, totalEnrages, detectedTanks)
+                    local fails = ui.BuildSingleCharacterFails(seg, pName, pClass, segDur, maxPossible30s, enrageStr, totalEnrages, detectedTanks)
                     if #fails == 0 then
                         table.insert(lines, "- No fails recorded for this player.")
                     else
@@ -5270,17 +5810,17 @@ local function CreateReportFrame()
                     end
                 end
             end
-            currentRaidChatLines = lines
-            currentPreviewText = table.concat(lines, "\n")
+            ui.currentRaidChatLines = lines
+            ui.currentPreviewText = table.concat(lines, "\n")
 
-        elseif activeReportPanel == "FAILS" then
+        elseif ui.activeReportPanel == "FAILS" then
             local lines = BuildStandardRaidHeaderLines(seg)
             local allSegDeaths = {}
             for _, dList in pairs(seg.deaths or {}) do
                 for _, d in ipairs(dList or {}) do table.insert(allSegDeaths, d) end
             end
 
-            if activeFailSubMode == "EARLY" then
+            if ui.activeFailSubMode == "EARLY" then
                 table.insert(lines, "--- Raid Fails: Early Deaths ---")
                 local maxTime = segDur * 0.75
                 local earlyDeaths = {}
@@ -5309,7 +5849,7 @@ local function CreateReportFrame()
                 if #earlyDeaths == 0 then
                     table.insert(lines, "None (No early deaths recorded)")
                 else
-                    local count = math.min(#earlyDeaths, failLineLimit)
+                    local count = math.min(#earlyDeaths, ui.failLineLimit)
                     for idx = 1, count do
                         local d = earlyDeaths[idx]
                         local pullStr = FormatPullTime(d.pullTime)
@@ -5318,7 +5858,7 @@ local function CreateReportFrame()
                     end
                 end
 
-            elseif activeFailSubMode == "SLACKERS" then
+            elseif ui.activeFailSubMode == "SLACKERS" then
                 table.insert(lines, "--- Raid Fails: Consumable Slackers ---")
                 local slackers = {}
                 for _, pName in ipairs(presentList) do
@@ -5342,7 +5882,7 @@ local function CreateReportFrame()
                 if #slackers == 0 then
                     table.insert(lines, "None (All raiders fully consumed)")
                 else
-                    local count = math.min(#slackers, failLineLimit)
+                    local count = math.min(#slackers, ui.failLineLimit)
                     for idx = 1, count do
                         table.insert(lines, slackers[idx].text)
                     end
@@ -5391,17 +5931,17 @@ local function CreateReportFrame()
                 if #cdFails == 0 then
                     table.insert(lines, "None (No critical cooldown or duty fails recorded)")
                 else
-                    local count = math.min(#cdFails, failLineLimit)
+                    local count = math.min(#cdFails, ui.failLineLimit)
                     for idx = 1, count do
                         table.insert(lines, cdFails[idx].text)
                     end
                 end
             end
 
-            currentRaidChatLines = lines
-            currentPreviewText = table.concat(lines, "\n")
+            ui.currentRaidChatLines = lines
+            ui.currentPreviewText = table.concat(lines, "\n")
 
-        elseif activeReportPanel == "DEATHS" then
+        elseif ui.activeReportPanel == "DEATHS" then
             local lines = BuildStandardRaidHeaderLines(seg)
             table.insert(lines, "--- Chronological Suspicious Deaths Breakdown ---")
             local allSegDeaths = {}
@@ -5454,49 +5994,50 @@ local function CreateReportFrame()
                 end
             end
 
-            currentRaidChatLines = lines
-            currentPreviewText = table.concat(lines, "\n")
+            ui.currentRaidChatLines = lines
+            ui.currentPreviewText = table.concat(lines, "\n")
         end
 
-        editBox:SetText(currentPreviewText)
-        if scrollFrame.UpdateScrollChildRect then
-            scrollFrame:UpdateScrollChildRect()
+        ui.editBox:SetText(ui.currentPreviewText)
+        if ui.scrollFrame.UpdateScrollChildRect then
+            ui.scrollFrame:UpdateScrollChildRect()
         end
-        scrollFrame:SetVerticalScroll(0)
-        editBox:ClearFocus()
+        ui.scrollFrame:SetVerticalScroll(0)
+        ui.editBox:ClearFocus()
     end
 
-    btnPanelAll:SetScript("OnClick", function() activeReportPanel = "ALL"; GenerateReport() end)
-    btnPanelChar:SetScript("OnClick", function() activeReportPanel = "CHAR"; GenerateReport() end)
-    btnPanelFails:SetScript("OnClick", function() activeReportPanel = "FAILS"; GenerateReport() end)
-    btnPanelDeaths:SetScript("OnClick", function() activeReportPanel = "DEATHS"; GenerateReport() end)
+    ui.btnPanelAll:SetScript("OnClick", function() ui.activeReportPanel = "ALL"; ui.GenerateReport() end)
+    ui.btnPanelChar:SetScript("OnClick", function() ui.activeReportPanel = "CHAR"; ui.GenerateReport() end)
+    ui.btnPanelFails:SetScript("OnClick", function() ui.activeReportPanel = "FAILS"; ui.GenerateReport() end)
+    ui.btnPanelDeaths:SetScript("OnClick", function() ui.activeReportPanel = "DEATHS"; ui.GenerateReport() end)
+    ui.btnPanelPotions:SetScript("OnClick", function() ui.activeReportPanel = "POTIONS"; ui.GenerateReport() end)
 
-    btnFailEarly:SetScript("OnClick", function() activeFailSubMode = "EARLY"; GenerateReport() end)
-    btnFailSlack:SetScript("OnClick", function() activeFailSubMode = "SLACKERS"; GenerateReport() end)
-    btnFailCds:SetScript("OnClick", function() activeFailSubMode = "FAILS"; GenerateReport() end)
+    ui.btnFailEarly:SetScript("OnClick", function() ui.activeFailSubMode = "EARLY"; ui.GenerateReport() end)
+    ui.btnFailSlack:SetScript("OnClick", function() ui.activeFailSubMode = "SLACKERS"; ui.GenerateReport() end)
+    ui.btnFailCds:SetScript("OnClick", function() ui.activeFailSubMode = "FAILS"; ui.GenerateReport() end)
 
-    chkPlain:SetScript("OnClick", function()
-        activeAllFormat = "PLAIN"
-        chkPlain:SetChecked(true); chkDiscord:SetChecked(false); chkHTML:SetChecked(false)
-        GenerateReport()
+    ui.chkPlain:SetScript("OnClick", function()
+        ui.activeAllFormat = "PLAIN"
+        ui.chkPlain:SetChecked(true); ui.chkDiscord:SetChecked(false); ui.chkHTML:SetChecked(false)
+        ui.GenerateReport()
     end)
 
-    chkDiscord:SetScript("OnClick", function()
-        activeAllFormat = "DISCORD"
-        chkPlain:SetChecked(false); chkDiscord:SetChecked(true); chkHTML:SetChecked(false)
-        GenerateReport()
+    ui.chkDiscord:SetScript("OnClick", function()
+        ui.activeAllFormat = "DISCORD"
+        ui.chkPlain:SetChecked(false); ui.chkDiscord:SetChecked(true); ui.chkHTML:SetChecked(false)
+        ui.GenerateReport()
     end)
 
-    chkHTML:SetScript("OnClick", function()
-        activeAllFormat = "HTML"
-        chkPlain:SetChecked(false); chkDiscord:SetChecked(false); chkHTML:SetChecked(true)
-        GenerateReport()
+    ui.chkHTML:SetScript("OnClick", function()
+        ui.activeAllFormat = "HTML"
+        ui.chkPlain:SetChecked(false); ui.chkDiscord:SetChecked(false); ui.chkHTML:SetChecked(true)
+        ui.GenerateReport()
     end)
 
-    btnCharBuffs:SetScript("OnClick", function() activeCharSubMode = "BUFFS"; GenerateReport() end)
-    btnCharFails:SetScript("OnClick", function() activeCharSubMode = "FAILS"; GenerateReport() end)
+    ui.btnCharBuffs:SetScript("OnClick", function() ui.activeCharSubMode = "BUFFS"; ui.GenerateReport() end)
+    ui.btnCharFails:SetScript("OnClick", function() ui.activeCharSubMode = "FAILS"; ui.GenerateReport() end)
 
-    ReportFrame:SetScript("OnShow", GenerateReport)
+    ReportFrame:SetScript("OnShow", ui.GenerateReport)
 end
 
 -------------------------------------------------------------------------------
@@ -5536,7 +6077,7 @@ local function CreateConfigFrame()
 
     local btnBack = CreateFrame("Button", nil, ConfigFrame, "UIPanelButtonTemplate")
     btnBack:SetSize(130, 24)
-    btnBack:SetPoint("BOTTOM", ConfigFrame, "BOTTOM", 0, 14)
+    btnBack:SetPoint("BOTTOMLEFT", ConfigFrame, "BOTTOMLEFT", 18, 14)
     btnBack:SetText("Back to Tracker")
     btnBack:SetScript("OnClick", function() CloseAllPanels(); MainTrackerFrame:Show() end)
 
@@ -6099,13 +6640,27 @@ function RTExt.CollectUnitsForDemonicPactCheck(pending)
 end
 
 function RTExt.GetDemonicPactAuraTiming(pending)
-    local unitsToCheck = RTExt.CollectUnitsForDemonicPactCheck(pending)
+    local unitsToCheck = {}
+    local seen = {}
+    local function AddUnit(u)
+        if u and not seen[u] and UnitExists(u) then
+            seen[u] = true
+            table.insert(unitsToCheck, u)
+        end
+    end
+    -- Check "player" first because 3.3.5a always reports real duration/expirationTime on "player"
+    AddUnit("player")
+    AddUnit(pending.ownerUnit)
+    for _, u in ipairs(RTExt.CollectUnitsForDemonicPactCheck(pending)) do
+        AddUnit(u)
+    end
+
     local function FindTiming(strictCaster)
         for _, u in ipairs(unitsToCheck) do
             for i = 1, 40 do
                 local buffName, _, _, _, _, duration, expirationTime, unitCaster, _, _, bSpellID = UnitBuff(u, i)
                 if not buffName then break end
-                if RTExt.IsDemonicPactRaidBuff(bSpellID, buffName) then
+                if RTExt.IsDemonicPactRaidBuff(bSpellID, buffName) and expirationTime and expirationTime > 0 then
                     local casterOwner = unitCaster and RTExt.OwnerInfoFromCasterUnit(unitCaster) or nil
                     local matches = false
                     if strictCaster then
@@ -6147,7 +6702,7 @@ function RTExt.ScanRaidForDemonicPactSP(pending)
     return nil
 end
 
-function RTExt.ResolveDemonicPactSpellPower(pending)
+function RTExt.ResolveDemonicPactSpellPower(pending, isFinalAttempt)
     -- Priority 1: Exact value synced from the Warlock whose pet procced DP via addon channel
     if pending.syncedSP and pending.syncedSP > 0 then
         RTExt.activeObservedDP = pending.syncedSP
@@ -6164,8 +6719,9 @@ function RTExt.ResolveDemonicPactSpellPower(pending)
             local preSP = pending.preSP or postSP
             if not pending.hadDPBefore then
                 local delta = postSP - preSP
+                local effectiveDelta = delta + (pending.preTotemSP or 0)
                 local expectedFromPre = math.floor(preSP * pct + 0.5)
-                if preSP > 0 and expectedFromPre > 0 and delta >= math.floor(expectedFromPre * 0.70) and delta <= math.ceil(expectedFromPre * 1.35) then
+                if preSP > 0 and expectedFromPre > 0 and effectiveDelta >= math.floor(expectedFromPre * 0.70) and effectiveDelta <= math.ceil(expectedFromPre * 1.35) then
                     spValue = expectedFromPre
                     RTExt.playerSelfDPContribution = spValue
                 else
@@ -6209,6 +6765,9 @@ function RTExt.ResolveDemonicPactSpellPower(pending)
                 return RTExt.activeObservedDP
             end
         elseif (RTExt.activeObservedDP or 0) > 0 then
+            if delta == 0 and not isFinalAttempt then
+                return nil
+            end
             local candidate = RTExt.activeObservedDP + delta
             if candidate > 0 and candidate < 2500 then
                 RTExt.activeObservedDP = math.floor(candidate + 0.5)
@@ -6313,6 +6872,13 @@ function RTExt.RecordDemonicPactProc(pending, spValue)
     targetSegment.demonicPactValues[ownerName] = targetSegment.demonicPactValues[ownerName] or {}
     table.insert(targetSegment.demonicPactValues[ownerName], recordedSP)
 
+    if targetSegment.isBoss and bossStartTime and bossStartTime > 0 then
+        local procPullTime = math.max(0, math.floor((pending.createdAt or GetTime()) - bossStartTime))
+        targetSegment.demonicPactTimes = targetSegment.demonicPactTimes or {}
+        targetSegment.demonicPactTimes[ownerName] = targetSegment.demonicPactTimes[ownerName] or {}
+        table.insert(targetSegment.demonicPactTimes[ownerName], procPullTime)
+    end
+
     if pending.isPrePull and not inCombatState then
         table.insert(recentPrePullEvents, {
             category = "UTILITY",
@@ -6359,8 +6925,9 @@ function RTExt.OnDemonicPactWatcherUpdate(self, elapsed)
             if isDuplicateAura then
                 table.remove(list, i)
             else
-                local sp = RTExt.ResolveDemonicPactSpellPower(pending)
-                if (sp and sp > 0) or now >= pending.maxWaitAt then
+                local isFinalAttempt = (now >= pending.maxWaitAt)
+                local sp = RTExt.ResolveDemonicPactSpellPower(pending, isFinalAttempt)
+                if (sp and sp > 0) or isFinalAttempt then
                     table.remove(list, i)
                     RTExt.lastDemonicPactConfirmedAt[ownerName] = now
                     RTExt.recentDemonicPact[ownerName] = now
@@ -6498,7 +7065,6 @@ eventHandler:SetScript("OnEvent", function(self, event, ...)
             InitializeDB()
             CreateMinimapButton()
             CreateMainTrackerFrame()
-            RTExt.CreatePotionsFrame()
             CreateCharacterFrame()
             RTExt.CreateCharacterExportFrame()
             CreateReportFrame()
