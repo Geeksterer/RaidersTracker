@@ -1,6 +1,6 @@
 # Raiders Tracker (WoW 3.3.5a)
 
-**Raiders Tracker (v1.3.0 by Copper)** is an all-in-one raid performance, utility, consumable, fail-analysis, attendance, and death-tracking addon built specifically for **World of Warcraft: Wrath of the Lich King (3.3.5a)**.
+**Raiders Tracker (v1.3.1 by Copper)** is an all-in-one raid performance, utility, consumable, fail-analysis, attendance, and death-tracking addon built specifically for **World of Warcraft: Wrath of the Lich King (3.3.5a)**.
 
 Leading a 10-man or 25-man raid takes enough focus without having to dig through raw combat logs mid-run to see who pre-potted, what spellpower and uptime your Demonology Warlock's Demonic Pact gave the raid, whether a tank used a defensive cooldown, which Rogue slacked on Tricks of the Trade, which Hunter missed a Tranquilizing Shot, or what actually killed someone on a wipe. **Raiders Tracker** automatically segments your raid into Trash and Boss pulls, snapshots your roster's buffs, tracks group-only per-zone attendance time, and organizes potions, procs, class utility, raid fails, and detailed death logs into clean, consistently laid-out in-game panels—complete with a 5-tab **Reports Hub** (with synced Session/Segment dropdowns, **Boss Potions**, throttled **Raid Chat** broadcasting with safety confirmations, **Discord Markdown**, and **HTML Export**) plus an advanced **Player Blacklist System** with permanent character ID fingerprinting and secure Base64/XML import & export.
 
