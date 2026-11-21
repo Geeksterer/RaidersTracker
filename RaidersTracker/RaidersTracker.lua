@@ -354,6 +354,70 @@ local function EnqueueRaidChatLines(rawLines)
     end
 end
 
+RTExt.raidSendButtons = {}
+
+function RTExt.UpdateAllRaidSendButtons()
+    local active = RTExt.IsRaidChatQueueActive()
+    for _, btn in ipairs(RTExt.raidSendButtons) do
+        if btn and btn.SetText then
+            if active then
+                btn:SetText("|cffFF4444Stop Sending|r")
+            else
+                btn:SetText("Send to Raid")
+            end
+        end
+    end
+end
+
+function RTExt.RegisterRaidSendButton(btn)
+    if not btn then return end
+    for _, existing in ipairs(RTExt.raidSendButtons) do
+        if existing == btn then return end
+    end
+    table.insert(RTExt.raidSendButtons, btn)
+    RTExt.UpdateAllRaidSendButtons()
+end
+
+RTExt.OnRaidChatQueueStateChanged = function()
+    RTExt.UpdateAllRaidSendButtons()
+end
+
+StaticPopupDialogs["RT_CONFIRM_LARGE_RAID_SEND"] = {
+    text = "This report contains %d lines.\n\nAre you sure you want to send it to Raid/Party chat?",
+    button1 = "Send",
+    button2 = "Cancel",
+    OnAccept = function()
+        if RTExt.pendingLargeRaidLines and #RTExt.pendingLargeRaidLines > 0 then
+            local linesToSend = RTExt.pendingLargeRaidLines
+            RTExt.pendingLargeRaidLines = nil
+            EnqueueRaidChatLines(linesToSend)
+            RTExt.UpdateAllRaidSendButtons()
+        end
+    end,
+    OnCancel = function()
+        RTExt.pendingLargeRaidLines = nil
+    end,
+    timeout = 0,
+    whileDead = true,
+    hideOnEscape = true,
+}
+
+function RTExt.TriggerSendToRaid(lines)
+    if RTExt.IsRaidChatQueueActive() then
+        RTExt.StopRaidChatQueue()
+        AnnounceLocalChat("Stopped sending raid chat report.")
+        return
+    end
+    if not lines or #lines == 0 then return end
+    if #lines > 25 then
+        RTExt.pendingLargeRaidLines = lines
+        StaticPopup_Show("RT_CONFIRM_LARGE_RAID_SEND", #lines)
+    else
+        EnqueueRaidChatLines(lines)
+        RTExt.UpdateAllRaidSendButtons()
+    end
+end
+
 -------------------------------------------------------------------------------
 -- Zone Retrieval, Raid Size/Difficulty & Roster Utilities
 -------------------------------------------------------------------------------
@@ -369,22 +433,45 @@ end
 
 local function GetRaidDifficultySuffix()
     local inInstance, instanceType = IsInInstance()
-    local _, instType, difficultyIndex, difficultyName, maxPlayers, dynamicDifficulty = GetInstanceInfo()
+    local _, instType, difficultyIndex, difficultyName, maxPlayers, dynamicDifficulty, isDynamic = GetInstanceInfo()
     local instDiff = GetInstanceDifficulty and GetInstanceDifficulty() or nil
     local raidDiff = GetRaidDifficulty and GetRaidDifficulty() or nil
     local dungDiff = GetDungeonDifficulty and GetDungeonDifficulty() or nil
     local diffText = difficultyName or ""
 
     if inInstance and (instType == "raid" or instanceType == "raid") then
-        local is25 = (maxPlayers == 25) or (difficultyIndex == 2) or (difficultyIndex == 4)
-            or (instDiff == 2) or (instDiff == 4) or (raidDiff == 2) or (raidDiff == 4)
-            or (diffText:find("25") ~= nil)
-        local isHeroic = (dynamicDifficulty == 1) or (difficultyIndex == 3) or (difficultyIndex == 4)
-            or (instDiff == 3) or (instDiff == 4) or (raidDiff == 3) or (raidDiff == 4)
-            or (diffText:find("Heroic") ~= nil)
+        local is25
+        if maxPlayers and maxPlayers > 0 then
+            is25 = (maxPlayers == 25)
+        elseif difficultyIndex and difficultyIndex > 0 then
+            is25 = (difficultyIndex == 2) or (difficultyIndex == 4)
+        elseif instDiff and instDiff > 0 then
+            is25 = (instDiff == 2) or (instDiff == 4)
+        else
+            is25 = (diffText:find("25") ~= nil)
+        end
+
+        local isHeroic
+        if isDynamic then
+            isHeroic = (dynamicDifficulty == 1)
+        elseif difficultyIndex and difficultyIndex > 0 then
+            isHeroic = (difficultyIndex == 3) or (difficultyIndex == 4)
+        elseif instDiff and instDiff > 0 then
+            isHeroic = (instDiff == 3) or (instDiff == 4)
+        else
+            isHeroic = (diffText:find("Heroic") ~= nil)
+        end
+
         if is25 then return isHeroic and "25HC" or "25N" else return isHeroic and "10HC" or "10N" end
     elseif inInstance and (instType == "party" or instanceType == "party") then
-        local isHeroicParty = (difficultyIndex == 2) or (instDiff == 2) or (dungDiff == 2) or (diffText:find("Heroic") ~= nil)
+        local isHeroicParty
+        if difficultyIndex and difficultyIndex > 0 then
+            isHeroicParty = (difficultyIndex == 2)
+        elseif instDiff and instDiff > 0 then
+            isHeroicParty = (instDiff == 2)
+        else
+            isHeroicParty = (diffText:find("Heroic") ~= nil)
+        end
         return isHeroicParty and "5HC" or "5N"
     end
 
@@ -934,25 +1021,52 @@ function RTExt.ExportBlacklistToBase64XML()
     return RTExt.Base64Encode(xmlStr), exportedCount
 end
 
-function RTExt.BuildBlacklistPlainText()
+function RTExt.BuildBlacklistReportSpec()
     local items = RTExt.CollectSortedBlacklistItems()
-    local lines = {
-        string.format("=== Raiders Tracker%s by %s - Player Blacklist ===", RTExt.GetVersionTag(), AUTHOR),
-        string.format("Total Blacklisted: %d", #items),
-        ""
-    }
-    if #items == 0 then
-        table.insert(lines, "No players currently blacklisted.")
-    else
-        for idx, item in ipairs(items) do
-            local dateSuffix = (item.date ~= "") and (" (" .. item.date .. ")") or ""
-            table.insert(lines, string.format(
+    local rowItems = {}
+    for idx, item in ipairs(items) do
+        local dateSuffix = (item.date ~= "") and (" (" .. item.date .. ")") or ""
+        local classHex = (item.class and item.class ~= "UNKNOWN") and GetPlayerClassColor(item.class) or "FFFF00"
+        table.insert(rowItems, {
+            plain = string.format(
                 "%d. [ID: %s] Names: %s%s - Reason: %s%s",
                 idx, item.id, item.namesStr, item.classStr, item.reason, dateSuffix
-            ))
-        end
+            ),
+            discord = string.format(
+                "%d. `[ID: %s]` **%s**%s - Reason: *%s*%s",
+                idx, item.id, item.namesStr, item.classStr, item.reason, dateSuffix
+            ),
+            html = string.format(
+                '%d. <span style="color: #00FF00;">[ID: %s]</span> <span style="color: #%s; font-weight: bold;">%s</span>%s &mdash; Reason: <span style="color: #FFD100;">%s</span>%s',
+                idx, RTExt.EscapeHTML(item.id), classHex, RTExt.EscapeHTML(item.namesStr), RTExt.EscapeHTML(item.classStr), RTExt.EscapeHTML(item.reason), RTExt.EscapeHTML(dateSuffix)
+            ),
+        })
     end
-    return table.concat(lines, "\n")
+
+    return {
+        plainTitle = string.format("=== Raiders Tracker%s by %s - Player Blacklist ===", RTExt.GetVersionTag(), AUTHOR),
+        discordTitle = string.format("## Raiders Tracker%s by %s - Player Blacklist", RTExt.GetVersionTag(), AUTHOR),
+        htmlHeading = "Player Blacklist",
+        metaLines = {
+            {
+                plain = string.format("Total Blacklisted: %d", #items),
+                discord = string.format("**Total Blacklisted:** %d", #items),
+                html = string.format('<strong>Total Blacklisted:</strong> %d', #items),
+            }
+        },
+        sections = {
+            {
+                title = string.format("Blacklisted Players (%d)", #items),
+                emptyText = "No players currently blacklisted.",
+                items = rowItems,
+            }
+        }
+    }
+end
+
+function RTExt.BuildBlacklistPlainText(lineLimit)
+    local preview = RTExt.RenderStandardReport(RTExt.BuildBlacklistReportSpec(), "PLAIN", lineLimit or 9999)
+    return preview
 end
 
 function RTExt.ParseStrictXMLAttributes(attrText)
@@ -2784,7 +2898,7 @@ function RTExt.FilterPotionsAndBuffsMap(entryMap, consumablesOnly)
     return filtered
 end
 
-function RTExt.BuildBossPotionsReportLines(activeSession, selectedSegOnly)
+function RTExt.BuildBossPotionsReportSpec(activeSession, selectedSegOnly)
     local sessionName = (activeSession and activeSession.name) or "Live Current Session"
     local segsToScan = {}
     local isSingleSeg = (selectedSegOnly ~= nil)
@@ -2845,21 +2959,45 @@ function RTExt.BuildBossPotionsReportLines(activeSession, selectedSegOnly)
         end
     end
 
-    local lines = {
-        string.format("=== Raiders Tracker%s by %s - Boss Potions Summary ===", RTExt.GetVersionTag(), AUTHOR),
-        string.format("Session: %s", sessionName),
+    local metaLines = {
+        {
+            plain = string.format("Session: %s", sessionName),
+            discord = string.format("**Session:** %s", sessionName),
+            html = string.format("<strong>Session:</strong> %s", RTExt.EscapeHTML(sessionName)),
+        }
     }
 
+    local htmlHeading
     if isSingleSeg then
         local segName = selectedSegOnly.name or "TRASH"
         local segDiff = selectedSegOnly.difficulty or GetRaidDifficultySuffix()
-        table.insert(lines, string.format("Scope: Selected Segment - %s (%s)", segName, segDiff))
+        htmlHeading = string.format("Boss Potions Summary - %s (%s)", segName, segDiff)
+        table.insert(metaLines, {
+            plain = string.format("Scope: Selected Segment - %s (%s)", segName, segDiff),
+            discord = string.format("**Scope:** Selected Segment - %s (%s)", segName, segDiff),
+            html = string.format("<strong>Scope:</strong> Selected Segment &mdash; %s (%s)", RTExt.EscapeHTML(segName), RTExt.EscapeHTML(segDiff)),
+        })
     else
-        table.insert(lines, string.format("Total Boss Fights: %d (%d Victories, %d Wipes/Attempts)", totalFights, victories, wipes))
+        htmlHeading = string.format("Boss Potions Summary - %s", sessionName)
+        table.insert(metaLines, {
+            plain = string.format("Total Boss Fights: %d (%d Victories, %d Wipes/Attempts)", totalFights, victories, wipes),
+            discord = string.format("**Total Boss Fights:** %d (%d Victories, %d Wipes/Attempts)", totalFights, victories, wipes),
+            html = string.format("<strong>Total Boss Fights:</strong> %d (%d Victories, %d Wipes/Attempts)", totalFights, victories, wipes),
+        })
         if totalFights == 0 then
-            table.insert(lines, "")
-            table.insert(lines, "No boss fights recorded in this session yet.")
-            return lines
+            return {
+                plainTitle = string.format("=== Raiders Tracker%s by %s - Boss Potions Summary ===", RTExt.GetVersionTag(), AUTHOR),
+                discordTitle = string.format("## Raiders Tracker%s by %s - Boss Potions Summary", RTExt.GetVersionTag(), AUTHOR),
+                htmlHeading = htmlHeading,
+                metaLines = metaLines,
+                sections = {
+                    {
+                        title = "Boss Potions Breakdown",
+                        emptyText = "No boss fights recorded in this session yet.",
+                        items = {},
+                    }
+                }
+            }
         end
     end
 
@@ -2878,42 +3016,63 @@ function RTExt.BuildBossPotionsReportLines(activeSession, selectedSegOnly)
         return a.name < b.name
     end)
 
-    table.insert(lines, string.format("Total Players: %d | Total Potions Used: %d", #sortedPlayers, grandTotalPotions))
-    table.insert(lines, "")
+    table.insert(metaLines, {
+        plain = string.format("Total Players: %d / Total Potions Used: %d", #sortedPlayers, grandTotalPotions),
+        discord = string.format("**Total Players:** %d | **Total Potions Used:** %d", #sortedPlayers, grandTotalPotions),
+        html = string.format("<strong>Total Players:</strong> %d | <strong>Total Potions Used:</strong> %d", #sortedPlayers, grandTotalPotions),
+    })
 
-    if #sortedPlayers == 0 then
-        table.insert(lines, isSingleSeg and "No players recorded in this segment yet." or "No players recorded in boss fights yet.")
-    else
-        for idx, p in ipairs(sortedPlayers) do
-            local itemNames = {}
-            for itemName in pairs(p.items) do
-                table.insert(itemNames, itemName)
+    local rowItems = {}
+    for idx, p in ipairs(sortedPlayers) do
+        local itemNames = {}
+        for itemName in pairs(p.items) do
+            table.insert(itemNames, itemName)
+        end
+        table.sort(itemNames)
+        local detailStr = "None"
+        if #itemNames > 0 then
+            local parts = {}
+            for _, itemName in ipairs(itemNames) do
+                table.insert(parts, string.format("%s: %d", itemName, p.items[itemName]))
             end
-            table.sort(itemNames)
-            local detailStr = "None"
-            if #itemNames > 0 then
-                local parts = {}
-                for _, itemName in ipairs(itemNames) do
-                    table.insert(parts, string.format("%s: %d", itemName, p.items[itemName]))
-                end
-                detailStr = table.concat(parts, ", ")
-            end
-            if isSingleSeg then
-                table.insert(lines, string.format(
-                    "%d. %s (%s) - %d total (%s)",
-                    idx, p.name, p.class, p.total, detailStr
-                ))
-            else
-                local fightWord = (p.fights == 1) and "fight" or "fights"
-                table.insert(lines, string.format(
-                    "%d. %s (%s) - %d total [%d/%d %s] (%s)",
-                    idx, p.name, p.class, p.total, p.fights, totalFights, fightWord, detailStr
-                ))
-            end
+            detailStr = table.concat(parts, ", ")
+        end
+        local nameHtml = RTExt.FormatClassHTML(p.name, p.class)
+        local totalColor = (p.total > 0) and "#00FF00" or "#FF6666"
+        if isSingleSeg then
+            table.insert(rowItems, {
+                plain = string.format("%d. %s (%s) - %d total (%s)", idx, p.name, p.class, p.total, detailStr),
+                discord = string.format("%d. **%s (%s)** - **%d** total (%s)", idx, p.name, p.class, p.total, detailStr),
+                html = string.format('%d. %s (%s) &mdash; <span style="color: %s; font-weight: bold;">%d total</span> (%s)', idx, nameHtml, RTExt.EscapeHTML(p.class), totalColor, p.total, RTExt.EscapeHTML(detailStr)),
+            })
+        else
+            local fightWord = (p.fights == 1) and "fight" or "fights"
+            table.insert(rowItems, {
+                plain = string.format("%d. %s (%s) - %d total [%d/%d %s] (%s)", idx, p.name, p.class, p.total, p.fights, totalFights, fightWord, detailStr),
+                discord = string.format("%d. **%s (%s)** - **%d** total [%d/%d %s] (%s)", idx, p.name, p.class, p.total, p.fights, totalFights, fightWord, detailStr),
+                html = string.format('%d. %s (%s) &mdash; <span style="color: %s; font-weight: bold;">%d total</span> [%d/%d %s] (%s)', idx, nameHtml, RTExt.EscapeHTML(p.class), totalColor, p.total, p.fights, totalFights, fightWord, RTExt.EscapeHTML(detailStr)),
+            })
         end
     end
 
-    return lines
+    return {
+        plainTitle = string.format("=== Raiders Tracker%s by %s - Boss Potions Summary ===", RTExt.GetVersionTag(), AUTHOR),
+        discordTitle = string.format("## Raiders Tracker%s by %s - Boss Potions Summary", RTExt.GetVersionTag(), AUTHOR),
+        htmlHeading = htmlHeading,
+        metaLines = metaLines,
+        sections = {
+            {
+                title = string.format("Potions Used (%d Players)", #sortedPlayers),
+                emptyText = isSingleSeg and "No players recorded in this segment yet." or "No players recorded in boss fights yet.",
+                items = rowItems,
+            }
+        }
+    }
+end
+
+function RTExt.BuildBossPotionsReportLines(activeSession, selectedSegOnly, lineLimit)
+    local _, plainLines = RTExt.RenderStandardReport(RTExt.BuildBossPotionsReportSpec(activeSession, selectedSegOnly), "PLAIN", lineLimit or 9999)
+    return plainLines
 end
 
 local function BuildCondensedEntryLines(entryMap, indentPrefix, dpValues, dpTimes, segDur)
@@ -3315,6 +3474,359 @@ StaticPopupDialogs["RT_REFRESH_ON_GROUP_JOIN"] = {
     whileDead = true,
     hideOnEscape = true,
 }
+
+-------------------------------------------------------------------------------
+-- Standardized Output Engine (Raw Text, Discord Markdown, HTML & Raid Chat)
+-------------------------------------------------------------------------------
+function RTExt.EscapeHTML(str)
+    if not str then return "" end
+    return tostring(str):gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;"):gsub('"', "&quot;")
+end
+
+function RTExt.ConvertWoWColorsToHTML(str)
+    if not str then return "" end
+    local escaped = RTExt.EscapeHTML(str)
+    escaped = escaped:gsub("|c%x%x(%x%x%x%x%x%x)(.-)|r", '<span style="color: #%1; font-weight: bold;">%2</span>')
+    escaped = escaped:gsub("|c%x%x%x%x%x%x%x%x", ""):gsub("|r", "")
+    return escaped
+end
+
+function RTExt.FormatClassHTML(name, pClass)
+    local hexColor = GetPlayerClassColor(pClass)
+    return string.format('<span style="color: #%s; font-weight: bold;">%s</span>', hexColor, RTExt.EscapeHTML(name))
+end
+
+function RTExt.GetLineLimitLabel(limit)
+    if not limit or limit >= 9999 then return "All lines" end
+    return tostring(limit) .. " lines"
+end
+
+function RTExt.CreateOutputOptionsBar(parent, width, topOffsetY, state, onChanged)
+    local bar = CreateFrame("Frame", nil, parent)
+    bar:SetSize(width, 26)
+    bar:SetPoint("TOPLEFT", parent, "TOPLEFT", 18, topOffsetY)
+
+    local chkPlain = CreateFrame("CheckButton", nil, bar, "UICheckButtonTemplate")
+    chkPlain:SetPoint("LEFT", bar, "LEFT", 0, 0)
+    chkPlain.text = chkPlain:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    chkPlain.text:SetPoint("LEFT", chkPlain, "RIGHT", 2, 0)
+    chkPlain.text:SetText("Raw Text")
+
+    local chkDiscord = CreateFrame("CheckButton", nil, bar, "UICheckButtonTemplate")
+    chkDiscord:SetPoint("LEFT", chkPlain.text, "RIGHT", 12, 0)
+    chkDiscord.text = chkDiscord:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    chkDiscord.text:SetPoint("LEFT", chkDiscord, "RIGHT", 2, 0)
+    chkDiscord.text:SetText("Discord Markdown")
+
+    local chkHTML = CreateFrame("CheckButton", nil, bar, "UICheckButtonTemplate")
+    chkHTML:SetPoint("LEFT", chkDiscord.text, "RIGHT", 12, 0)
+    chkHTML.text = chkHTML:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    chkHTML.text:SetPoint("LEFT", chkHTML, "RIGHT", 2, 0)
+    chkHTML.text:SetText("HTML Output")
+
+    local limitDropdown = CreateCustomDropdown(bar, 100, 22)
+    limitDropdown:SetPoint("RIGHT", bar, "RIGHT", 0, 0)
+
+    local limitLabel = bar:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    limitLabel:SetPoint("RIGHT", limitDropdown, "LEFT", -6, 0)
+    limitLabel:SetText("Lines:")
+
+    function bar:SyncFromState()
+        local fmt = state.getFormat() or "PLAIN"
+        chkPlain:SetChecked(fmt == "PLAIN")
+        chkDiscord:SetChecked(fmt == "DISCORD")
+        chkHTML:SetChecked(fmt == "HTML")
+        limitDropdown:SetText(RTExt.GetLineLimitLabel(state.getLineLimit()))
+    end
+
+    limitDropdown.getItems = function()
+        local cur = state.getLineLimit() or 9999
+        return {
+            { text = "5 lines", checked = (cur == 5), func = function() state.setLineLimit(5); bar:SyncFromState(); if onChanged then onChanged() end end },
+            { text = "10 lines", checked = (cur == 10), func = function() state.setLineLimit(10); bar:SyncFromState(); if onChanged then onChanged() end end },
+            { text = "20 lines", checked = (cur == 20), func = function() state.setLineLimit(20); bar:SyncFromState(); if onChanged then onChanged() end end },
+            { text = "All lines", checked = (cur == 9999), func = function() state.setLineLimit(9999); bar:SyncFromState(); if onChanged then onChanged() end end },
+        }
+    end
+
+    chkPlain:SetScript("OnClick", function()
+        HideAllCustomDropdownMenus()
+        state.setFormat("PLAIN")
+        bar:SyncFromState()
+        if onChanged then onChanged() end
+    end)
+
+    chkDiscord:SetScript("OnClick", function()
+        HideAllCustomDropdownMenus()
+        state.setFormat("DISCORD")
+        bar:SyncFromState()
+        if onChanged then onChanged() end
+    end)
+
+    chkHTML:SetScript("OnClick", function()
+        HideAllCustomDropdownMenus()
+        state.setFormat("HTML")
+        bar:SyncFromState()
+        if onChanged then onChanged() end
+    end)
+
+    bar.chkPlain = chkPlain
+    bar.chkDiscord = chkDiscord
+    bar.chkHTML = chkHTML
+    bar.limitDropdown = limitDropdown
+    bar:SyncFromState()
+    return bar
+end
+
+function RTExt.BuildCondensedEntryItems(entryMap, dpValues, dpTimes, segDur)
+    if not entryMap or next(entryMap) == nil then return {} end
+    local grouped, groupOrder = {}, {}
+    for rawKey, count in pairs(entryMap) do
+        local c = tonumber(count) or 0
+        if c > 0 then
+            local clean = StripColorCodes(rawKey)
+            local base, target = clean:match("^(.-)%s*%[(.-)%]$")
+            if base and target then
+                if not grouped[base] then
+                    grouped[base] = { total = 0, targets = {}, targetCount = 0, isTargeted = true, rawTargets = {} }
+                    table.insert(groupOrder, base)
+                end
+                grouped[base].total = grouped[base].total + c
+                if not grouped[base].targets[target] then
+                    grouped[base].targetCount = grouped[base].targetCount + 1
+                end
+                grouped[base].targets[target] = (grouped[base].targets[target] or 0) + c
+                grouped[base].rawTargets[target] = rawKey
+            else
+                if not grouped[clean] then
+                    grouped[clean] = { total = 0, targets = {}, targetCount = 0, isTargeted = false, rawKey = rawKey }
+                    table.insert(groupOrder, clean)
+                end
+                grouped[clean].total = grouped[clean].total + c
+            end
+        end
+    end
+    table.sort(groupOrder)
+    local out = {}
+    for _, base in ipairs(groupOrder) do
+        local info = grouped[base]
+        if info.isTargeted then
+            if base == "Power Word: Shield" or info.targetCount > 3 then
+                local noun = (info.targetCount == 1) and "target" or "targets"
+                table.insert(out, {
+                    plain = string.format("- %s: %d casts (across %d %s)", base, info.total, info.targetCount, noun),
+                    discord = string.format("- %s: **%d** casts (across %d %s)", base, info.total, info.targetCount, noun),
+                    html = string.format('%s: <span style="color: #00FF00; font-weight: bold;">%d</span> casts (across %d %s)', RTExt.EscapeHTML(base), info.total, info.targetCount, noun),
+                })
+            else
+                local tNames = {}
+                for tName in pairs(info.targets) do table.insert(tNames, tName) end
+                table.sort(tNames)
+                for _, tName in ipairs(tNames) do
+                    local cnt = info.targets[tName]
+                    local rawLbl = info.rawTargets[tName] or (base .. " [" .. tName .. "]")
+                    table.insert(out, {
+                        plain = string.format("- %s [%s]: %d", base, tName, cnt),
+                        discord = string.format("- %s [%s]: **%d**", base, tName, cnt),
+                        html = string.format('%s: <span style="color: #00FF00; font-weight: bold;">%d</span>', RTExt.ConvertWoWColorsToHTML(rawLbl), cnt),
+                    })
+                end
+            end
+        elseif base == "Demonic Pact" and type(dpValues) == "table" and #dpValues > 0 then
+            local summary = RTExt.FormatDemonicPactSummaryLine("", dpValues, dpTimes, segDur, info.total)
+            local valsStr = table.concat(dpValues, ", ")
+            local summaryHtml = summary and ('<br><span style="color: #AAAAAA; font-size: 0.9em;">' .. RTExt.EscapeHTML(summary) .. '</span>') or ""
+            table.insert(out, {
+                plain = RTExt.FormatDemonicPactLine("- ", dpValues, info.total),
+                extraPlain = summary and ("  " .. summary) or nil,
+                discord = string.format("- **Demonic Pact (%d):** %s", #dpValues, valsStr),
+                extraDiscord = summary and ("  *" .. summary .. "*") or nil,
+                html = string.format('Demonic Pact (<span style="color: #00FF00; font-weight: bold;">%d</span>): %s%s', #dpValues, RTExt.EscapeHTML(valsStr), summaryHtml),
+            })
+        else
+            table.insert(out, {
+                plain = string.format("- %s: %d", base, info.total),
+                discord = string.format("- %s: **%d**", base, info.total),
+                html = string.format('%s: <span style="color: #00FF00; font-weight: bold;">%d</span>', RTExt.ConvertWoWColorsToHTML(info.rawKey or base), info.total),
+            })
+        end
+    end
+    return out
+end
+
+function RTExt.RenderStandardReport(spec, outputFormat, lineLimit)
+    local fmt = outputFormat or "PLAIN"
+    local limit = tonumber(lineLimit) or 9999
+    local remaining = limit
+    local wasTruncated = false
+    local limitedSections = {}
+
+    for _, sec in ipairs(spec.sections or {}) do
+        local items = sec.items or {}
+        if #items == 0 then
+            if not wasTruncated then
+                table.insert(limitedSections, { title = sec.title, emptyText = sec.emptyText, items = {}, originalCount = 0 })
+            end
+        elseif remaining <= 0 then
+            wasTruncated = true
+        else
+            local newSec = { title = sec.title, emptyText = sec.emptyText, items = {}, originalCount = #items, truncated = false }
+            for _, item in ipairs(items) do
+                if remaining <= 0 then
+                    wasTruncated = true
+                    newSec.truncated = true
+                    break
+                end
+                remaining = remaining - 1
+                local copyItem = {
+                    plain = item.plain,
+                    discord = item.discord or item.plain,
+                    html = item.html or RTExt.EscapeHTML(item.plain or ""),
+                    extraPlain = item.extraPlain,
+                    extraDiscord = item.extraDiscord,
+                }
+                if item.subitems and #item.subitems > 0 then
+                    copyItem.subitems = {}
+                    for _, sub in ipairs(item.subitems) do
+                        if remaining <= 0 then
+                            wasTruncated = true
+                            newSec.truncated = true
+                            break
+                        end
+                        remaining = remaining - 1
+                        table.insert(copyItem.subitems, sub)
+                    end
+                end
+                table.insert(newSec.items, copyItem)
+            end
+            if #newSec.items > 0 then
+                table.insert(limitedSections, newSec)
+            end
+        end
+    end
+
+    local function GetSectionTitle(sec)
+        if not sec.title then return nil end
+        if sec.truncated and #(spec.sections or {}) == 1 then
+            return string.format("%s (Showing %d of %d)", sec.title, #sec.items, sec.originalCount)
+        end
+        return sec.title
+    end
+
+    local plainLines = {
+        spec.plainTitle or string.format("=== Raiders Tracker%s by %s ===", RTExt.GetVersionTag(), AUTHOR),
+        GITHUB_URL,
+    }
+    for _, m in ipairs(spec.metaLines or {}) do
+        table.insert(plainLines, m.plain)
+    end
+    if wasTruncated and #(spec.sections or {}) > 1 then
+        table.insert(plainLines, string.format("(Output limited to %d lines)", limit))
+    end
+    for _, sec in ipairs(limitedSections) do
+        local sTitle = GetSectionTitle(sec)
+        table.insert(plainLines, "")
+        if sTitle then
+            table.insert(plainLines, string.format("--- %s ---", sTitle))
+        end
+        if #sec.items == 0 then
+            table.insert(plainLines, sec.emptyText or "None")
+        else
+            for _, item in ipairs(sec.items) do
+                table.insert(plainLines, item.plain)
+                if item.extraPlain then table.insert(plainLines, item.extraPlain) end
+                for _, sub in ipairs(item.subitems or {}) do
+                    table.insert(plainLines, sub.plain)
+                    if sub.extraPlain then table.insert(plainLines, sub.extraPlain) end
+                end
+            end
+        end
+    end
+
+    if fmt == "PLAIN" then
+        return table.concat(plainLines, "\n"), plainLines
+    end
+
+    if fmt == "DISCORD" then
+        local dLines = {
+            spec.discordTitle or string.format("## Raiders Tracker%s by %s", RTExt.GetVersionTag(), AUTHOR),
+            "<" .. GITHUB_URL .. ">",
+        }
+        for _, m in ipairs(spec.metaLines or {}) do
+            table.insert(dLines, m.discord or m.plain)
+        end
+        if wasTruncated and #(spec.sections or {}) > 1 then
+            table.insert(dLines, string.format("*(Output limited to %d lines)*", limit))
+        end
+        for _, sec in ipairs(limitedSections) do
+            local sTitle = GetSectionTitle(sec)
+            table.insert(dLines, "")
+            if sTitle then
+                table.insert(dLines, "### " .. sTitle)
+            end
+            if #sec.items == 0 then
+                table.insert(dLines, "*" .. (sec.emptyText or "None") .. "*")
+            else
+                for _, item in ipairs(sec.items) do
+                    table.insert(dLines, item.discord)
+                    if item.extraDiscord then table.insert(dLines, item.extraDiscord) end
+                    for _, sub in ipairs(item.subitems or {}) do
+                        table.insert(dLines, sub.discord or sub.plain)
+                        if sub.extraDiscord then table.insert(dLines, sub.extraDiscord) end
+                    end
+                end
+            end
+        end
+        return table.concat(dLines, "\n"), plainLines
+    end
+
+    local ver = GetAddonVersion()
+    local verPrefix = (ver ~= "") and ("Version " .. RTExt.EscapeHTML(ver) .. " &mdash; ") or ""
+    local htmlHeading = spec.htmlHeading or ADDON_NAME
+    local hLines = {
+        "<!DOCTYPE html>", "<html>", "<head>", '  <meta charset="UTF-8">',
+        "  <title>Raiders Tracker by " .. RTExt.EscapeHTML(AUTHOR) .. " - " .. RTExt.EscapeHTML(htmlHeading) .. "</title>",
+        "</head>",
+        '<body style="background-color: #141419; color: #E0E0E0; font-family: Arial, Helvetica, sans-serif; line-height: 1.5; padding: 20px;">',
+        '  <h1 style="color: #00FF00; margin-bottom: 4px;">Raiders Tracker by ' .. RTExt.EscapeHTML(AUTHOR) .. '</h1>',
+        string.format('  <p style="margin-top: 0; margin-bottom: 14px;">%s<a href="%s" target="_blank" style="color: #69CCF0; text-decoration: underline;">%s</a></p>', verPrefix, GITHUB_URL, GITHUB_URL),
+        string.format('  <h2 style="color: #FFFFFF; border-bottom: 1px solid #444444; padding-bottom: 6px;">%s</h2>', RTExt.EscapeHTML(htmlHeading)),
+    }
+    for _, m in ipairs(spec.metaLines or {}) do
+        table.insert(hLines, '  <p style="margin: 2px 0; color: #CCCCCC;">' .. (m.html or RTExt.EscapeHTML(m.plain)) .. '</p>')
+    end
+    if wasTruncated and #(spec.sections or {}) > 1 then
+        table.insert(hLines, string.format('  <p style="color: #AAAAAA; font-style: italic;">Output limited to %d lines.</p>', limit))
+    end
+    for _, sec in ipairs(limitedSections) do
+        local sTitle = GetSectionTitle(sec)
+        if sTitle then
+            table.insert(hLines, string.format('  <h3 style="color: #FFD100; margin-top: 20px;">%s</h3>', RTExt.EscapeHTML(sTitle)))
+        end
+        table.insert(hLines, "  <ul>")
+        if #sec.items == 0 then
+            table.insert(hLines, "    <li>" .. RTExt.EscapeHTML(sec.emptyText or "None") .. "</li>")
+        else
+            for _, item in ipairs(sec.items) do
+                if item.subitems and #item.subitems > 0 then
+                    table.insert(hLines, "    <li>" .. item.html)
+                    table.insert(hLines, "      <ul>")
+                    for _, sub in ipairs(item.subitems) do
+                        table.insert(hLines, "        <li>" .. (sub.html or RTExt.EscapeHTML(sub.plain or "")) .. "</li>")
+                    end
+                    table.insert(hLines, "      </ul>")
+                    table.insert(hLines, "    </li>")
+                else
+                    table.insert(hLines, "    <li>" .. item.html .. "</li>")
+                end
+            end
+        end
+        table.insert(hLines, "  </ul>")
+    end
+    table.insert(hLines, "</body>")
+    table.insert(hLines, "</html>")
+    return table.concat(hLines, "\n"), plainLines
+end
 
 -------------------------------------------------------------------------------
 -- Minimap Icon Construction
@@ -4080,16 +4592,21 @@ function RTExt.CreateBlacklistImportFrame()
 end
 
 function RTExt.CreateBlacklistTextFrame()
-    local frame = CreateRUTPanel("RTBlacklistTextFrame", 620, 440, "Copy Blacklist as Text")
+    local frame = CreateRUTPanel("RTBlacklistTextFrame", 640, 480, "Copy Blacklist as Text")
     RTExt.BlacklistTextFrame = frame
 
-    local currentText = ""
+    local ui = {
+        outputFormat = "PLAIN",
+        lineLimit = 9999,
+        currentText = "",
+        currentRaidChatLines = {},
+    }
 
     local infoLabel = frame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    infoLabel:SetPoint("TOPLEFT", frame, "TOPLEFT", 18, -36)
-    infoLabel:SetText("Plain-text blacklist ready to copy (Ctrl+A, Ctrl+C):")
+    infoLabel:SetPoint("TOPLEFT", frame, "TOPLEFT", 18, -34)
+    infoLabel:SetText("Select output format & line limit, then Ctrl+A / Ctrl+C or Send to Raid:")
 
-    local viewBox = CreateWhiteBorderViewBox(frame, -58, 46)
+    local viewBox = CreateWhiteBorderViewBox(frame, -82, 46)
 
     local scrollFrame = CreateFrame("ScrollFrame", "RTBlacklistTextScrollFrame", viewBox, "UIPanelScrollFrameTemplate")
     scrollFrame:SetPoint("TOPLEFT", viewBox, "TOPLEFT", 8, -8)
@@ -4101,35 +4618,68 @@ function RTExt.CreateBlacklistTextFrame()
     if editBox.SetMaxLetters then editBox:SetMaxLetters(0) end
     if editBox.SetMaxBytes then editBox:SetMaxBytes(0) end
     editBox:SetFontObject(GameFontHighlightSmall)
-    editBox:SetWidth(540)
-    editBox:SetHeight(290)
+    editBox:SetWidth(560)
+    editBox:SetHeight(310)
     editBox:SetScript("OnEscapePressed", function(self)
         self:ClearFocus()
         frame:Hide()
     end)
     editBox:SetScript("OnChar", function(self)
-        self:SetText(currentText)
+        self:SetText(ui.currentText)
     end)
     scrollFrame:SetScrollChild(editBox)
 
     viewBox:EnableMouse(true)
     viewBox:SetScript("OnMouseDown", function() editBox:SetFocus() end)
 
+    ui.RefreshOutput = function(highlight)
+        local preview, raidLines = RTExt.RenderStandardReport(RTExt.BuildBlacklistReportSpec(), ui.outputFormat, ui.lineLimit)
+        ui.currentText = preview or ""
+        ui.currentRaidChatLines = raidLines or {}
+        editBox:SetText(ui.currentText)
+        if scrollFrame.UpdateScrollChildRect then scrollFrame:UpdateScrollChildRect() end
+        scrollFrame:SetVerticalScroll(0)
+        if highlight then
+            editBox:SetFocus()
+            editBox:HighlightText()
+        else
+            editBox:ClearFocus()
+        end
+    end
+
+    ui.outputBar = RTExt.CreateOutputOptionsBar(frame, 604, -52, {
+        getFormat = function() return ui.outputFormat end,
+        setFormat = function(v) ui.outputFormat = v end,
+        getLineLimit = function() return ui.lineLimit end,
+        setLineLimit = function(v) ui.lineLimit = v end,
+    }, function()
+        ui.RefreshOutput(false)
+    end)
+
     local btnBackBL = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
-    btnBackBL:SetSize(135, 24)
+    btnBackBL:SetSize(125, 24)
     btnBackBL:SetPoint("BOTTOMLEFT", frame, "BOTTOMLEFT", 18, 14)
     btnBackBL:SetText("Back to Blacklist")
     btnBackBL:SetScript("OnClick", function() CloseAllPanels(); BlacklistFrame:Show() end)
 
     local btnBackTracker = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
-    btnBackTracker:SetSize(130, 24)
-    btnBackTracker:SetPoint("LEFT", btnBackBL, "RIGHT", 8, 0)
+    btnBackTracker:SetSize(115, 24)
+    btnBackTracker:SetPoint("LEFT", btnBackBL, "RIGHT", 6, 0)
     btnBackTracker:SetText("Back to Tracker")
     btnBackTracker:SetScript("OnClick", function() CloseAllPanels(); MainTrackerFrame:Show() end)
 
+    local btnSendRaid = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
+    btnSendRaid:SetSize(115, 24)
+    btnSendRaid:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", -18, 14)
+    btnSendRaid:SetText("Send to Raid")
+    btnSendRaid:SetScript("OnClick", function()
+        RTExt.TriggerSendToRaid(ui.currentRaidChatLines)
+    end)
+    RTExt.RegisterRaidSendButton(btnSendRaid)
+
     local btnSelectAll = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
-    btnSelectAll:SetSize(115, 24)
-    btnSelectAll:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", -18, 14)
+    btnSelectAll:SetSize(95, 24)
+    btnSelectAll:SetPoint("RIGHT", btnSendRaid, "LEFT", -6, 0)
     btnSelectAll:SetText("Select All")
     btnSelectAll:SetScript("OnClick", function()
         editBox:SetFocus()
@@ -4137,12 +4687,10 @@ function RTExt.CreateBlacklistTextFrame()
     end)
 
     frame:SetScript("OnShow", function()
-        currentText = RTExt.BuildBlacklistPlainText()
-        editBox:SetText(currentText)
-        if scrollFrame.UpdateScrollChildRect then scrollFrame:UpdateScrollChildRect() end
-        scrollFrame:SetVerticalScroll(0)
-        editBox:SetFocus()
-        editBox:HighlightText()
+        HideAllCustomDropdownMenus()
+        RTExt.UpdateAllRaidSendButtons()
+        ui.outputBar:SyncFromState()
+        ui.RefreshOutput(true)
     end)
 end
 
@@ -4780,17 +5328,102 @@ local function CreateCharacterFrame()
     CharacterFrame:SetScript("OnHide", function() blacklistMenu:Hide() end)
 end
 
+function RTExt.BuildCharacterExportReportSpec()
+    local activeSession = GetActiveSession()
+    local majZone = RTExt.activeMajorityRaidZone
+    if not majZone or majZone == "" then
+        majZone = RTExt.GetMajorityRaidZone(activeSession)
+        RTExt.activeMajorityRaidZone = majZone
+    end
+
+    local playerMap = {}
+    for pName, pClass in pairs((activeSession and activeSession.players) or {}) do
+        playerMap[pName] = pClass
+    end
+    if activeSession and activeSession.zoneTimes then
+        for pName in pairs(activeSession.zoneTimes) do
+            if not playerMap[pName] then
+                playerMap[pName] = GetSafePlayerClass(pName)
+            end
+        end
+    end
+    for _, seg in ipairs((activeSession and activeSession.segments) or {}) do
+        for pName, pClass in pairs(seg.players or {}) do
+            playerMap[pName] = pClass
+        end
+    end
+
+    local activeCount = RTExt.CountActiveSessionPlayers(activeSession, playerMap)
+
+    local sortedPlayers = {}
+    for pName in pairs(playerMap) do table.insert(sortedPlayers, pName) end
+    table.sort(sortedPlayers)
+
+    local sessionName = (activeSession and activeSession.name) or "Live Current Session"
+    local zoneName = majZone or "Unknown"
+
+    local rowItems = {}
+    for _, pName in ipairs(sortedPlayers) do
+        local pClass = string.upper(playerMap[pName] or "WARRIOR")
+        local zoneSecs = 0
+        if activeSession and activeSession.zoneTimes and activeSession.zoneTimes[pName] and majZone then
+            zoneSecs = RTExt.GetZoneTimeTotal(activeSession.zoneTimes[pName][majZone])
+        end
+        local durStr = RTExt.FormatZoneDuration(zoneSecs)
+        table.insert(rowItems, {
+            plain = string.format("%s (%s) - %s", pName, pClass, durStr),
+            discord = string.format("- **%s (%s)** - `%s`", pName, pClass, durStr),
+            html = string.format('%s (%s) &mdash; <span style="color: #00FF00; font-weight: bold;">%s</span>', RTExt.FormatClassHTML(pName, pClass), RTExt.EscapeHTML(pClass), RTExt.EscapeHTML(durStr)),
+        })
+    end
+
+    return {
+        plainTitle = string.format("=== Raiders Tracker%s by %s - Session Characters ===", RTExt.GetVersionTag(), AUTHOR),
+        discordTitle = string.format("## Raiders Tracker%s by %s - Session Characters", RTExt.GetVersionTag(), AUTHOR),
+        htmlHeading = string.format("Session Characters - %s", sessionName),
+        metaLines = {
+            {
+                plain = string.format("Session: %s", sessionName),
+                discord = string.format("**Session:** %s", sessionName),
+                html = string.format("<strong>Session:</strong> %s", RTExt.EscapeHTML(sessionName)),
+            },
+            {
+                plain = string.format("Raid Zone: %s", zoneName),
+                discord = string.format("**Raid Zone:** %s", zoneName),
+                html = string.format("<strong>Raid Zone:</strong> %s", RTExt.EscapeHTML(zoneName)),
+            },
+            {
+                plain = string.format("Players: Active: %d / Total: %d", activeCount, #sortedPlayers),
+                discord = string.format("**Players:** Active: %d | Total: %d", activeCount, #sortedPlayers),
+                html = string.format("<strong>Players:</strong> Active: %d | Total: %d", activeCount, #sortedPlayers),
+            },
+        },
+        sections = {
+            {
+                title = string.format("Characters (%d)", #sortedPlayers),
+                emptyText = "No characters recorded in this session yet.",
+                items = rowItems,
+            }
+        }
+    }
+end
+
 function RTExt.CreateCharacterExportFrame()
-    local frame = CreateRUTPanel("RTCharacterExportFrame", 580, 440, "Export Characters")
+    local frame = CreateRUTPanel("RTCharacterExportFrame", 640, 480, "Export Characters")
     RTExt.CharacterExportFrame = frame
 
-    local currentExportText = ""
+    local ui = {
+        outputFormat = "PLAIN",
+        lineLimit = 9999,
+        currentExportText = "",
+        currentRaidChatLines = {},
+    }
 
     local infoLabel = frame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    infoLabel:SetPoint("TOPLEFT", frame, "TOPLEFT", 18, -36)
-    infoLabel:SetText("Copy character names, classes, and raid zone online time (Ctrl+A, Ctrl+C):")
+    infoLabel:SetPoint("TOPLEFT", frame, "TOPLEFT", 18, -34)
+    infoLabel:SetText("Select output format & line limit, then Ctrl+A / Ctrl+C or Send to Raid:")
 
-    local viewBox = CreateWhiteBorderViewBox(frame, -58, 46)
+    local viewBox = CreateWhiteBorderViewBox(frame, -82, 46)
 
     local scrollFrame = CreateFrame("ScrollFrame", "RTCharExportScrollFrame", viewBox, "UIPanelScrollFrameTemplate")
     scrollFrame:SetPoint("TOPLEFT", viewBox, "TOPLEFT", 8, -8)
@@ -4802,35 +5435,68 @@ function RTExt.CreateCharacterExportFrame()
     if editBox.SetMaxLetters then editBox:SetMaxLetters(0) end
     if editBox.SetMaxBytes then editBox:SetMaxBytes(0) end
     editBox:SetFontObject(GameFontHighlightSmall)
-    editBox:SetWidth(500)
-    editBox:SetHeight(290)
+    editBox:SetWidth(560)
+    editBox:SetHeight(310)
     editBox:SetScript("OnEscapePressed", function(self)
         self:ClearFocus()
         frame:Hide()
     end)
     editBox:SetScript("OnChar", function(self)
-        self:SetText(currentExportText)
+        self:SetText(ui.currentExportText)
     end)
     scrollFrame:SetScrollChild(editBox)
 
     viewBox:EnableMouse(true)
     viewBox:SetScript("OnMouseDown", function() editBox:SetFocus() end)
 
+    ui.RefreshOutput = function(highlight)
+        local preview, raidLines = RTExt.RenderStandardReport(RTExt.BuildCharacterExportReportSpec(), ui.outputFormat, ui.lineLimit)
+        ui.currentExportText = preview or ""
+        ui.currentRaidChatLines = raidLines or {}
+        editBox:SetText(ui.currentExportText)
+        if scrollFrame.UpdateScrollChildRect then scrollFrame:UpdateScrollChildRect() end
+        scrollFrame:SetVerticalScroll(0)
+        if highlight then
+            editBox:SetFocus()
+            editBox:HighlightText()
+        else
+            editBox:ClearFocus()
+        end
+    end
+
+    ui.outputBar = RTExt.CreateOutputOptionsBar(frame, 604, -52, {
+        getFormat = function() return ui.outputFormat end,
+        setFormat = function(v) ui.outputFormat = v end,
+        getLineLimit = function() return ui.lineLimit end,
+        setLineLimit = function(v) ui.lineLimit = v end,
+    }, function()
+        ui.RefreshOutput(false)
+    end)
+
     local btnBackChars = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
-    btnBackChars:SetSize(145, 24)
+    btnBackChars:SetSize(130, 24)
     btnBackChars:SetPoint("BOTTOMLEFT", frame, "BOTTOMLEFT", 18, 14)
     btnBackChars:SetText("Back to Characters")
     btnBackChars:SetScript("OnClick", function() CloseAllPanels(); CharacterFrame:Show() end)
 
     local btnBackTracker = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
-    btnBackTracker:SetSize(130, 24)
-    btnBackTracker:SetPoint("LEFT", btnBackChars, "RIGHT", 8, 0)
+    btnBackTracker:SetSize(115, 24)
+    btnBackTracker:SetPoint("LEFT", btnBackChars, "RIGHT", 6, 0)
     btnBackTracker:SetText("Back to Tracker")
     btnBackTracker:SetScript("OnClick", function() CloseAllPanels(); MainTrackerFrame:Show() end)
 
+    local btnSendRaid = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
+    btnSendRaid:SetSize(115, 24)
+    btnSendRaid:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", -18, 14)
+    btnSendRaid:SetText("Send to Raid")
+    btnSendRaid:SetScript("OnClick", function()
+        RTExt.TriggerSendToRaid(ui.currentRaidChatLines)
+    end)
+    RTExt.RegisterRaidSendButton(btnSendRaid)
+
     local btnSelectAll = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
-    btnSelectAll:SetSize(110, 24)
-    btnSelectAll:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", -18, 14)
+    btnSelectAll:SetSize(95, 24)
+    btnSelectAll:SetPoint("RIGHT", btnSendRaid, "LEFT", -6, 0)
     btnSelectAll:SetText("Select All")
     btnSelectAll:SetScript("OnClick", function()
         editBox:SetFocus()
@@ -4838,62 +5504,10 @@ function RTExt.CreateCharacterExportFrame()
     end)
 
     frame:SetScript("OnShow", function()
-        local activeSession = GetActiveSession()
-        local majZone = RTExt.activeMajorityRaidZone
-        if not majZone or majZone == "" then
-            majZone = RTExt.GetMajorityRaidZone(activeSession)
-            RTExt.activeMajorityRaidZone = majZone
-        end
-
-        local playerMap = {}
-        for pName, pClass in pairs((activeSession and activeSession.players) or {}) do
-            playerMap[pName] = pClass
-        end
-        if activeSession and activeSession.zoneTimes then
-            for pName in pairs(activeSession.zoneTimes) do
-                if not playerMap[pName] then
-                    playerMap[pName] = GetSafePlayerClass(pName)
-                end
-            end
-        end
-        for _, seg in ipairs((activeSession and activeSession.segments) or {}) do
-            for pName, pClass in pairs(seg.players or {}) do
-                playerMap[pName] = pClass
-            end
-        end
-
-        local activeCount = RTExt.CountActiveSessionPlayers(activeSession, playerMap)
-
-        local sortedPlayers = {}
-        for pName in pairs(playerMap) do table.insert(sortedPlayers, pName) end
-        table.sort(sortedPlayers)
-
-        local lines = {
-            string.format("=== Raiders Tracker%s by %s - Session Characters ===", RTExt.GetVersionTag(), AUTHOR),
-            string.format("Session: %s", (activeSession and activeSession.name) or "Live Current Session"),
-            string.format("Raid Zone: %s", majZone or "Unknown"),
-            string.format("Players: Active: %d | Total: %d", activeCount, #sortedPlayers),
-            ""
-        }
-        if #sortedPlayers == 0 then
-            table.insert(lines, "No characters recorded in this session yet.")
-        else
-            for _, pName in ipairs(sortedPlayers) do
-                local pClass = string.upper(playerMap[pName] or "WARRIOR")
-                local zoneSecs = 0
-                if activeSession and activeSession.zoneTimes and activeSession.zoneTimes[pName] and majZone then
-                    zoneSecs = RTExt.GetZoneTimeTotal(activeSession.zoneTimes[pName][majZone])
-                end
-                table.insert(lines, string.format("%s (%s) - %s", pName, pClass, RTExt.FormatZoneDuration(zoneSecs)))
-            end
-        end
-
-        currentExportText = table.concat(lines, "\n")
-        editBox:SetText(currentExportText)
-        if scrollFrame.UpdateScrollChildRect then scrollFrame:UpdateScrollChildRect() end
-        scrollFrame:SetVerticalScroll(0)
-        editBox:SetFocus()
-        editBox:HighlightText()
+        HideAllCustomDropdownMenus()
+        RTExt.UpdateAllRaidSendButtons()
+        ui.outputBar:SyncFromState()
+        ui.RefreshOutput(true)
     end)
 end
 
@@ -4901,15 +5515,21 @@ end
 -- Multi-Panel Reporting Hub (5-Tab Hub, Context Dropdowns, Filters & Broadcast Guards)
 -------------------------------------------------------------------------------
 local function CreateReportFrame()
-    ReportFrame = CreateRUTPanel("RTReportFrame", 740, 560, "Reports Hub")
+    ReportFrame = CreateRUTPanel("RTReportFrame", 740, 580, "Reports Hub")
 
     -- Group widget references & state into a single table to stay well below Lua 5.1's 60-upvalue limit
     local ui = {
         activeReportPanel = "ALL",
-        activeAllFormat = "PLAIN",
+        outputFormat = "PLAIN",
         activeCharSubMode = "BUFFS",
         activeFailSubMode = "EARLY",
-        failLineLimit = 10,
+        lineLimits = {
+            ALL = 9999,
+            CHAR = 9999,
+            FAILS = 10,
+            DEATHS = 9999,
+            POTIONS = 9999,
+        },
         selectedReportChar = nil,
         currentPreviewText = "",
         currentRaidChatLines = {},
@@ -5033,27 +5653,12 @@ local function CreateReportFrame()
 
     -- Row 3: Tab-Specific Options
     ui.subFrameAll = CreateFrame("Frame", nil, ReportFrame)
-    ui.subFrameAll:SetSize(704, 28)
+    ui.subFrameAll:SetSize(704, 26)
     ui.subFrameAll:SetPoint("TOPLEFT", ReportFrame, "TOPLEFT", 18, -94)
 
-    ui.chkPlain = CreateFrame("CheckButton", nil, ui.subFrameAll, "UICheckButtonTemplate")
-    ui.chkPlain:SetPoint("LEFT", ui.subFrameAll, "LEFT", 0, 0)
-    ui.chkPlain.text = ui.chkPlain:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    ui.chkPlain.text:SetPoint("LEFT", ui.chkPlain, "RIGHT", 2, 0)
-    ui.chkPlain.text:SetText("Plain Text")
-    ui.chkPlain:SetChecked(true)
-
-    ui.chkDiscord = CreateFrame("CheckButton", nil, ui.subFrameAll, "UICheckButtonTemplate")
-    ui.chkDiscord:SetPoint("LEFT", ui.chkPlain.text, "RIGHT", 14, 0)
-    ui.chkDiscord.text = ui.chkDiscord:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    ui.chkDiscord.text:SetPoint("LEFT", ui.chkDiscord, "RIGHT", 2, 0)
-    ui.chkDiscord.text:SetText("Discord Markdown")
-
-    ui.chkHTML = CreateFrame("CheckButton", nil, ui.subFrameAll, "UICheckButtonTemplate")
-    ui.chkHTML:SetPoint("LEFT", ui.chkDiscord.text, "RIGHT", 14, 0)
-    ui.chkHTML.text = ui.chkHTML:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    ui.chkHTML.text:SetPoint("LEFT", ui.chkHTML, "RIGHT", 2, 0)
-    ui.chkHTML.text:SetText("Export as HTML")
+    local allBannerText = ui.subFrameAll:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    allBannerText:SetPoint("LEFT", ui.subFrameAll, "LEFT", 2, 0)
+    allBannerText:SetText("|cffCCCCCCFull segment report (Characters, Deaths, Potions/Buffs & Raid Utility)|r")
 
     ui.btnAllFilter = CreateFrame("Button", nil, ui.subFrameAll, "UIPanelButtonTemplate")
     ui.btnAllFilter:SetSize(165, 22)
@@ -5065,7 +5670,7 @@ local function CreateReportFrame()
     end)
 
     ui.subFrameChar = CreateFrame("Frame", nil, ReportFrame)
-    ui.subFrameChar:SetSize(704, 28)
+    ui.subFrameChar:SetSize(704, 26)
     ui.subFrameChar:SetPoint("TOPLEFT", ReportFrame, "TOPLEFT", 18, -94)
     ui.subFrameChar:Hide()
 
@@ -5096,40 +5701,31 @@ local function CreateReportFrame()
     end)
 
     ui.subFrameFails = CreateFrame("Frame", nil, ReportFrame)
-    ui.subFrameFails:SetSize(704, 28)
+    ui.subFrameFails:SetSize(704, 26)
     ui.subFrameFails:SetPoint("TOPLEFT", ReportFrame, "TOPLEFT", 18, -94)
     ui.subFrameFails:Hide()
 
     ui.btnFailEarly = CreateFrame("Button", nil, ui.subFrameFails, "UIPanelButtonTemplate")
-    ui.btnFailEarly:SetSize(110, 24)
+    ui.btnFailEarly:SetSize(115, 24)
     ui.btnFailEarly:SetPoint("LEFT", ui.subFrameFails, "LEFT", 0, 0)
     ui.btnFailEarly:SetText("1. Early Deaths")
 
     ui.btnFailSlack = CreateFrame("Button", nil, ui.subFrameFails, "UIPanelButtonTemplate")
-    ui.btnFailSlack:SetSize(105, 24)
+    ui.btnFailSlack:SetSize(110, 24)
     ui.btnFailSlack:SetPoint("LEFT", ui.btnFailEarly, "RIGHT", 6, 0)
     ui.btnFailSlack:SetText("2. Slackers")
 
     ui.btnFailCds = CreateFrame("Button", nil, ui.subFrameFails, "UIPanelButtonTemplate")
-    ui.btnFailCds:SetSize(100, 24)
+    ui.btnFailCds:SetSize(105, 24)
     ui.btnFailCds:SetPoint("LEFT", ui.btnFailSlack, "RIGHT", 6, 0)
     ui.btnFailCds:SetText("3. CD Fails")
 
-    ui.limitDropdown = CreateCustomDropdown(ui.subFrameFails, 100, 24)
-    ui.limitDropdown:SetPoint("LEFT", ui.btnFailCds, "RIGHT", 10, 0)
-
-    ui.limitDropdown.getItems = function()
-        return {
-            { text = "5 lines", checked = (ui.failLineLimit == 5), func = function() ui.failLineLimit = 5; ui.GenerateReport() end },
-            { text = "10 lines", checked = (ui.failLineLimit == 10), func = function() ui.failLineLimit = 10; ui.GenerateReport() end },
-            { text = "20 lines", checked = (ui.failLineLimit == 20), func = function() ui.failLineLimit = 20; ui.GenerateReport() end },
-            { text = "All lines", checked = (ui.failLineLimit == 9999), func = function() ui.failLineLimit = 9999; ui.GenerateReport() end },
-        }
-    end
-    ui.limitDropdown:SetText(ui.failLineLimit == 9999 and "All lines" or (ui.failLineLimit .. " lines"))
+    local failsHintText = ui.subFrameFails:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    failsHintText:SetPoint("LEFT", ui.btnFailCds, "RIGHT", 12, 0)
+    failsHintText:SetText("|cffCCCCCCSorted by severity / pull time|r")
 
     ui.subFrameDeaths = CreateFrame("Frame", nil, ReportFrame)
-    ui.subFrameDeaths:SetSize(704, 28)
+    ui.subFrameDeaths:SetSize(704, 26)
     ui.subFrameDeaths:SetPoint("TOPLEFT", ReportFrame, "TOPLEFT", 18, -94)
     ui.subFrameDeaths:Hide()
 
@@ -5147,7 +5743,7 @@ local function CreateReportFrame()
     end)
 
     ui.subFramePotions = CreateFrame("Frame", nil, ReportFrame)
-    ui.subFramePotions:SetSize(704, 28)
+    ui.subFramePotions:SetSize(704, 26)
     ui.subFramePotions:SetPoint("TOPLEFT", ReportFrame, "TOPLEFT", 18, -94)
     ui.subFramePotions:Hide()
 
@@ -5164,7 +5760,17 @@ local function CreateReportFrame()
     potionsHintText:SetPoint("LEFT", ui.btnPotionsScope, "RIGHT", 12, 0)
     potionsHintText:SetText("|cffCCCCCCIncludes all combat potions, Flame Caps, Thistle Tea & Runes|r")
 
-    local viewBox = CreateWhiteBorderViewBox(ReportFrame, -126, 46)
+    -- Row 4: Standardized Output Options Bar (shared across all 5 Report Tabs)
+    ui.outputBar = RTExt.CreateOutputOptionsBar(ReportFrame, 704, -124, {
+        getFormat = function() return ui.outputFormat end,
+        setFormat = function(v) ui.outputFormat = v end,
+        getLineLimit = function() return ui.lineLimits[ui.activeReportPanel] or 9999 end,
+        setLineLimit = function(v) ui.lineLimits[ui.activeReportPanel] = v end,
+    }, function()
+        if ui.GenerateReport then ui.GenerateReport() end
+    end)
+
+    local viewBox = CreateWhiteBorderViewBox(ReportFrame, -154, 46)
 
     ui.scrollFrame = CreateFrame("ScrollFrame", "RTReportScrollFrame", viewBox, "UIPanelScrollFrameTemplate")
     ui.scrollFrame:SetPoint("TOPLEFT", viewBox, "TOPLEFT", 8, -8)
@@ -5200,6 +5806,10 @@ local function CreateReportFrame()
     ui.btnSendRaid:SetSize(135, 24)
     ui.btnSendRaid:SetPoint("BOTTOMRIGHT", ReportFrame, "BOTTOMRIGHT", -18, 14)
     ui.btnSendRaid:SetText("Send to Raid")
+    ui.btnSendRaid:SetScript("OnClick", function()
+        RTExt.TriggerSendToRaid(ui.currentRaidChatLines)
+    end)
+    RTExt.RegisterRaidSendButton(ui.btnSendRaid)
 
     local btnSelectAll = CreateFrame("Button", nil, ReportFrame, "UIPanelButtonTemplate")
     btnSelectAll:SetSize(105, 24)
@@ -5213,133 +5823,6 @@ local function CreateReportFrame()
     local footerText = ReportFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
     footerText:SetPoint("BOTTOM", ReportFrame, "BOTTOM", -25, 18)
     footerText:SetText(GetFooterText())
-
-    ui.UpdateSendRaidButton = function()
-        if RTExt.IsRaidChatQueueActive() then
-            ui.btnSendRaid:SetText("|cffFF4444Stop Sending|r")
-        else
-            ui.btnSendRaid:SetText("Send to Raid")
-        end
-    end
-
-    RTExt.OnRaidChatQueueStateChanged = function()
-        ui.UpdateSendRaidButton()
-    end
-
-    StaticPopupDialogs["RT_CONFIRM_LARGE_RAID_SEND"] = {
-        text = "This report contains %d lines.\n\nAre you sure you want to send it to Raid/Party chat?",
-        button1 = "Send",
-        button2 = "Cancel",
-        OnAccept = function()
-            if RTExt.pendingLargeRaidLines and #RTExt.pendingLargeRaidLines > 0 then
-                local linesToSend = RTExt.pendingLargeRaidLines
-                RTExt.pendingLargeRaidLines = nil
-                EnqueueRaidChatLines(linesToSend)
-                ui.UpdateSendRaidButton()
-            end
-        end,
-        OnCancel = function()
-            RTExt.pendingLargeRaidLines = nil
-        end,
-        timeout = 0,
-        whileDead = true,
-        hideOnEscape = true,
-    }
-
-    ui.btnSendRaid:SetScript("OnClick", function()
-        if RTExt.IsRaidChatQueueActive() then
-            RTExt.StopRaidChatQueue()
-            AnnounceLocalChat("Stopped sending raid chat report.")
-            return
-        end
-        if #ui.currentRaidChatLines == 0 then return end
-        if #ui.currentRaidChatLines > 25 then
-            RTExt.pendingLargeRaidLines = ui.currentRaidChatLines
-            StaticPopup_Show("RT_CONFIRM_LARGE_RAID_SEND", #ui.currentRaidChatLines)
-        else
-            EnqueueRaidChatLines(ui.currentRaidChatLines)
-            ui.UpdateSendRaidButton()
-        end
-    end)
-
-    ui.EscapeHTML = function(str)
-        if not str then return "" end
-        return str:gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;"):gsub('"', "&quot;")
-    end
-
-    ui.ConvertWoWColorsToHTML = function(str)
-        if not str then return "" end
-        local escaped = ui.EscapeHTML(str)
-        escaped = escaped:gsub("|c%x%x(%x%x%x%x%x%x)(.-)|r", '<span style="color: #%1; font-weight: bold;">%2</span>')
-        escaped = escaped:gsub("|c%x%x%x%x%x%x%x%x", ""):gsub("|r", "")
-        return escaped
-    end
-
-    ui.BuildAllDataPlainLines = function(seg, segDur, presentList, presentMap, deathPlayers, totalSegDeaths, potPlayers, filteredPotByPlayer, utilPlayers, consumablesOnly)
-        local rLines = BuildStandardRaidHeaderLines(seg)
-        table.insert(rLines, "")
-        table.insert(rLines, string.format("--- 1. Characters Present (%d) ---", #presentList))
-        if #presentList == 0 then
-            table.insert(rLines, "None")
-        else
-            for _, pName in ipairs(presentList) do
-                table.insert(rLines, string.format("- %s (%s)", pName, presentMap[pName] or "WARRIOR"))
-            end
-        end
-        table.insert(rLines, "")
-        table.insert(rLines, string.format("--- 2. Deaths & Death Log (%d Total) ---", totalSegDeaths))
-        if #deathPlayers == 0 then
-            table.insert(rLines, "None")
-        else
-            for _, dPlayer in ipairs(deathPlayers) do
-                local pName = dPlayer.name
-                local pClass = presentMap[pName] or string.upper(GetSafePlayerClass(pName))
-                local deathWord = (dPlayer.count == 1) and "Death" or "Deaths"
-                table.insert(rLines, string.format("%s (%s) - %d %s", pName, pClass, dPlayer.count, deathWord))
-                for idx, d in ipairs(dPlayer.list) do
-                    local killer = StripColorCodes(d.killer or "Unknown Mob")
-                    local ability = StripColorCodes(d.ability or "Unknown Attack")
-                    local amount = tonumber(d.amount) or 0
-                    local overkill = tonumber(d.overkill) or 0
-                    local timeStr = d.time or ""
-                    local pullStr = FormatPullTime(d.pullTime)
-                    local stamp = pullStr and string.format("%s into pull / %s", pullStr, timeStr) or timeStr
-                    local dmgText = (amount > 0) and string.format("%d dmg", amount) or "Fatal Effect"
-                    if overkill > 0 then dmgText = string.format("%d dmg (%d overkill)", amount, overkill) end
-                    table.insert(rLines, string.format("- %d. [%s] Killed by %s / Ability: %s / Damage: %s", idx, stamp, killer, ability, dmgText))
-                end
-            end
-        end
-        table.insert(rLines, "")
-        table.insert(rLines, consumablesOnly and "--- 3. Consumables Only ---" or "--- 3. Potions & Buffs ---")
-        if #potPlayers == 0 then
-            table.insert(rLines, "None")
-        else
-            for _, pName in ipairs(potPlayers) do
-                local pClass = presentMap[pName] or string.upper(seg.players[pName] or "WARRIOR")
-                table.insert(rLines, string.format("%s (%s)", pName, pClass))
-                for _, cLine in ipairs(BuildCondensedEntryLines(filteredPotByPlayer[pName], "- ")) do
-                    table.insert(rLines, cLine)
-                end
-            end
-        end
-        table.insert(rLines, "")
-        table.insert(rLines, "--- 4. Raid Utility ---")
-        if #utilPlayers == 0 then
-            table.insert(rLines, "None")
-        else
-            for _, pName in ipairs(utilPlayers) do
-                local pClass = presentMap[pName] or string.upper(seg.players[pName] or "WARRIOR")
-                table.insert(rLines, string.format("%s (%s):", pName, pClass))
-                local dpVals = seg.demonicPactValues and seg.demonicPactValues[pName] or nil
-                local dpTimes = seg.demonicPactTimes and seg.demonicPactTimes[pName] or nil
-                for _, cLine in ipairs(BuildCondensedEntryLines(seg.raidUtility[pName], "- ", dpVals, dpTimes, segDur)) do
-                    table.insert(rLines, cLine)
-                end
-            end
-        end
-        return rLines
-    end
 
     ui.BuildSingleCharacterFails = function(seg, pName, pClass, segDur, maxPossible30s, enrageStr, totalEnrages, detectedTanks)
         local fails = {}
@@ -5409,9 +5892,21 @@ local function CreateReportFrame()
         return fails
     end
 
+    ui.BuildSegmentMetaLines = function(seg)
+        local segName = (seg and seg.name) or "TRASH"
+        local segDiff = (seg and seg.difficulty) or GetRaidDifficultySuffix()
+        return {
+            {
+                plain = string.format("Segment: %s (%s)", segName, segDiff),
+                discord = string.format("**Segment:** %s (%s)", segName, segDiff),
+                html = string.format("<strong>Segment:</strong> %s (%s)", RTExt.EscapeHTML(segName), RTExt.EscapeHTML(segDiff)),
+            }
+        }
+    end
+
     ui.GenerateReport = function()
         HideAllCustomDropdownMenus()
-        ui.UpdateSendRaidButton()
+        RTExt.UpdateAllRaidSendButtons()
 
         local activeSession = GetActiveSession()
         local segments = (activeSession and activeSession.segments) or {}
@@ -5481,7 +5976,6 @@ local function CreateReportFrame()
             if ui.activeFailSubMode == "EARLY" then ui.btnFailEarly:LockHighlight()
             elseif ui.activeFailSubMode == "SLACKERS" then ui.btnFailSlack:LockHighlight()
             else ui.btnFailCds:LockHighlight() end
-            ui.limitDropdown:SetText(ui.failLineLimit == 9999 and "All lines" or (ui.failLineLimit .. " lines"))
         elseif ui.activeReportPanel == "DEATHS" then
             ui.btnPanelDeaths:LockHighlight()
             ui.subFrameDeaths:Show()
@@ -5491,17 +5985,20 @@ local function CreateReportFrame()
             ui.btnPotionsScope:SetText(RTExt.bossPotionsAllFights and "Scope: All Boss Fights (Session)" or "Scope: Selected Segment")
         end
 
+        ui.outputBar:SyncFromState()
+        local activeLineLimit = ui.lineLimits[ui.activeReportPanel] or 9999
+
         if ui.activeReportPanel == "POTIONS" then
-            local lines
             if RTExt.bossPotionsAllFights then
-                lines = RTExt.BuildBossPotionsReportLines(activeSession, nil)
+                local spec = RTExt.BuildBossPotionsReportSpec(activeSession, nil)
+                ui.currentPreviewText, ui.currentRaidChatLines = RTExt.RenderStandardReport(spec, ui.outputFormat, activeLineLimit)
             elseif seg then
-                lines = RTExt.BuildBossPotionsReportLines(activeSession, seg)
+                local spec = RTExt.BuildBossPotionsReportSpec(activeSession, seg)
+                ui.currentPreviewText, ui.currentRaidChatLines = RTExt.RenderStandardReport(spec, ui.outputFormat, activeLineLimit)
             else
-                lines = { "No Segment Selected" }
+                ui.currentPreviewText = "No Segment Selected"
+                ui.currentRaidChatLines = {}
             end
-            ui.currentRaidChatLines = lines
-            ui.currentPreviewText = table.concat(lines, "\n")
             ui.editBox:SetText(ui.currentPreviewText)
             if ui.scrollFrame.UpdateScrollChildRect then ui.scrollFrame:UpdateScrollChildRect() end
             ui.scrollFrame:SetVerticalScroll(0)
@@ -5543,10 +6040,15 @@ local function CreateReportFrame()
             ui.charDropdown:SetText("No Characters")
         end
 
+        local segZone = seg.zone or GetCurrentZoneSafe()
+        local segDiff = seg.difficulty or GetRaidDifficultySuffix()
+        local segName = seg.name or "TRASH"
         local segDur = GetSegmentDuration(seg)
         local maxPossible30s = (segDur > 0) and math.max(1, math.floor(segDur / 30)) or 0
         local enrageStr, totalEnrages = GetEnrageSummaryString(seg)
         local detectedTanks = DetectSegmentTanks(seg, presentMap)
+
+        local spec = nil
 
         if ui.activeReportPanel == "ALL" then
             local deathPlayers = {}
@@ -5579,249 +6081,158 @@ local function CreateReportFrame()
             end
             table.sort(utilPlayers)
 
-            ui.currentRaidChatLines = ui.BuildAllDataPlainLines(seg, segDur, presentList, presentMap, deathPlayers, totalSegDeaths, potPlayers, filteredPotByPlayer, utilPlayers, RTExt.reportConsumablesOnly)
-
-            local segZone = seg.zone or GetCurrentZoneSafe()
-            local segDiff = seg.difficulty or GetRaidDifficultySuffix()
-            local segName = seg.name or "TRASH"
-            local header = string.format("[%s %s] - %s (Full Segment Report)", segZone, segDiff, segName)
-
-            if ui.activeAllFormat == "HTML" then
-                local lines = {
-                    "<!DOCTYPE html>", "<html>", "<head>", '  <meta charset="UTF-8">',
-                    "  <title>Raiders Tracker by Copper - " .. ui.EscapeHTML(header) .. "</title>",
-                    "</head>",
-                    '<body style="background-color: #141419; color: #E0E0E0; font-family: Arial, Helvetica, sans-serif; line-height: 1.5; padding: 20px;">',
-                    '  <h1 style="color: #00FF00; margin-bottom: 4px;">Raiders Tracker by Copper</h1>',
-                    string.format('  <p style="margin-top: 0; margin-bottom: 18px;">%s<a href="%s" target="_blank" style="color: #69CCF0; text-decoration: underline;">%s</a></p>', (GetAddonVersion() ~= "" and ("Version " .. ui.EscapeHTML(GetAddonVersion()) .. " &mdash; ") or ""), GITHUB_URL, GITHUB_URL),
-                    string.format('  <h1 style="color: #FFFFFF; border-bottom: 1px solid #444444; padding-bottom: 6px;">%s</h1>', ui.EscapeHTML(header)),
-                    string.format('  <h1 style="color: #FFD100; font-size: 1.35em; margin-top: 24px;">1. Characters Present (%d)</h1>', #presentList),
-                    "  <ul>"
-                }
-                if #presentList == 0 then
-                    table.insert(lines, "    <li>None</li>")
-                else
-                    for _, pName in ipairs(presentList) do
-                        local pClass = presentMap[pName] or "WARRIOR"
-                        local hexColor = GetPlayerClassColor(pClass)
-                        table.insert(lines, string.format('    <li><span style="color: #%s; font-weight: bold;">%s</span> (%s)</li>', hexColor, ui.EscapeHTML(pName), ui.EscapeHTML(pClass)))
-                    end
-                end
-                table.insert(lines, "  </ul>")
-                table.insert(lines, string.format('  <h1 style="color: #FFD100; font-size: 1.35em; margin-top: 24px;">2. Deaths &amp; Death Log (%d Total)</h1>', totalSegDeaths))
-                table.insert(lines, "  <ul>")
-                if #deathPlayers == 0 then
-                    table.insert(lines, "    <li>None</li>")
-                else
-                    for _, dPlayer in ipairs(deathPlayers) do
-                        local pName = dPlayer.name
-                        local pClass = presentMap[pName] or string.upper(GetSafePlayerClass(pName))
-                        local hexColor = GetPlayerClassColor(pClass)
-                        local deathWord = (dPlayer.count == 1) and "Death" or "Deaths"
-                        table.insert(lines, string.format('    <li><span style="color: #%s; font-weight: bold;">%s</span> (%s) &mdash; <span style="color: #FFFF00; font-weight: bold;">%d %s</span>', hexColor, ui.EscapeHTML(pName), ui.EscapeHTML(pClass), dPlayer.count, deathWord))
-                        table.insert(lines, "      <ul>")
-                        for idx, d in ipairs(dPlayer.list) do
-                            local killer = StripColorCodes(d.killer or "Unknown Mob")
-                            local ability = StripColorCodes(d.ability or "Unknown Attack")
-                            local amount = tonumber(d.amount) or 0
-                            local overkill = tonumber(d.overkill) or 0
-                            local timeStr = d.time or ""
-                            local pullStr = FormatPullTime(d.pullTime)
-                            local stamp = pullStr and string.format("%s into pull / %s", pullStr, timeStr) or timeStr
-                            local dmgText = (amount > 0) and string.format("%d dmg", amount) or "Fatal Effect"
-                            if overkill > 0 then dmgText = string.format("%d dmg (%d overkill)", amount, overkill) end
-                            table.insert(lines, string.format(
-                                '        <li>%d. [%s] Killed by <span style="color: #FFFF00;">%s</span> | Ability: <span style="color: #FFD100;">%s</span> | Damage: <span style="color: #FFFF00;">%s</span></li>',
-                                idx, ui.EscapeHTML(stamp), ui.EscapeHTML(killer), ui.EscapeHTML(ability), ui.EscapeHTML(dmgText)
-                            ))
-                        end
-                        table.insert(lines, "      </ul>")
-                        table.insert(lines, "    </li>")
-                    end
-                end
-                table.insert(lines, "  </ul>")
-                table.insert(lines, RTExt.reportConsumablesOnly
-                    and '  <h1 style="color: #FFD100; font-size: 1.35em; margin-top: 24px;">3. Consumables Only</h1>'
-                    or '  <h1 style="color: #FFD100; font-size: 1.35em; margin-top: 24px;">3. Potions &amp; Buffs</h1>')
-                table.insert(lines, "  <ul>")
-                if #potPlayers == 0 then
-                    table.insert(lines, "    <li>None</li>")
-                else
-                    for _, pName in ipairs(potPlayers) do
-                        local pClass = presentMap[pName] or string.upper(seg.players[pName] or "WARRIOR")
-                        local hexColor = GetPlayerClassColor(pClass)
-                        table.insert(lines, string.format('    <li><span style="color: #%s; font-weight: bold;">%s</span> (%s)', hexColor, ui.EscapeHTML(pName), ui.EscapeHTML(pClass)))
-                        table.insert(lines, "      <ul>")
-                        local sortedEntries = {}
-                        for buffName, count in pairs(filteredPotByPlayer[pName]) do
-                            table.insert(sortedEntries, { rawName = buffName, cleanName = StripColorCodes(buffName), count = count })
-                        end
-                        table.sort(sortedEntries, function(a, b) return a.cleanName < b.cleanName end)
-                        for _, entry in ipairs(sortedEntries) do
-                            table.insert(lines, string.format('        <li>%s: <span style="color: #00FF00; font-weight: bold;">%d</span></li>', ui.ConvertWoWColorsToHTML(entry.rawName), entry.count))
-                        end
-                        table.insert(lines, "      </ul>")
-                        table.insert(lines, "    </li>")
-                    end
-                end
-                table.insert(lines, "  </ul>")
-                table.insert(lines, '  <h1 style="color: #FFD100; font-size: 1.35em; margin-top: 24px;">4. Raid Utility</h1>')
-                table.insert(lines, "  <ul>")
-                if #utilPlayers == 0 then
-                    table.insert(lines, "    <li>None</li>")
-                else
-                    for _, pName in ipairs(utilPlayers) do
-                        local pClass = presentMap[pName] or string.upper(seg.players[pName] or "WARRIOR")
-                        local hexColor = GetPlayerClassColor(pClass)
-                        table.insert(lines, string.format('    <li><span style="color: #%s; font-weight: bold;">%s</span> (%s)', hexColor, ui.EscapeHTML(pName), ui.EscapeHTML(pClass)))
-                        table.insert(lines, "      <ul>")
-                        local sortedEntries = {}
-                        for utilName, count in pairs(seg.raidUtility[pName]) do
-                            table.insert(sortedEntries, { rawName = utilName, cleanName = StripColorCodes(utilName), count = count })
-                        end
-                        table.sort(sortedEntries, function(a, b) return a.cleanName < b.cleanName end)
-                        local dpVals = seg.demonicPactValues and seg.demonicPactValues[pName] or nil
-                        local dpTimes = seg.demonicPactTimes and seg.demonicPactTimes[pName] or nil
-                        for _, entry in ipairs(sortedEntries) do
-                            if entry.cleanName == "Demonic Pact" and type(dpVals) == "table" and #dpVals > 0 then
-                                local summaryText = RTExt.FormatDemonicPactSummaryLine("", dpVals, dpTimes, segDur, entry.count)
-                                local summaryHtml = summaryText and ('<br><span style="color: #AAAAAA; font-size: 0.9em;">' .. ui.EscapeHTML(summaryText) .. '</span>') or ""
-                                table.insert(lines, string.format('        <li>Demonic Pact (<span style="color: #00FF00; font-weight: bold;">%d</span>): %s%s</li>', #dpVals, ui.EscapeHTML(table.concat(dpVals, ", ")), summaryHtml))
-                            else
-                                table.insert(lines, string.format('        <li>%s: <span style="color: #00FF00; font-weight: bold;">%d</span></li>', ui.ConvertWoWColorsToHTML(entry.rawName), entry.count))
-                            end
-                        end
-                        table.insert(lines, "      </ul>")
-                        table.insert(lines, "    </li>")
-                    end
-                end
-                table.insert(lines, "  </ul>")
-                table.insert(lines, "</body>")
-                table.insert(lines, "</html>")
-                ui.currentPreviewText = table.concat(lines, "\n")
-
-            elseif ui.activeAllFormat == "DISCORD" then
-                local lines = {
-                    string.format("=== Raiders Tracker%s by %s ===", RTExt.GetVersionTag(), AUTHOR),
-                    GITHUB_URL,
-                    string.format("Segment: %s (%s)", segName, segDiff),
-                    "",
-                    string.format("--- 1. Characters Present (%d) ---", #presentList)
-                }
-                if #presentList == 0 then
-                    table.insert(lines, "None")
-                else
-                    for _, pName in ipairs(presentList) do
-                        table.insert(lines, string.format("- %s (%s)", pName, presentMap[pName] or "WARRIOR"))
-                    end
-                end
-                table.insert(lines, "")
-                table.insert(lines, string.format("--- 2. Deaths & Death Log (%d Total) ---", totalSegDeaths))
-                if #deathPlayers == 0 then
-                    table.insert(lines, "None")
-                else
-                    for _, dPlayer in ipairs(deathPlayers) do
-                        local pName = dPlayer.name
-                        local pClass = presentMap[pName] or string.upper(GetSafePlayerClass(pName))
-                        local deathWord = (dPlayer.count == 1) and "Death" or "Deaths"
-                        table.insert(lines, string.format("%s (%s) - %d %s", pName, pClass, dPlayer.count, deathWord))
-                        for idx, d in ipairs(dPlayer.list) do
-                            local killer = StripColorCodes(d.killer or "Unknown Mob")
-                            local ability = StripColorCodes(d.ability or "Unknown Attack")
-                            local amount = tonumber(d.amount) or 0
-                            local overkill = tonumber(d.overkill) or 0
-                            local timeStr = d.time or ""
-                            local pullStr = FormatPullTime(d.pullTime)
-                            local stamp = pullStr and string.format("%s into pull / %s", pullStr, timeStr) or timeStr
-                            local dmgText = (amount > 0) and string.format("%d dmg", amount) or "Fatal Effect"
-                            if overkill > 0 then dmgText = string.format("%d dmg (%d overkill)", amount, overkill) end
-                            table.insert(lines, string.format("- %d. [%s] Killed by %s / Ability: %s / Damage: %s", idx, stamp, killer, ability, dmgText))
-                        end
-                    end
-                end
-                table.insert(lines, "")
-                table.insert(lines, RTExt.reportConsumablesOnly and "--- 3. Consumables Only ---" or "--- 3. Potions & Buffs ---")
-                if #potPlayers == 0 then
-                    table.insert(lines, "None")
-                else
-                    for _, pName in ipairs(potPlayers) do
-                        local pClass = presentMap[pName] or string.upper(seg.players[pName] or "WARRIOR")
-                        table.insert(lines, string.format("**%s (%s)**", pName, pClass))
-                        for _, cLine in ipairs(BuildCondensedEntryLines(filteredPotByPlayer[pName], "- ")) do
-                            table.insert(lines, cLine)
-                        end
-                    end
-                end
-                table.insert(lines, "")
-                table.insert(lines, "--- 4. Raid Utility ---")
-                if #utilPlayers == 0 then
-                    table.insert(lines, "None")
-                else
-                    for _, pName in ipairs(utilPlayers) do
-                        local pClass = presentMap[pName] or string.upper(seg.players[pName] or "WARRIOR")
-                        table.insert(lines, string.format("**%s (%s):**", pName, pClass))
-                        local dpVals = seg.demonicPactValues and seg.demonicPactValues[pName] or nil
-                        local dpTimes = seg.demonicPactTimes and seg.demonicPactTimes[pName] or nil
-                        for _, cLine in ipairs(BuildCondensedEntryLines(seg.raidUtility[pName], "- ", dpVals, dpTimes, segDur)) do
-                            table.insert(lines, cLine)
-                        end
-                    end
-                end
-                ui.currentPreviewText = table.concat(lines, "\n")
-            else
-                ui.currentPreviewText = table.concat(ui.currentRaidChatLines, "\n")
+            local charItems = {}
+            for _, pName in ipairs(presentList) do
+                local pClass = presentMap[pName] or "WARRIOR"
+                table.insert(charItems, {
+                    plain = string.format("- %s (%s)", pName, pClass),
+                    discord = string.format("- %s (%s)", pName, pClass),
+                    html = string.format("%s (%s)", RTExt.FormatClassHTML(pName, pClass), RTExt.EscapeHTML(pClass)),
+                })
             end
 
+            local deathItems = {}
+            for _, dPlayer in ipairs(deathPlayers) do
+                local pName = dPlayer.name
+                local pClass = presentMap[pName] or string.upper(GetSafePlayerClass(pName))
+                local deathWord = (dPlayer.count == 1) and "Death" or "Deaths"
+                local subitems = {}
+                for idx, d in ipairs(dPlayer.list) do
+                    local killer = StripColorCodes(d.killer or "Unknown Mob")
+                    local ability = StripColorCodes(d.ability or "Unknown Attack")
+                    local amount = tonumber(d.amount) or 0
+                    local overkill = tonumber(d.overkill) or 0
+                    local timeStr = d.time or ""
+                    local pullStr = FormatPullTime(d.pullTime)
+                    local stamp = pullStr and string.format("%s into pull / %s", pullStr, timeStr) or timeStr
+                    local dmgText = (amount > 0) and string.format("%d dmg", amount) or "Fatal Effect"
+                    if overkill > 0 then dmgText = string.format("%d dmg (%d overkill)", amount, overkill) end
+                    table.insert(subitems, {
+                        plain = string.format("- %d. [%s] Killed by %s / Ability: %s / Damage: %s", idx, stamp, killer, ability, dmgText),
+                        discord = string.format("- %d. `[%s]` Killed by **%s** / Ability: *%s* / Damage: %s", idx, stamp, killer, ability, dmgText),
+                        html = string.format('%d. [%s] Killed by <span style="color: #FFFF00;">%s</span> | Ability: <span style="color: #FFD100;">%s</span> | Damage: <span style="color: #FFFF00;">%s</span>', idx, RTExt.EscapeHTML(stamp), RTExt.EscapeHTML(killer), RTExt.EscapeHTML(ability), RTExt.EscapeHTML(dmgText)),
+                    })
+                end
+                table.insert(deathItems, {
+                    plain = string.format("%s (%s) - %d %s", pName, pClass, dPlayer.count, deathWord),
+                    discord = string.format("**%s (%s)** - %d %s", pName, pClass, dPlayer.count, deathWord),
+                    html = string.format('%s (%s) &mdash; <span style="color: #FFFF00; font-weight: bold;">%d %s</span>', RTExt.FormatClassHTML(pName, pClass), RTExt.EscapeHTML(pClass), dPlayer.count, deathWord),
+                    subitems = subitems,
+                })
+            end
+
+            local potItems = {}
+            for _, pName in ipairs(potPlayers) do
+                local pClass = presentMap[pName] or string.upper(seg.players[pName] or "WARRIOR")
+                table.insert(potItems, {
+                    plain = string.format("%s (%s)", pName, pClass),
+                    discord = string.format("**%s (%s)**", pName, pClass),
+                    html = string.format("%s (%s)", RTExt.FormatClassHTML(pName, pClass), RTExt.EscapeHTML(pClass)),
+                    subitems = RTExt.BuildCondensedEntryItems(filteredPotByPlayer[pName]),
+                })
+            end
+
+            local utilItems = {}
+            for _, pName in ipairs(utilPlayers) do
+                local pClass = presentMap[pName] or string.upper(seg.players[pName] or "WARRIOR")
+                local dpVals = seg.demonicPactValues and seg.demonicPactValues[pName] or nil
+                local dpTimes = seg.demonicPactTimes and seg.demonicPactTimes[pName] or nil
+                table.insert(utilItems, {
+                    plain = string.format("%s (%s):", pName, pClass),
+                    discord = string.format("**%s (%s):**", pName, pClass),
+                    html = string.format("%s (%s)", RTExt.FormatClassHTML(pName, pClass), RTExt.EscapeHTML(pClass)),
+                    subitems = RTExt.BuildCondensedEntryItems(seg.raidUtility[pName], dpVals, dpTimes, segDur),
+                })
+            end
+
+            spec = {
+                htmlHeading = string.format("[%s %s] - %s (Full Segment Report)", segZone, segDiff, segName),
+                metaLines = ui.BuildSegmentMetaLines(seg),
+                sections = {
+                    { title = string.format("1. Characters Present (%d)", #presentList), emptyText = "None", items = charItems },
+                    { title = string.format("2. Deaths & Death Log (%d Total)", totalSegDeaths), emptyText = "None", items = deathItems },
+                    { title = RTExt.reportConsumablesOnly and "3. Consumables Only" or "3. Potions & Buffs", emptyText = "None", items = potItems },
+                    { title = "4. Raid Utility", emptyText = "None", items = utilItems },
+                }
+            }
+
         elseif ui.activeReportPanel == "CHAR" then
-            local lines = BuildStandardRaidHeaderLines(seg)
             if not ui.selectedReportChar then
-                table.insert(lines, "No Character Selected in Segment.")
+                spec = {
+                    htmlHeading = string.format("[%s %s] - %s (Character Report)", segZone, segDiff, segName),
+                    metaLines = ui.BuildSegmentMetaLines(seg),
+                    sections = {
+                        { title = "Character Report", emptyText = "No Character Selected in Segment.", items = {} }
+                    }
+                }
             else
                 local pName = ui.selectedReportChar
                 local pClass = presentMap[pName] or string.upper(GetSafePlayerClass(pName))
                 if ui.activeCharSubMode == "BUFFS" then
-                    table.insert(lines, string.format("--- Character Buffs & Utility: %s (%s) ---", pName, pClass))
                     local filteredPots = RTExt.FilterPotionsAndBuffsMap((seg.potionsAndBuffs or {})[pName], RTExt.reportConsumablesOnly)
-                    local potLines = BuildCondensedEntryLines(filteredPots, "- ")
-                    table.insert(lines, RTExt.reportConsumablesOnly and "[Consumables Only]" or "[Potions & Buffs]")
-                    if #potLines == 0 then
-                        table.insert(lines, "- None recorded")
-                    else
-                        for _, l in ipairs(potLines) do table.insert(lines, l) end
-                    end
                     local dpVals = seg.demonicPactValues and seg.demonicPactValues[pName] or nil
                     local dpTimes = seg.demonicPactTimes and seg.demonicPactTimes[pName] or nil
-                    local utilLines = BuildCondensedEntryLines((seg.raidUtility or {})[pName], "- ", dpVals, dpTimes, segDur)
-                    table.insert(lines, "[Raid Utility Used]")
-                    if #utilLines == 0 then
-                        table.insert(lines, "- None recorded")
-                    else
-                        for _, l in ipairs(utilLines) do table.insert(lines, l) end
-                    end
+                    spec = {
+                        htmlHeading = string.format("[%s %s] - %s - %s (%s) Buffs & Utility", segZone, segDiff, segName, pName, pClass),
+                        metaLines = {
+                            ui.BuildSegmentMetaLines(seg)[1],
+                            {
+                                plain = string.format("Character: %s (%s)", pName, pClass),
+                                discord = string.format("**Character:** %s (%s)", pName, pClass),
+                                html = string.format("<strong>Character:</strong> %s (%s)", RTExt.FormatClassHTML(pName, pClass), RTExt.EscapeHTML(pClass)),
+                            }
+                        },
+                        sections = {
+                            {
+                                title = RTExt.reportConsumablesOnly and "Consumables Only" or "Potions & Buffs",
+                                emptyText = "None recorded",
+                                items = RTExt.BuildCondensedEntryItems(filteredPots),
+                            },
+                            {
+                                title = "Raid Utility Used",
+                                emptyText = "None recorded",
+                                items = RTExt.BuildCondensedEntryItems((seg.raidUtility or {})[pName], dpVals, dpTimes, segDur),
+                            }
+                        }
+                    }
                 else
-                    table.insert(lines, string.format("--- Character Fails Report: %s (%s) ---", pName, pClass))
                     local fails = ui.BuildSingleCharacterFails(seg, pName, pClass, segDur, maxPossible30s, enrageStr, totalEnrages, detectedTanks)
-                    if #fails == 0 then
-                        table.insert(lines, "- No fails recorded for this player.")
-                    else
-                        for _, f in ipairs(fails) do
-                            table.insert(lines, "- " .. f.text)
-                        end
+                    local failItems = {}
+                    for _, f in ipairs(fails) do
+                        table.insert(failItems, {
+                            plain = "- " .. f.text,
+                            discord = "- " .. f.text,
+                            html = '<span style="color: #FFCC66;">' .. RTExt.EscapeHTML(f.text) .. '</span>',
+                        })
                     end
+                    spec = {
+                        htmlHeading = string.format("[%s %s] - %s - %s (%s) Fails Report", segZone, segDiff, segName, pName, pClass),
+                        metaLines = {
+                            ui.BuildSegmentMetaLines(seg)[1],
+                            {
+                                plain = string.format("Character: %s (%s)", pName, pClass),
+                                discord = string.format("**Character:** %s (%s)", pName, pClass),
+                                html = string.format("<strong>Character:</strong> %s (%s)", RTExt.FormatClassHTML(pName, pClass), RTExt.EscapeHTML(pClass)),
+                            }
+                        },
+                        sections = {
+                            {
+                                title = string.format("Character Fails: %s (%s)", pName, pClass),
+                                emptyText = "No fails recorded for this player.",
+                                items = failItems,
+                            }
+                        }
+                    }
                 end
             end
-            ui.currentRaidChatLines = lines
-            ui.currentPreviewText = table.concat(lines, "\n")
 
         elseif ui.activeReportPanel == "FAILS" then
-            local lines = BuildStandardRaidHeaderLines(seg)
             local allSegDeaths = {}
             for _, dList in pairs(seg.deaths or {}) do
                 for _, d in ipairs(dList or {}) do table.insert(allSegDeaths, d) end
             end
 
             if ui.activeFailSubMode == "EARLY" then
-                table.insert(lines, "--- Raid Fails: Early Deaths ---")
                 local maxTime = segDur * 0.75
                 local earlyDeaths = {}
                 for pName, dList in pairs(seg.deaths or {}) do
@@ -5836,7 +6247,6 @@ local function CreateReportFrame()
                                 time = d.time or "",
                                 killer = StripColorCodes(d.killer or "Unknown Mob"),
                                 ability = StripColorCodes(d.ability or "Unknown Attack"),
-                                severity = 5
                             })
                         end
                     end
@@ -5846,20 +6256,30 @@ local function CreateReportFrame()
                     return a.name < b.name
                 end)
 
-                if #earlyDeaths == 0 then
-                    table.insert(lines, "None (No early deaths recorded)")
-                else
-                    local count = math.min(#earlyDeaths, ui.failLineLimit)
-                    for idx = 1, count do
-                        local d = earlyDeaths[idx]
-                        local pullStr = FormatPullTime(d.pullTime)
-                        local timeTag = pullStr and string.format("%s into pull", pullStr) or d.time
-                        table.insert(lines, string.format("- [%s] %s (%s): Died to %s (%s)", timeTag, d.name, d.class, d.killer, d.ability))
-                    end
+                local failItems = {}
+                for _, d in ipairs(earlyDeaths) do
+                    local pullStr = FormatPullTime(d.pullTime)
+                    local timeTag = pullStr and string.format("%s into pull", pullStr) or d.time
+                    table.insert(failItems, {
+                        plain = string.format("- [%s] %s (%s): Died to %s (%s)", timeTag, d.name, d.class, d.killer, d.ability),
+                        discord = string.format("- `[%s]` **%s (%s)**: Died to **%s** (*%s*)", timeTag, d.name, d.class, d.killer, d.ability),
+                        html = string.format('[%s] %s (%s): Died to <span style="color: #FFFF00;">%s</span> (<span style="color: #FFD100;">%s</span>)', RTExt.EscapeHTML(timeTag), RTExt.FormatClassHTML(d.name, d.class), RTExt.EscapeHTML(d.class), RTExt.EscapeHTML(d.killer), RTExt.EscapeHTML(d.ability)),
+                    })
                 end
 
+                spec = {
+                    htmlHeading = string.format("[%s %s] - %s (Raid Fails: Early Deaths)", segZone, segDiff, segName),
+                    metaLines = ui.BuildSegmentMetaLines(seg),
+                    sections = {
+                        {
+                            title = "Raid Fails: Early Deaths",
+                            emptyText = "None (No early deaths recorded)",
+                            items = failItems,
+                        }
+                    }
+                }
+
             elseif ui.activeFailSubMode == "SLACKERS" then
-                table.insert(lines, "--- Raid Fails: Consumable Slackers ---")
                 local slackers = {}
                 for _, pName in ipairs(presentList) do
                     local pClass = presentMap[pName] or "WARRIOR"
@@ -5871,79 +6291,106 @@ local function CreateReportFrame()
                         if not hasFood then table.insert(issues, "Missing Food"); sev = sev + 2 end
                         if potCount == 0 then table.insert(issues, "0 Potions"); sev = sev + 3
                         elseif potCount == 1 then table.insert(issues, "1 Potion"); sev = sev + 1 end
+                        local issueStr = table.concat(issues, " / ")
                         table.insert(slackers, {
-                            text = string.format("- %s (%s): %s", pName, pClass, table.concat(issues, " / ")),
-                            severity = sev
+                            name = pName,
+                            class = pClass,
+                            issueStr = issueStr,
+                            severity = sev,
                         })
                     end
                 end
-                table.sort(slackers, function(a, b) return a.severity > b.severity end)
+                table.sort(slackers, function(a, b)
+                    if a.severity ~= b.severity then return a.severity > b.severity end
+                    return a.name < b.name
+                end)
 
-                if #slackers == 0 then
-                    table.insert(lines, "None (All raiders fully consumed)")
-                else
-                    local count = math.min(#slackers, ui.failLineLimit)
-                    for idx = 1, count do
-                        table.insert(lines, slackers[idx].text)
-                    end
+                local failItems = {}
+                for _, s in ipairs(slackers) do
+                    table.insert(failItems, {
+                        plain = string.format("- %s (%s): %s", s.name, s.class, s.issueStr),
+                        discord = string.format("- **%s (%s)**: %s", s.name, s.class, s.issueStr),
+                        html = string.format('%s (%s): <span style="color: #FFCC66;">%s</span>', RTExt.FormatClassHTML(s.name, s.class), RTExt.EscapeHTML(s.class), RTExt.EscapeHTML(s.issueStr)),
+                    })
                 end
 
+                spec = {
+                    htmlHeading = string.format("[%s %s] - %s (Raid Fails: Consumable Slackers)", segZone, segDiff, segName),
+                    metaLines = ui.BuildSegmentMetaLines(seg),
+                    sections = {
+                        {
+                            title = "Raid Fails: Consumable Slackers",
+                            emptyText = "None (All raiders fully consumed)",
+                            items = failItems,
+                        }
+                    }
+                }
+
             else
-                table.insert(lines, "--- Raid Fails: Critical Cooldown & Duty Fails ---")
                 local cdFails = {}
                 local durLabel = (segDur > 0) and FormatDurationShort(segDur) or "segment"
 
                 for _, pName in ipairs(presentList) do
-                    local pClass = presentMap[pName]
+                    local pClass = presentMap[pName] or "WARRIOR"
                     local uEntries = (seg.raidUtility and seg.raidUtility[pName]) or {}
                     if pClass == "ROGUE" then
                         local tricks = CountPlayerSpellUsage(uEntries, "Tricks of the Trade")
                         if maxPossible30s > 0 and tricks < maxPossible30s then
-                            table.insert(cdFails, { text = string.format("- %s (ROGUE): Cast %d Tricks in %s (%d possible)", pName, tricks, durLabel, maxPossible30s), severity = 3 })
+                            table.insert(cdFails, { name = pName, class = pClass, roleTag = pClass, detail = string.format("Cast %d Tricks in %s (%d possible)", tricks, durLabel, maxPossible30s), severity = 3 })
                         elseif maxPossible30s == 0 and tricks == 0 then
-                            table.insert(cdFails, { text = string.format("- %s (ROGUE): Cast 0 Tricks", pName), severity = 3 })
+                            table.insert(cdFails, { name = pName, class = pClass, roleTag = pClass, detail = "Cast 0 Tricks", severity = 3 })
                         end
                     elseif pClass == "HUNTER" then
                         local mdCasts = CountPlayerSpellUsage(uEntries, "Misdirection")
                         local tranqCasts = CountPlayerSpellUsage(uEntries, "Tranquilizing Shot")
                         if maxPossible30s > 0 and mdCasts < math.max(1, math.floor(maxPossible30s / 2)) then
-                            table.insert(cdFails, { text = string.format("- %s (HUNTER): Cast %d Misdirection in %s", pName, mdCasts, durLabel), severity = 3 })
+                            table.insert(cdFails, { name = pName, class = pClass, roleTag = pClass, detail = string.format("Cast %d Misdirection in %s", mdCasts, durLabel), severity = 3 })
                         end
                         if totalEnrages > 0 and tranqCasts == 0 then
-                            table.insert(cdFails, { text = string.format("- %s (HUNTER): 0 Tranq Shots used (%s)", pName, enrageStr), severity = 5 })
+                            table.insert(cdFails, { name = pName, class = pClass, roleTag = pClass, detail = string.format("0 Tranq Shots used (%s)", enrageStr), severity = 5 })
                         end
                     end
                     if detectedTanks[pName] then
                         local tankCDCount = CountMajorTankCooldowns(seg, pName)
                         if tankCDCount == 0 then
-                            table.insert(cdFails, { text = string.format("- %s (%s - TANK): Used 0 major tank cooldowns", pName, pClass or "TANK"), severity = 5 })
+                            table.insert(cdFails, { name = pName, class = pClass, roleTag = pClass .. " - TANK", detail = "Used 0 major tank cooldowns", severity = 5 })
                         end
                     end
                     local totalU = 0
                     for _, c in pairs(uEntries) do totalU = totalU + (tonumber(c) or 0) end
                     if totalU == 0 then
-                        table.insert(cdFails, { text = string.format("- %s (%s): 0 total utility casts", pName, pClass or "RAIDER"), severity = 2 })
+                        table.insert(cdFails, { name = pName, class = pClass, roleTag = pClass, detail = "0 total utility casts", severity = 2 })
                     end
                 end
 
-                table.sort(cdFails, function(a, b) return a.severity > b.severity end)
+                table.sort(cdFails, function(a, b)
+                    if a.severity ~= b.severity then return a.severity > b.severity end
+                    return a.name < b.name
+                end)
 
-                if #cdFails == 0 then
-                    table.insert(lines, "None (No critical cooldown or duty fails recorded)")
-                else
-                    local count = math.min(#cdFails, ui.failLineLimit)
-                    for idx = 1, count do
-                        table.insert(lines, cdFails[idx].text)
-                    end
+                local failItems = {}
+                for _, cf in ipairs(cdFails) do
+                    table.insert(failItems, {
+                        plain = string.format("- %s (%s): %s", cf.name, cf.roleTag, cf.detail),
+                        discord = string.format("- **%s (%s)**: %s", cf.name, cf.roleTag, cf.detail),
+                        html = string.format('%s (%s): <span style="color: #FFCC66;">%s</span>', RTExt.FormatClassHTML(cf.name, cf.class), RTExt.EscapeHTML(cf.roleTag), RTExt.EscapeHTML(cf.detail)),
+                    })
                 end
+
+                spec = {
+                    htmlHeading = string.format("[%s %s] - %s (Raid Fails: Critical Cooldown & Duty Fails)", segZone, segDiff, segName),
+                    metaLines = ui.BuildSegmentMetaLines(seg),
+                    sections = {
+                        {
+                            title = "Raid Fails: Critical Cooldown & Duty Fails",
+                            emptyText = "None (No critical cooldown or duty fails recorded)",
+                            items = failItems,
+                        }
+                    }
+                }
             end
 
-            ui.currentRaidChatLines = lines
-            ui.currentPreviewText = table.concat(lines, "\n")
-
         elseif ui.activeReportPanel == "DEATHS" then
-            local lines = BuildStandardRaidHeaderLines(seg)
-            table.insert(lines, "--- Chronological Suspicious Deaths Breakdown ---")
             local allSegDeaths = {}
             for _, dList in pairs(seg.deaths or {}) do
                 for _, d in ipairs(dList or {}) do table.insert(allSegDeaths, d) end
@@ -5975,27 +6422,38 @@ local function CreateReportFrame()
                 return a.name < b.name
             end)
 
-            if #allDeaths == 0 then
-                table.insert(lines, "No suspicious player deaths recorded in this segment.")
-            else
-                for idx, d in ipairs(allDeaths) do
-                    local pullStr = FormatPullTime(d.pullTime)
-                    local timeTag = pullStr and string.format("%s into pull / %s", pullStr, d.time) or d.time
-                    local amt = tonumber(d.amount) or 0
-                    local ovk = tonumber(d.overkill) or 0
-                    local dmgText = (amt > 0) and string.format("%d dmg", amt) or "Fatal Effect"
-                    if ovk > 0 then dmgText = string.format("%d dmg (%d overkill)", amt, ovk) end
-                    local unusedDef = GetUnusedPersonalDefensives(seg, d.name, d.class)
-                    local unusedStr = (#unusedDef > 0) and table.concat(unusedDef, ", ") or "None unused"
-                    table.insert(lines, string.format(
-                        "%d. [%s] %s (%s) -> Killed by %s / Ability: %s / Damage: %s / Unused Defensives: %s",
-                        idx, timeTag, d.name, d.class, d.killer, d.ability, dmgText, unusedStr
-                    ))
-                end
+            local deathItems = {}
+            for idx, d in ipairs(allDeaths) do
+                local pullStr = FormatPullTime(d.pullTime)
+                local timeTag = pullStr and string.format("%s into pull / %s", pullStr, d.time) or d.time
+                local amt = tonumber(d.amount) or 0
+                local ovk = tonumber(d.overkill) or 0
+                local dmgText = (amt > 0) and string.format("%d dmg", amt) or "Fatal Effect"
+                if ovk > 0 then dmgText = string.format("%d dmg (%d overkill)", amt, ovk) end
+                local unusedDef = GetUnusedPersonalDefensives(seg, d.name, d.class)
+                local unusedStr = (#unusedDef > 0) and table.concat(unusedDef, ", ") or "None unused"
+                table.insert(deathItems, {
+                    plain = string.format("%d. [%s] %s (%s) -> Killed by %s / Ability: %s / Damage: %s / Unused Defensives: %s", idx, timeTag, d.name, d.class, d.killer, d.ability, dmgText, unusedStr),
+                    discord = string.format("%d. `[%s]` **%s (%s)** -> Killed by **%s** / Ability: *%s* / Damage: %s / Unused Defensives: %s", idx, timeTag, d.name, d.class, d.killer, d.ability, dmgText, unusedStr),
+                    html = string.format('%d. [%s] %s (%s) &rarr; Killed by <span style="color: #FFFF00;">%s</span> | Ability: <span style="color: #FFD100;">%s</span> | Damage: <span style="color: #FFFF00;">%s</span> | Unused Defensives: <span style="color: #FF8888;">%s</span>', idx, RTExt.EscapeHTML(timeTag), RTExt.FormatClassHTML(d.name, d.class), RTExt.EscapeHTML(d.class), RTExt.EscapeHTML(d.killer), RTExt.EscapeHTML(d.ability), RTExt.EscapeHTML(dmgText), RTExt.EscapeHTML(unusedStr)),
+                })
             end
 
-            ui.currentRaidChatLines = lines
-            ui.currentPreviewText = table.concat(lines, "\n")
+            spec = {
+                htmlHeading = string.format("[%s %s] - %s (Chronological Suspicious Deaths)", segZone, segDiff, segName),
+                metaLines = ui.BuildSegmentMetaLines(seg),
+                sections = {
+                    {
+                        title = "Chronological Suspicious Deaths Breakdown",
+                        emptyText = "No suspicious player deaths recorded in this segment.",
+                        items = deathItems,
+                    }
+                }
+            }
+        end
+
+        if spec then
+            ui.currentPreviewText, ui.currentRaidChatLines = RTExt.RenderStandardReport(spec, ui.outputFormat, activeLineLimit)
         end
 
         ui.editBox:SetText(ui.currentPreviewText)
@@ -6015,24 +6473,6 @@ local function CreateReportFrame()
     ui.btnFailEarly:SetScript("OnClick", function() ui.activeFailSubMode = "EARLY"; ui.GenerateReport() end)
     ui.btnFailSlack:SetScript("OnClick", function() ui.activeFailSubMode = "SLACKERS"; ui.GenerateReport() end)
     ui.btnFailCds:SetScript("OnClick", function() ui.activeFailSubMode = "FAILS"; ui.GenerateReport() end)
-
-    ui.chkPlain:SetScript("OnClick", function()
-        ui.activeAllFormat = "PLAIN"
-        ui.chkPlain:SetChecked(true); ui.chkDiscord:SetChecked(false); ui.chkHTML:SetChecked(false)
-        ui.GenerateReport()
-    end)
-
-    ui.chkDiscord:SetScript("OnClick", function()
-        ui.activeAllFormat = "DISCORD"
-        ui.chkPlain:SetChecked(false); ui.chkDiscord:SetChecked(true); ui.chkHTML:SetChecked(false)
-        ui.GenerateReport()
-    end)
-
-    ui.chkHTML:SetScript("OnClick", function()
-        ui.activeAllFormat = "HTML"
-        ui.chkPlain:SetChecked(false); ui.chkDiscord:SetChecked(false); ui.chkHTML:SetChecked(true)
-        ui.GenerateReport()
-    end)
 
     ui.btnCharBuffs:SetScript("OnClick", function() ui.activeCharSubMode = "BUFFS"; ui.GenerateReport() end)
     ui.btnCharFails:SetScript("OnClick", function() ui.activeCharSubMode = "FAILS"; ui.GenerateReport() end)
