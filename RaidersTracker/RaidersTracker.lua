@@ -63,6 +63,8 @@ RTExt.charActiveOnly = false
 RTExt.pendingLargeRaidLines = nil
 RTExt.OnRaidChatQueueStateChanged = nil
 RTExt.OpenReportPanel = nil
+RTExt.wipeSpeechHeard = false
+RTExt.deadOutOfRangeAccum = 0
 
 local function GetAddonVersion()
     return GetAddOnMetadata("RaidersTracker", "Version") or ""
@@ -542,6 +544,31 @@ local function CachePlayerCharID(name, guid, targetSegment)
     return charID
 end
 
+function RTExt.RecordGroupMemberInSession(name, engClass, guid, targetSegment)
+    if not name or name == "" or name == UNKNOWN then return end
+    local shortName = name:match("^([^%-]+)") or name
+    if engClass and engClass ~= "" then
+        groupClasses[shortName] = engClass
+    end
+    local resolvedClass = (engClass and engClass ~= "") and engClass or groupClasses[shortName] or "WARRIOR"
+    if currentSession then
+        currentSession.players = currentSession.players or {}
+        if not currentSession.players[shortName] or (engClass and engClass ~= "") then
+            currentSession.players[shortName] = resolvedClass
+        end
+    end
+    local seg = targetSegment or (currentSession and currentSession.segments and currentSession.segments[1])
+    if seg then
+        seg.players = seg.players or {}
+        if not seg.players[shortName] or (engClass and engClass ~= "") then
+            seg.players[shortName] = resolvedClass
+        end
+    end
+    if guid then
+        CachePlayerCharID(shortName, guid, seg)
+    end
+end
+
 local function UpdateGroupCache()
     table.wipe(groupMembers)
     table.wipe(groupGUIDs)
@@ -551,30 +578,43 @@ local function UpdateGroupCache()
     table.wipe(RTExt.petNameToOwner)
     table.wipe(RTExt.playerGUIDToUnit)
     table.wipe(RTExt.playerNameToUnit)
-    local function CacheUnit(unit, petUnit)
+
+    local inGroup = (GetNumRaidMembers() > 0) or (GetNumPartyMembers() > 0)
+
+    local function CacheUnit(unit, petUnit, fallbackName, fallbackClass)
         local name = UnitName(unit)
+        if not name or name == UNKNOWN then
+            name = fallbackName
+        end
         if name and name ~= UNKNOWN then
-            groupMembers[name] = true
-            RTExt.playerNameToUnit[name] = unit
+            local shortName = name:match("^([^%-]+)") or name
+            groupMembers[shortName] = true
+            RTExt.playerNameToUnit[shortName] = unit
             local uGUID = UnitGUID(unit)
             if uGUID then
                 RTExt.playerGUIDToUnit[uGUID] = unit
-                CachePlayerCharID(name, uGUID)
-            elseif nameToCharID[name] then
-                local cID = nameToCharID[name]
-                charIDToName[cID] = name
-                groupGUIDs[cID] = name
-                groupGUIDToName[cID] = name
+                CachePlayerCharID(shortName, uGUID)
+            elseif nameToCharID[shortName] then
+                local cID = nameToCharID[shortName]
+                charIDToName[cID] = shortName
+                groupGUIDs[cID] = shortName
+                groupGUIDToName[cID] = shortName
             end
             local _, engClass = UnitClass(unit)
-            if engClass then groupClasses[name] = engClass end
+            if (not engClass or engClass == "") and fallbackClass and fallbackClass ~= "" then
+                engClass = fallbackClass
+            end
+            if engClass and engClass ~= "" then groupClasses[shortName] = engClass end
+            if inGroup then
+                RTExt.RecordGroupMemberInSession(shortName, engClass, uGUID)
+            end
             if petUnit and UnitExists(petUnit) then
                 local petGUID = UnitGUID(petUnit)
                 local petName = UnitName(petUnit)
                 local ownerInfo = {
-                    name = name,
+                    name = shortName,
                     guid = uGUID,
-                    class = engClass or groupClasses[name],
+                    class = engClass or groupClasses[shortName],
                     unit = unit,
                     petUnit = petUnit,
                 }
@@ -595,7 +635,10 @@ local function UpdateGroupCache()
     CacheUnit("player", "pet")
     local numRaid = GetNumRaidMembers()
     if numRaid > 0 then
-        for i = 1, numRaid do CacheUnit("raid" .. i, "raidpet" .. i) end
+        for i = 1, numRaid do
+            local rName, _, _, _, _, rFileName = GetRaidRosterInfo(i)
+            CacheUnit("raid" .. i, "raidpet" .. i, rName, rFileName)
+        end
     else
         local numParty = GetNumPartyMembers()
         for i = 1, numParty do CacheUnit("party" .. i, "partypet" .. i) end
@@ -662,6 +705,66 @@ local function IsRaidInCombat()
         end
     end
     return false
+end
+
+function RTExt.GetRaidAliveStats(targetZone)
+    local aliveCount, deadCount, totalTracked, inRangeCount = 0, 0, 0, 0
+    local numRaid = GetNumRaidMembers()
+    if numRaid > 0 then
+        local zoneFilter = (targetZone and targetZone ~= "" and targetZone ~= "Unknown") and targetZone or nil
+        local function ScanRaid(useZoneFilter)
+            local a, d, t, vis = 0, 0, 0, 0
+            for i = 1, numRaid do
+                local rName, _, _, _, _, _, rZone, rOnline, rIsDead = GetRaidRosterInfo(i)
+                if rName and rOnline then
+                    if (not useZoneFilter) or (rZone == zoneFilter) then
+                        local unit = "raid" .. i
+                        local isDead = (rIsDead == 1 or rIsDead == true) or (UnitExists(unit) and UnitIsDeadOrGhost(unit))
+                        t = t + 1
+                        if isDead then
+                            d = d + 1
+                        else
+                            a = a + 1
+                            if UnitExists(unit) and UnitIsVisible(unit) then
+                                vis = vis + 1
+                            end
+                        end
+                    end
+                end
+            end
+            return a, d, t, vis
+        end
+        if zoneFilter then
+            aliveCount, deadCount, totalTracked, inRangeCount = ScanRaid(true)
+        end
+        if totalTracked == 0 then
+            aliveCount, deadCount, totalTracked, inRangeCount = ScanRaid(false)
+        end
+    else
+        totalTracked = 1
+        if UnitIsDeadOrGhost("player") then
+            deadCount = 1
+        else
+            aliveCount = 1
+            inRangeCount = 1
+        end
+        local numParty = GetNumPartyMembers()
+        for i = 1, numParty do
+            local unit = "party" .. i
+            if UnitExists(unit) and UnitIsConnected(unit) then
+                totalTracked = totalTracked + 1
+                if UnitIsDeadOrGhost(unit) then
+                    deadCount = deadCount + 1
+                else
+                    aliveCount = aliveCount + 1
+                    if UnitIsVisible(unit) then
+                        inRangeCount = inRangeCount + 1
+                    end
+                end
+            end
+        end
+    end
+    return aliveCount, deadCount, totalTracked, inRangeCount
 end
 
 local function GetNPCIDFromGUID(guid)
@@ -1508,7 +1611,10 @@ local BOSS_DEFEAT_SPEECH = {
     ["I see... only darkness"] = "Lord Marrowgar",
     ["All is part of the Master's plan"] = "Lady Deathwhisper",
     ["Don't say I didn't warn ya, scoundrels"] = "Icecrown Gunship Battle",
-    ["The Alliance falters. Onward to the Lich King"] = "Icecrown Gunship Battle",
+    ["warn you, scoundrels"] = "Icecrown Gunship Battle",
+    ["Onward, brothers and sisters"] = "Icecrown Gunship Battle",
+    ["The Alliance falter"] = "Icecrown Gunship Battle",
+    ["Onward to the Lich King"] = "Icecrown Gunship Battle",
     ["I... am... released"] = "Deathbringer Saurfang",
     ["Da-da... I..."] = "Festergut",
     ["Bad news, daddy"] = "Rotface",
@@ -1560,6 +1666,14 @@ local BOSS_DEFEAT_SPEECH = {
 local LICH_KING_RP_SPEECH = {
     "no questions remain unanswered", "greatest champions", "light, grant me one final blessing",
     "shatter this prison", "no more, arthas", "now i stand, the lion", "they cannot fear"
+}
+
+RTExt.BOSS_WIPE_SPEECH = {
+    ["the skybreaker's lost"] = "Icecrown Gunship Battle",
+    ["the skybreaker is lost"] = "Icecrown Gunship Battle",
+    ["damage sustained is too great"] = "Icecrown Gunship Battle",
+    ["orgrim's hammer's lost"] = "Icecrown Gunship Battle",
+    ["orgrim's hammer is lost"] = "Icecrown Gunship Battle",
 }
 
 local WOTLK_BOSS_INITIATORS = {
@@ -1936,6 +2050,9 @@ local function EnsureTrashSegment()
         local newTrashSeg = GetNewSegment("TRASH", false, nil, nil, nil)
         table.insert(currentSession.segments, 1, newTrashSeg)
         currentSegment = currentSession.segments[1]
+        if (GetNumRaidMembers() > 0) or (GetNumPartyMembers() > 0) then
+            UpdateGroupCache()
+        end
     elseif topSeg and not topSeg.isBoss and topSeg.difficulty ~= currentDiff then
         topSeg.difficulty = currentDiff
         lastKnownDiff = currentDiff
@@ -1951,6 +2068,8 @@ local function ResetLiveSessionState()
     lichKingRPActive = false
     lichKingRPElapsed = 0
     RTExt.lichKingFuryTime = nil
+    RTExt.wipeSpeechHeard = false
+    RTExt.deadOutOfRangeAccum = 0
     activeBossID = nil
     activeBossName = nil
     activeBossData = nil
@@ -2089,7 +2208,7 @@ function RTExt.CloseActiveZoneStint(entry)
     if type(entry) ~= "table" then return end
     if entry.inGroup then
         if (tonumber(entry.curr) or 0) > 0 then
-            entry.prev = tonumber(entry.curr) or 0
+            entry.prev = (tonumber(entry.prev) or 0) + (tonumber(entry.curr) or 0)
             entry.curr = 0
         end
         entry.inGroup = false
@@ -2157,14 +2276,8 @@ function RTExt.UpdateSessionZoneTimes(dt)
             if rName and rName ~= UNKNOWN then
                 local shortName = rName:match("^([^%-]+)") or rName
                 presentInGroup[shortName] = true
-                if rFileName and rFileName ~= "" then
-                    currentSession.players[shortName] = currentSession.players[shortName] or rFileName
-                    groupClasses[shortName] = groupClasses[shortName] or rFileName
-                end
                 local uGUID = UnitGUID("raid" .. i)
-                if uGUID then
-                    CachePlayerCharID(shortName, uGUID)
-                end
+                RTExt.RecordGroupMemberInSession(shortName, rFileName, uGUID)
                 if rOnline and rZone and rZone ~= "" and rZone ~= "Offline" then
                     RTExt.AddZoneTimeSeconds(currentSession, shortName, rZone, dt)
                 end
@@ -2176,7 +2289,7 @@ function RTExt.UpdateSessionZoneTimes(dt)
         if myName and myName ~= UNKNOWN then
             presentInGroup[myName] = true
             local _, myClass = UnitClass("player")
-            if myClass then currentSession.players[myName] = currentSession.players[myName] or myClass end
+            RTExt.RecordGroupMemberInSession(myName, myClass, UnitGUID("player"))
             if myZone ~= "Unknown" then
                 RTExt.AddZoneTimeSeconds(currentSession, myName, myZone, dt)
             end
@@ -2188,9 +2301,8 @@ function RTExt.UpdateSessionZoneTimes(dt)
                 if pName and pName ~= UNKNOWN then
                     presentInGroup[pName] = true
                     local _, pClass = UnitClass(unit)
-                    if pClass then currentSession.players[pName] = currentSession.players[pName] or pClass end
                     local uGUID = UnitGUID(unit)
-                    if uGUID then CachePlayerCharID(pName, uGUID) end
+                    RTExt.RecordGroupMemberInSession(pName, pClass, uGUID)
                     if UnitIsConnected(unit) and myZone ~= "Unknown" and (UnitIsVisible(unit) or IsInInstance()) then
                         RTExt.AddZoneTimeSeconds(currentSession, pName, myZone, dt)
                     end
@@ -2318,6 +2430,8 @@ local function StartEncounter(bossID, bossName, overrideData, fromSpeech)
     lichKingRPActive = false
     lichKingRPElapsed = 0
     RTExt.lichKingFuryTime = nil
+    RTExt.wipeSpeechHeard = false
+    RTExt.deadOutOfRangeAccum = 0
     bossStartTime = now
     outOfCombatAccum = 0
     gracePeriodAccum = 0
@@ -2411,34 +2525,78 @@ local function StartEncounter(bossID, bossName, overrideData, fromSpeech)
     RequestMainViewRefresh()
 end
 
-local function EndEncounter(isVictory, reason)
+function RTExt.PromoteRecentWipeToVictory(bossName, reason)
+    if inCombatState or not bossName or not currentSession or not currentSession.segments then return false end
+    local now = GetTime()
+    local maxCheck = math.min(2, #currentSession.segments)
+    for idx = 1, maxCheck do
+        local seg = currentSession.segments[idx]
+        if seg and seg.isBoss and seg.bossName == bossName and seg.name and seg.name:find("%[Wipe") then
+            if seg.endedAt and (now - seg.endedAt) <= 120.0 then
+                local dur = math.max(1, math.floor(tonumber(seg.duration) or 1))
+                local timeStr = string.format("%dm %ds", math.floor(dur / 60), dur % 60)
+                seg.name = string.format("%s [Victory - %s]", bossName, timeStr)
+                bossEndCooldowns[bossName] = now
+                defeatedBossLocks[bossName] = now
+                RepairSplitLichKingSegments(currentSession)
+                AnnounceLocalChat(string.format("VICTORY (confirmed): %s was killed and it was a victory! (%s)", bossName, timeStr))
+                RequestMainViewRefresh()
+                return true
+            end
+        end
+    end
+    return false
+end
+
+local function EndEncounter(isVictory, reason, oocSubtract)
     if not inCombatState then return end
 
     local now = GetTime()
     local finishedBoss = activeBossName or "Boss"
-
-    if not isVictory and finishedBoss == "Faction Champions" then
-        local champsKilled = 0
-        for _ in pairs(defeatedGroupNPCs) do champsKilled = champsKilled + 1 end
-        local diff = GetRaidDifficultySuffix()
-        local reqKills = (diff:find("25") ~= nil) and 10 or 6
-        if champsKilled >= reqKills or (champsKilled >= 4 and not UnitIsDeadOrGhost("player")) then
-            isVictory = true
-        end
-    end
-
-    if not isVictory and finishedBoss == "The Lich King" and lichKingRPActive and not UnitIsDeadOrGhost("player") then
-        isVictory = true
-    end
+    local activeSeg = (currentSession and currentSession.segments[1] and currentSession.segments[1].isBoss) and currentSession.segments[1] or nil
+    local bossZone = (activeSeg and activeSeg.zone) or GetCurrentZoneSafe()
+    local aliveCount, deadCount, totalTracked = RTExt.GetRaidAliveStats(bossZone)
 
     local usedLKFuryTime = false
     local effectiveEndTime = now
+    if oocSubtract and oocSubtract > 0 then
+        effectiveEndTime = math.max(bossStartTime + 1, now - oocSubtract)
+    end
     if isVictory and finishedBoss == "The Lich King" and RTExt.lichKingFuryTime and RTExt.lichKingFuryTime >= bossStartTime then
         effectiveEndTime = RTExt.lichKingFuryTime
         usedLKFuryTime = true
     end
 
     local duration = math.max(1, math.floor(effectiveEndTime - bossStartTime))
+
+    if not isVictory and finishedBoss == "Faction Champions" then
+        local champsKilled = 0
+        for _ in pairs(defeatedGroupNPCs) do champsKilled = champsKilled + 1 end
+        local diff = GetRaidDifficultySuffix()
+        local reqKills = (diff:find("25") ~= nil) and 10 or 6
+        if champsKilled >= reqKills or (champsKilled >= 4 and aliveCount > 0) then
+            isVictory = true
+        end
+    end
+
+    if not isVictory and finishedBoss == "The Lich King" and lichKingRPActive and aliveCount > 0 then
+        isVictory = true
+        if RTExt.lichKingFuryTime and RTExt.lichKingFuryTime >= bossStartTime then
+            effectiveEndTime = RTExt.lichKingFuryTime
+            usedLKFuryTime = true
+            duration = math.max(1, math.floor(effectiveEndTime - bossStartTime))
+        end
+    end
+
+    -- Gunship Battle cannot be reset by running out while alive: if combat ends after a real pull
+    -- with no wipe speech and at least half of the raid in the zone alive, treat as Victory
+    -- even if the local player died and missed the victory yell.
+    if not isVictory and finishedBoss == "Icecrown Gunship Battle" and hasEnteredBossCombat
+        and (not RTExt.wipeSpeechHeard) and duration >= RTExt.MIN_BOSS_PULL_DURATION
+        and totalTracked > 0 and aliveCount >= math.max(1, math.ceil(totalTracked * 0.5)) then
+        isVictory = true
+    end
+
     local mins = math.floor(duration / 60)
     local secs = duration % 60
     local timeStr = string.format("%dm %ds", mins, secs)
@@ -2446,18 +2604,19 @@ local function EndEncounter(isVictory, reason)
     if isVictory then
         bossEndCooldowns[finishedBoss] = now
         defeatedBossLocks[finishedBoss] = now
-        if currentSession.segments[1] and currentSession.segments[1].isBoss then
-            currentSession.segments[1].duration = duration
+        if activeSeg then
+            activeSeg.duration = duration
+            activeSeg.endedAt = now
             if usedLKFuryTime then
-                currentSession.segments[1].lkFuryDuration = duration
+                activeSeg.lkFuryDuration = duration
             end
-            currentSession.segments[1].name = string.format("%s [Victory - %s]", finishedBoss, timeStr)
+            activeSeg.name = string.format("%s [Victory - %s]", finishedBoss, timeStr)
         end
         RepairSplitLichKingSegments(currentSession)
         AnnounceLocalChat(string.format("VICTORY: %s was killed and it was a victory! (%s)", finishedBoss, timeStr))
     else
         if duration < RTExt.MIN_BOSS_PULL_DURATION or not hasEnteredBossCombat then
-            if currentSession.segments[1] and currentSession.segments[1].isBoss then
+            if activeSeg then
                 table.remove(currentSession.segments, 1)
             end
             if activeBossName and bossAttemptCount[activeBossName] and bossAttemptCount[activeBossName] > 0 then
@@ -2466,9 +2625,10 @@ local function EndEncounter(isVictory, reason)
             AnnounceLocalChat(string.format("Boss combat ended: %s (Attempt < %ds removed)", finishedBoss, RTExt.MIN_BOSS_PULL_DURATION))
         else
             bossEndCooldowns[finishedBoss] = now
-            if currentSession.segments[1] and currentSession.segments[1].isBoss then
-                currentSession.segments[1].duration = duration
-                currentSession.segments[1].name = string.format("%s [Wipe %d - %s]", finishedBoss, currentSession.segments[1].attempt or 1, timeStr)
+            if activeSeg then
+                activeSeg.duration = duration
+                activeSeg.endedAt = now
+                activeSeg.name = string.format("%s [Wipe %d - %s]", finishedBoss, activeSeg.attempt or 1, timeStr)
             end
             RepairSplitLichKingSegments(currentSession)
             AnnounceLocalChat(string.format("Boss combat ended: %s (%s)", finishedBoss, timeStr))
@@ -2480,6 +2640,8 @@ local function EndEncounter(isVictory, reason)
     lichKingRPActive = false
     lichKingRPElapsed = 0
     RTExt.lichKingFuryTime = nil
+    RTExt.wipeSpeechHeard = false
+    RTExt.deadOutOfRangeAccum = 0
     activeBossID = nil
     activeBossName = nil
     activeBossData = nil
@@ -2531,6 +2693,7 @@ combatWatchdogFrame:SetScript("OnUpdate", function(self, elapsed)
     if not inCombatState then
         outOfCombatAccum = 0
         gracePeriodAccum = 0
+        RTExt.deadOutOfRangeAccum = 0
         return
     end
 
@@ -2550,6 +2713,7 @@ combatWatchdogFrame:SetScript("OnUpdate", function(self, elapsed)
     if IsRaidInCombat() then
         hasEnteredBossCombat = true
         outOfCombatAccum = 0
+        RTExt.deadOutOfRangeAccum = 0
         return
     end
 
@@ -2562,10 +2726,30 @@ combatWatchdogFrame:SetScript("OnUpdate", function(self, elapsed)
 
     if gracePeriodAccum < 5.0 then return end
 
+    local activeSeg = (currentSession and currentSession.segments[1] and currentSession.segments[1].isBoss) and currentSession.segments[1] or nil
+    local bossZone = (activeSeg and activeSeg.zone) or GetCurrentZoneSafe()
+    local aliveCount, deadCount, totalTracked, inRangeCount = RTExt.GetRaidAliveStats(bossZone)
+
+    -- If local player is dead/ghost and out of visibility range of living raidmates (e.g., released spirit
+    -- or knocked off Gunship), UnitAffectingCombat cannot see raidmates; hold off ending as a wipe while
+    -- raidmates remain alive (up to 90s safety cap).
+    if UnitIsDeadOrGhost("player") and inRangeCount == 0 and aliveCount > 0 then
+        RTExt.deadOutOfRangeAccum = (RTExt.deadOutOfRangeAccum or 0) + elapsed
+        if RTExt.deadOutOfRangeAccum < 90.0 then
+            return
+        end
+    else
+        RTExt.deadOutOfRangeAccum = 0
+    end
+
+    local isScripted = (activeBossData and activeBossData.scriptedFinish) or false
+    local oocThreshold = (isScripted and aliveCount > 0 and not RTExt.wipeSpeechHeard) and 12.0 or 3.5
+
     outOfCombatAccum = outOfCombatAccum + elapsed
-    if outOfCombatAccum >= 3.5 then
+    if outOfCombatAccum >= oocThreshold then
+        local waited = outOfCombatAccum
         outOfCombatAccum = 0
-        EndEncounter(false, "Boss Despawned / Wipe / Combat Ended")
+        EndEncounter(false, "Boss Despawned / Wipe / Combat Ended", (waited > 4.0) and waited or 0)
     end
 end)
 
@@ -4973,8 +5157,9 @@ end
 -------------------------------------------------------------------------------
 function RTExt.CountActiveSessionPlayers(activeSession, playerMap)
     local activeSet = {}
+    local inGroupSet = {}
     if not activeSession or activeSession ~= currentSession then
-        return 0, activeSet
+        return 0, activeSet, inGroupSet
     end
     local numRaid = GetNumRaidMembers()
     if numRaid > 0 then
@@ -4982,8 +5167,11 @@ function RTExt.CountActiveSessionPlayers(activeSession, playerMap)
             local rName, _, _, _, _, rFileName, _, rOnline = GetRaidRosterInfo(i)
             if rName and rName ~= UNKNOWN then
                 local shortName = rName:match("^([^%-]+)") or rName
+                inGroupSet[shortName] = true
+                local pClass = (rFileName and rFileName ~= "") and rFileName or GetSafePlayerClass(shortName)
+                RTExt.RecordGroupMemberInSession(shortName, pClass, UnitGUID("raid" .. i))
                 if playerMap and not playerMap[shortName] then
-                    playerMap[shortName] = (rFileName and rFileName ~= "") and rFileName or GetSafePlayerClass(shortName)
+                    playerMap[shortName] = pClass
                 end
                 if rOnline then
                     activeSet[shortName] = true
@@ -4995,8 +5183,11 @@ function RTExt.CountActiveSessionPlayers(activeSession, playerMap)
         if numParty > 0 then
             local myName = UnitName("player")
             if myName and myName ~= UNKNOWN then
+                inGroupSet[myName] = true
+                local myClass = GetSafePlayerClass(myName)
+                RTExt.RecordGroupMemberInSession(myName, myClass, UnitGUID("player"))
                 if playerMap and not playerMap[myName] then
-                    playerMap[myName] = GetSafePlayerClass(myName)
+                    playerMap[myName] = myClass
                 end
                 activeSet[myName] = true
             end
@@ -5005,8 +5196,11 @@ function RTExt.CountActiveSessionPlayers(activeSession, playerMap)
                 if UnitExists(unit) then
                     local pName = UnitName(unit)
                     if pName and pName ~= UNKNOWN then
+                        inGroupSet[pName] = true
+                        local pClass = GetSafePlayerClass(pName)
+                        RTExt.RecordGroupMemberInSession(pName, pClass, UnitGUID(unit))
                         if playerMap and not playerMap[pName] then
-                            playerMap[pName] = GetSafePlayerClass(pName)
+                            playerMap[pName] = pClass
                         end
                         if UnitIsConnected(unit) then
                             activeSet[pName] = true
@@ -5018,7 +5212,61 @@ function RTExt.CountActiveSessionPlayers(activeSession, playerMap)
     end
     local count = 0
     for _ in pairs(activeSet) do count = count + 1 end
-    return count, activeSet
+    return count, activeSet, inGroupSet
+end
+
+function RTExt.CollectSessionCharacters(activeSession)
+    local playerMap = {}
+    local playerIDMap = {}
+    if not activeSession then
+        return playerMap, playerIDMap, 0, {}, {}
+    end
+
+    local function AddChar(pName, pClass)
+        if not pName or pName == "" or pName == UNKNOWN then return end
+        local shortName = pName:match("^([^%-]+)") or pName
+        if pClass and pClass ~= "" then
+            playerMap[shortName] = pClass
+        elseif not playerMap[shortName] then
+            playerMap[shortName] = GetSafePlayerClass(shortName)
+        end
+    end
+
+    for pName, pClass in pairs(activeSession.players or {}) do
+        AddChar(pName, pClass)
+    end
+    for pName, cID in pairs(activeSession.playerIDs or {}) do
+        local shortName = pName:match("^([^%-]+)") or pName
+        playerIDMap[shortName] = cID
+        AddChar(shortName, nil)
+    end
+    if activeSession.zoneTimes then
+        for pName in pairs(activeSession.zoneTimes) do
+            AddChar(pName, nil)
+        end
+    end
+    for _, seg in ipairs(activeSession.segments or {}) do
+        for pName, pClass in pairs(seg.players or {}) do
+            AddChar(pName, pClass)
+        end
+        for pName, cID in pairs(seg.playerIDs or {}) do
+            local shortName = pName:match("^([^%-]+)") or pName
+            playerIDMap[shortName] = playerIDMap[shortName] or cID
+            AddChar(shortName, nil)
+        end
+        for pName in pairs(seg.potionsAndBuffs or {}) do
+            AddChar(pName, nil)
+        end
+        for pName in pairs(seg.raidUtility or {}) do
+            AddChar(pName, nil)
+        end
+        for pName in pairs(seg.deaths or {}) do
+            AddChar(pName, nil)
+        end
+    end
+
+    local activeCount, activeSet, inGroupSet = RTExt.CountActiveSessionPlayers(activeSession, playerMap)
+    return playerMap, playerIDMap, activeCount, activeSet, inGroupSet
 end
 
 local function CreateCharacterFrame()
@@ -5229,31 +5477,7 @@ local function CreateCharacterFrame()
             zoneHeaderLabel:SetText(string.format("Majority Raid Zone: |cffFFD100%s|r", majZone or "Unknown"))
         end
 
-        local playerMap = {}
-        local playerIDMap = {}
-        for pName, pClass in pairs((activeSession and activeSession.players) or {}) do
-            playerMap[pName] = pClass
-        end
-        for pName, cID in pairs((activeSession and activeSession.playerIDs) or {}) do
-            playerIDMap[pName] = cID
-        end
-        if activeSession and activeSession.zoneTimes then
-            for pName in pairs(activeSession.zoneTimes) do
-                if not playerMap[pName] then
-                    playerMap[pName] = GetSafePlayerClass(pName)
-                end
-            end
-        end
-        for _, seg in ipairs((activeSession and activeSession.segments) or {}) do
-            for pName, pClass in pairs(seg.players or {}) do
-                playerMap[pName] = pClass
-            end
-            for pName, cID in pairs(seg.playerIDs or {}) do
-                playerIDMap[pName] = playerIDMap[pName] or cID
-            end
-        end
-
-        local activeCount, activeSet = RTExt.CountActiveSessionPlayers(activeSession, playerMap)
+        local playerMap, playerIDMap, activeCount, activeSet, inGroupSet = RTExt.CollectSessionCharacters(activeSession)
 
         local totalPlayersCount = 0
         local sortedPlayers = {}
@@ -5312,7 +5536,15 @@ local function CreateCharacterFrame()
             if activeSession and activeSession.zoneTimes and activeSession.zoneTimes[pName] and majZone then
                 zoneSecs = RTExt.GetZoneTimeTotal(activeSession.zoneTimes[pName][majZone])
             end
-            rows[idx].text:SetText(string.format("%s |cff888888(%s)|r - |cff00FF00%s|r", ColorizeText(pName, hexColor), pClass, RTExt.FormatZoneDuration(zoneSecs)))
+            local statusTag = ""
+            if activeSession == currentSession and ((GetNumRaidMembers() > 0) or (GetNumPartyMembers() > 0)) then
+                if inGroupSet[pName] and not activeSet[pName] then
+                    statusTag = " |cffFFAA00[DC]|r"
+                elseif not inGroupSet[pName] then
+                    statusTag = " |cffFF5555[Left]|r"
+                end
+            end
+            rows[idx].text:SetText(string.format("%s |cff888888(%s)|r - |cff00FF00%s|r%s", ColorizeText(pName, hexColor), pClass, RTExt.FormatZoneDuration(zoneSecs), statusTag))
             rows[idx].btnWhisper.playerName = pName
             rows[idx].btnBlacklist.playerName = pName
             rows[idx].btnBlacklist.playerClass = pClass
@@ -5336,24 +5568,7 @@ function RTExt.BuildCharacterExportReportSpec()
         RTExt.activeMajorityRaidZone = majZone
     end
 
-    local playerMap = {}
-    for pName, pClass in pairs((activeSession and activeSession.players) or {}) do
-        playerMap[pName] = pClass
-    end
-    if activeSession and activeSession.zoneTimes then
-        for pName in pairs(activeSession.zoneTimes) do
-            if not playerMap[pName] then
-                playerMap[pName] = GetSafePlayerClass(pName)
-            end
-        end
-    end
-    for _, seg in ipairs((activeSession and activeSession.segments) or {}) do
-        for pName, pClass in pairs(seg.players or {}) do
-            playerMap[pName] = pClass
-        end
-    end
-
-    local activeCount = RTExt.CountActiveSessionPlayers(activeSession, playerMap)
+    local playerMap, _, activeCount = RTExt.CollectSessionCharacters(activeSession)
 
     local sortedPlayers = {}
     for pName in pairs(playerMap) do table.insert(sortedPlayers, pName) end
@@ -7495,6 +7710,7 @@ eventHandler:RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED")
 eventHandler:RegisterEvent("PLAYER_REGEN_DISABLED")
 eventHandler:RegisterEvent("PLAYER_REGEN_ENABLED")
 eventHandler:RegisterEvent("CHAT_MSG_MONSTER_YELL")
+eventHandler:RegisterEvent("CHAT_MSG_MONSTER_SAY")
 eventHandler:RegisterEvent("CHAT_MSG_MONSTER_EMOTE")
 eventHandler:RegisterEvent("CHAT_MSG_RAID_BOSS_EMOTE")
 
@@ -7601,16 +7817,27 @@ eventHandler:SetScript("OnEvent", function(self, event, ...)
 
     if not RaidersTrackerDB.enabled then return end
 
-    if event == "CHAT_MSG_MONSTER_YELL" or event == "CHAT_MSG_MONSTER_EMOTE" or event == "CHAT_MSG_RAID_BOSS_EMOTE" then
+    if event == "CHAT_MSG_MONSTER_YELL" or event == "CHAT_MSG_MONSTER_SAY" or event == "CHAT_MSG_MONSTER_EMOTE" or event == "CHAT_MSG_RAID_BOSS_EMOTE" then
         local msg = ...
         msg = msg or ""
         local lowerMsg = msg:lower()
 
         if not inCombatState then
-            for phrase, bossName in pairs(BOSS_ENGAGE_SPEECH) do
+            local promoted = false
+            for phrase, bossName in pairs(BOSS_DEFEAT_SPEECH) do
                 if lowerMsg:find(phrase:lower(), 1, true) then
-                    StartEncounter(nil, bossName, nil, true)
-                    break
+                    if RTExt.PromoteRecentWipeToVictory(bossName, "Late Boss Defeat Speech") then
+                        promoted = true
+                        break
+                    end
+                end
+            end
+            if not promoted then
+                for phrase, bossName in pairs(BOSS_ENGAGE_SPEECH) do
+                    if lowerMsg:find(phrase:lower(), 1, true) then
+                        StartEncounter(nil, bossName, nil, true)
+                        break
+                    end
                 end
             end
         else
@@ -7625,6 +7852,13 @@ eventHandler:SetScript("OnEvent", function(self, event, ...)
                         outOfCombatAccum = 0
                         break
                     end
+                end
+            end
+
+            for phrase, bossName in pairs(RTExt.BOSS_WIPE_SPEECH) do
+                if lowerMsg:find(phrase, 1, true) and activeBossName == bossName then
+                    RTExt.wipeSpeechHeard = true
+                    break
                 end
             end
 
@@ -7765,8 +7999,8 @@ eventHandler:SetScript("OnEvent", function(self, event, ...)
                 RecordPlayerDeath(destName, destGUID)
             end
 
+            local deadID = GetNPCIDFromGUID(destGUID)
             if inCombatState then
-                local deadID = GetNPCIDFromGUID(destGUID)
                 if deadID and WOTLK_BOSS_DB[deadID] and not WOTLK_BOSS_DB[deadID].isAdd then
                     local bInfo = activeBossName and BOSS_NAME_TO_INFO[activeBossName]
                     if bInfo and bInfo.isFactionChamp and WOTLK_BOSS_DB[deadID].isFactionChamp then
@@ -7792,6 +8026,12 @@ eventHandler:SetScript("OnEvent", function(self, event, ...)
                     elseif activeBossID and deadID == activeBossID and not (activeBossData and (activeBossData.scriptedFinish or activeBossData.isSubBoss)) then
                         EndEncounter(true, "Boss NPC Defeated")
                     end
+                end
+            elseif deadID and WOTLK_BOSS_DB[deadID] and not WOTLK_BOSS_DB[deadID].isAdd and not WOTLK_BOSS_DB[deadID].isMini and not WOTLK_BOSS_DB[deadID].isSubBoss and not WOTLK_BOSS_DB[deadID].scriptedFinish then
+                local deadBossName = WOTLK_BOSS_DB[deadID].name
+                local bInfo = deadBossName and BOSS_NAME_TO_INFO[deadBossName]
+                if bInfo and bInfo.npcIDs[deadID] and not bInfo.isGroup and not bInfo.isFactionChamp then
+                    RTExt.PromoteRecentWipeToVictory(deadBossName, "Late Boss NPC Death")
                 end
             end
             return
