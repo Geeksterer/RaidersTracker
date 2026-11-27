@@ -1040,11 +1040,72 @@ function RTExt.IsValidBlacklistReason(reason)
     return true
 end
 
+RTExt.MONTH_NAMES_SHORT = {
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+}
+RTExt.MONTH_NAMES_SHORT_LOOKUP = {
+    jan = "Jan", feb = "Feb", mar = "Mar", apr = "Apr",
+    may = "May", jun = "Jun", jul = "Jul", aug = "Aug",
+    sep = "Sep", oct = "Oct", nov = "Nov", dec = "Dec",
+}
+
+function RTExt.FormatBlacklistDate(rawDate)
+    if type(rawDate) ~= "string" or rawDate == "" then return "" end
+    local y, m, d = rawDate:match("^(%d%d%d%d)%-(%d%d)%-(%d%d)")
+    if y and m and d then
+        local mNum = tonumber(m)
+        local mon = mNum and RTExt.MONTH_NAMES_SHORT[mNum]
+        if mon then
+            return string.format("%s-%s-%s", y, mon, d)
+        end
+    end
+    local ay, am, ad = rawDate:match("^(%d%d%d%d)%-([A-Za-z][A-Za-z][A-Za-z])%-(%d%d)")
+    if ay and am and ad then
+        local normMon = RTExt.MONTH_NAMES_SHORT_LOOKUP[am:lower()]
+        if normMon then
+            return string.format("%s-%s-%s", ay, normMon, ad)
+        end
+    end
+    return rawDate
+end
+
+function RTExt.IsPlayerBlacklisted(playerName, charID)
+    local bl = RaidersTrackerDB and RaidersTrackerDB.blacklist
+    if type(bl) ~= "table" then return false end
+    if charID and charID ~= "" and bl[tostring(charID)] then
+        return true
+    end
+    if type(playerName) == "string" and playerName ~= "" then
+        if bl["NAME:" .. playerName] then
+            return true
+        end
+        local lowerName = playerName:lower()
+        for _, info in pairs(bl) do
+            if type(info) == "table" then
+                if type(info.names) == "table" then
+                    if info.names[playerName] then return true end
+                    for n in pairs(info.names) do
+                        if type(n) == "string" and n:lower() == lowerName then
+                            return true
+                        end
+                    end
+                elseif type(info.name) == "string" and info.name:lower() == lowerName then
+                    return true
+                end
+            end
+        end
+    end
+    return false
+end
+
 function RTExt.IsValidBlacklistTimestamp(ts)
     if type(ts) ~= "string" then return false end
     if ts == "" then return true end
     if ts:match("^%d%d%d%d%-%d%d%-%d%d %d%d:%d%d$") then return true end
     if ts:match("^%d%d%d%d%-%d%d%-%d%d$") then return true end
+    local _, mon = ts:match("^(%d%d%d%d)%-([A-Za-z][A-Za-z][A-Za-z])%-(%d%d)$")
+    if mon and RTExt.MONTH_NAMES_SHORT_LOOKUP[mon:lower()] then return true end
     return false
 end
 
@@ -1068,6 +1129,7 @@ function RTExt.CollectSortedBlacklistItems()
         local namesStr = (#nameList > 0) and table.concat(nameList, ", ") or "Unknown"
         local rawClass = info.class and string.upper(tostring(info.class)) or "UNKNOWN"
         if not RTExt.VALID_BLACKLIST_CLASSES[rawClass] then rawClass = "UNKNOWN" end
+        local rawDate = RTExt.SanitizeForXMLField(info.timestamp or "")
         table.insert(list, {
             id = tostring(charID),
             names = nameList,
@@ -1075,7 +1137,8 @@ function RTExt.CollectSortedBlacklistItems()
             class = rawClass,
             classStr = (rawClass ~= "UNKNOWN") and (" (" .. rawClass .. ")") or "",
             reason = RTExt.SanitizeForXMLField(info.reason or "Unspecified"),
-            date = RTExt.SanitizeForXMLField(info.timestamp or "")
+            date = rawDate,
+            formattedDate = RTExt.FormatBlacklistDate(rawDate)
         })
     end
     table.sort(list, function(a, b)
@@ -1127,21 +1190,24 @@ end
 function RTExt.BuildBlacklistReportSpec()
     local items = RTExt.CollectSortedBlacklistItems()
     local rowItems = {}
-    for idx, item in ipairs(items) do
-        local dateSuffix = (item.date ~= "") and (" (" .. item.date .. ")") or ""
-        local classHex = (item.class and item.class ~= "UNKNOWN") and GetPlayerClassColor(item.class) or "FFFF00"
+    for _, item in ipairs(items) do
+        local fmtDate = item.formattedDate or RTExt.FormatBlacklistDate(item.date or "")
+        local datePlain = (fmtDate ~= "") and (" (" .. fmtDate .. ")") or ""
+        local dateHtml = (fmtDate ~= "") and string.format(' <span style="color: #AAAAAA;">(%s)</span>', RTExt.EscapeHTML(fmtDate)) or ""
+        local classHex = (item.class and item.class ~= "UNKNOWN") and GetPlayerClassColor(item.class) or "CCCCCC"
+        local classSuffix = item.classStr or ""
         table.insert(rowItems, {
             plain = string.format(
-                "%d. [ID: %s] Names: %s%s - Reason: %s%s",
-                idx, item.id, item.namesStr, item.classStr, item.reason, dateSuffix
+                "[%s] %s%s (%s)%s",
+                item.id, item.namesStr, classSuffix, item.reason, datePlain
             ),
             discord = string.format(
-                "%d. `[ID: %s]` **%s**%s - Reason: *%s*%s",
-                idx, item.id, item.namesStr, item.classStr, item.reason, dateSuffix
+                "- `[%s]` **%s**%s (*%s*)%s",
+                item.id, item.namesStr, classSuffix, item.reason, datePlain
             ),
             html = string.format(
-                '%d. <span style="color: #00FF00;">[ID: %s]</span> <span style="color: #%s; font-weight: bold;">%s</span>%s &mdash; Reason: <span style="color: #FFD100;">%s</span>%s',
-                idx, RTExt.EscapeHTML(item.id), classHex, RTExt.EscapeHTML(item.namesStr), RTExt.EscapeHTML(item.classStr), RTExt.EscapeHTML(item.reason), RTExt.EscapeHTML(dateSuffix)
+                '<span style="color: #00FF00;">[%s]</span> <span style="color: #%s; font-weight: bold;">%s</span> <span style="color: #FFD100;">(%s)</span>%s',
+                RTExt.EscapeHTML(item.id), classHex, RTExt.EscapeHTML(item.namesStr), RTExt.EscapeHTML(item.reason), dateHtml
             ),
         })
     end
@@ -3271,9 +3337,10 @@ local function BuildCondensedEntryLines(entryMap, indentPrefix, dpValues, dpTime
             local base, target = clean:match("^(.-)%s*%[(.-)%]$")
             if base and target then
                 if not grouped[base] then
-                    grouped[base] = { total = 0, targets = {}, targetCount = 0, isTargeted = true }
+                    grouped[base] = { total = 0, targets = {}, targetCount = 0, untargetedCount = 0, isTargeted = false }
                     table.insert(groupOrder, base)
                 end
+                grouped[base].isTargeted = true
                 grouped[base].total = grouped[base].total + c
                 if not grouped[base].targets[target] then
                     grouped[base].targetCount = grouped[base].targetCount + 1
@@ -3281,10 +3348,11 @@ local function BuildCondensedEntryLines(entryMap, indentPrefix, dpValues, dpTime
                 grouped[base].targets[target] = (grouped[base].targets[target] or 0) + c
             else
                 if not grouped[clean] then
-                    grouped[clean] = { total = 0, targets = {}, targetCount = 0, isTargeted = false }
+                    grouped[clean] = { total = 0, targets = {}, targetCount = 0, untargetedCount = 0, isTargeted = false }
                     table.insert(groupOrder, clean)
                 end
                 grouped[clean].total = grouped[clean].total + c
+                grouped[clean].untargetedCount = (grouped[clean].untargetedCount or 0) + c
             end
         end
     end
@@ -3296,6 +3364,9 @@ local function BuildCondensedEntryLines(entryMap, indentPrefix, dpValues, dpTime
             if base == "Power Word: Shield" or info.targetCount > 3 then
                 table.insert(out, string.format("%s%s: %d casts (across %d %s)", indentPrefix, base, info.total, info.targetCount, (info.targetCount == 1) and "target" or "targets"))
             else
+                if (info.untargetedCount or 0) > 0 then
+                    table.insert(out, string.format("%s%s: %d", indentPrefix, base, info.untargetedCount))
+                end
                 local tNames = {}
                 for tName in pairs(info.targets) do table.insert(tNames, tName) end
                 table.sort(tNames)
@@ -3772,9 +3843,11 @@ function RTExt.BuildCondensedEntryItems(entryMap, dpValues, dpTimes, segDur)
             local base, target = clean:match("^(.-)%s*%[(.-)%]$")
             if base and target then
                 if not grouped[base] then
-                    grouped[base] = { total = 0, targets = {}, targetCount = 0, isTargeted = true, rawTargets = {} }
+                    grouped[base] = { total = 0, targets = {}, rawTargets = {}, targetCount = 0, untargetedCount = 0, isTargeted = false }
                     table.insert(groupOrder, base)
                 end
+                grouped[base].isTargeted = true
+                grouped[base].rawTargets = grouped[base].rawTargets or {}
                 grouped[base].total = grouped[base].total + c
                 if not grouped[base].targets[target] then
                     grouped[base].targetCount = grouped[base].targetCount + 1
@@ -3783,10 +3856,12 @@ function RTExt.BuildCondensedEntryItems(entryMap, dpValues, dpTimes, segDur)
                 grouped[base].rawTargets[target] = rawKey
             else
                 if not grouped[clean] then
-                    grouped[clean] = { total = 0, targets = {}, targetCount = 0, isTargeted = false, rawKey = rawKey }
+                    grouped[clean] = { total = 0, targets = {}, rawTargets = {}, targetCount = 0, untargetedCount = 0, isTargeted = false }
                     table.insert(groupOrder, clean)
                 end
                 grouped[clean].total = grouped[clean].total + c
+                grouped[clean].untargetedCount = (grouped[clean].untargetedCount or 0) + c
+                grouped[clean].rawKey = grouped[clean].rawKey or rawKey
             end
         end
     end
@@ -3803,12 +3878,19 @@ function RTExt.BuildCondensedEntryItems(entryMap, dpValues, dpTimes, segDur)
                     html = string.format('%s: <span style="color: #00FF00; font-weight: bold;">%d</span> casts (across %d %s)', RTExt.EscapeHTML(base), info.total, info.targetCount, noun),
                 })
             else
+                if (info.untargetedCount or 0) > 0 then
+                    table.insert(out, {
+                        plain = string.format("- %s: %d", base, info.untargetedCount),
+                        discord = string.format("- %s: **%d**", base, info.untargetedCount),
+                        html = string.format('%s: <span style="color: #00FF00; font-weight: bold;">%d</span>', RTExt.ConvertWoWColorsToHTML(info.rawKey or base), info.untargetedCount),
+                    })
+                end
                 local tNames = {}
                 for tName in pairs(info.targets) do table.insert(tNames, tName) end
                 table.sort(tNames)
                 for _, tName in ipairs(tNames) do
                     local cnt = info.targets[tName]
-                    local rawLbl = info.rawTargets[tName] or (base .. " [" .. tName .. "]")
+                    local rawLbl = (info.rawTargets and info.rawTargets[tName]) or (base .. " [" .. tName .. "]")
                     table.insert(out, {
                         plain = string.format("- %s [%s]: %d", base, tName, cnt),
                         discord = string.format("- %s [%s]: **%d**", base, tName, cnt),
@@ -4504,11 +4586,11 @@ local function CreateBlacklistFrame()
     local rows = {}
     for i = 1, 100 do
         local row = CreateFrame("Frame", nil, scrollContent)
-        row:SetSize(540, 42)
-        row:SetPoint("TOPLEFT", scrollContent, "TOPLEFT", 4, -((i - 1) * 42) - 4)
+        row:SetSize(540, 30)
+        row:SetPoint("TOPLEFT", scrollContent, "TOPLEFT", 4, -((i - 1) * 30) - 4)
 
-        local text = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-        text:SetPoint("TOPLEFT", row, "TOPLEFT", 6, -2)
+        local text = row:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+        text:SetPoint("LEFT", row, "LEFT", 6, 0)
         text:SetPoint("RIGHT", row, "RIGHT", -90, 0)
         text:SetJustifyH("LEFT")
         text:SetWordWrap(true)
@@ -4523,6 +4605,9 @@ local function CreateBlacklistFrame()
                 RaidersTrackerDB.blacklist[self.targetID] = nil
                 AnnounceLocalChat("Removed player from blacklist.")
                 RefreshBlacklistView()
+                if CharacterFrame and CharacterFrame:IsShown() then
+                    RefreshCharactersView()
+                end
             end
         end)
 
@@ -4534,28 +4619,7 @@ local function CreateBlacklistFrame()
 
     RefreshBlacklistView = function()
         if not BlacklistFrame or not BlacklistFrame:IsShown() then return end
-        RaidersTrackerDB.blacklist = RaidersTrackerDB.blacklist or {}
-
-        local list = {}
-        for charID, info in pairs(RaidersTrackerDB.blacklist) do
-            local nameList = {}
-            if info.names then
-                for n in pairs(info.names) do table.insert(nameList, n) end
-                table.sort(nameList)
-            elseif info.name then
-                table.insert(nameList, info.name)
-            end
-            local namesStr = (#nameList > 0) and table.concat(nameList, ", ") or "Unknown"
-            local classStr = info.class and (" (" .. info.class .. ")") or ""
-            table.insert(list, {
-                id = charID,
-                namesStr = namesStr,
-                classStr = classStr,
-                reason = info.reason or "Unspecified",
-                date = info.timestamp or ""
-            })
-        end
-        table.sort(list, function(a, b) return a.namesStr < b.namesStr end)
+        local list = RTExt.CollectSortedBlacklistItems()
 
         if #list == 0 then
             for i = 1, 100 do rows[i]:Hide() end
@@ -4568,12 +4632,16 @@ local function CreateBlacklistFrame()
         local shownCount = math.min(#list, 100)
         for idx = 1, shownCount do
             local item = list[idx]
-            rows[idx].text:SetText(string.format("ID: |cff00FF00[%s]|r Names: |cffFFFF00%s|r%s\nReason: |cffFFD100%s|r (%s)", item.id, item.namesStr, item.classStr, item.reason, item.date))
+            local classHex = (item.class and item.class ~= "UNKNOWN") and GetPlayerClassColor(item.class) or "CCCCCC"
+            local coloredNames = ColorizeText(item.namesStr, classHex)
+            local fmtDate = item.formattedDate or RTExt.FormatBlacklistDate(item.date or "")
+            local datePart = (fmtDate ~= "") and (" |cffAAAAAA(" .. fmtDate .. ")|r") or ""
+            rows[idx].text:SetText(string.format("|cff00FF00[%s]|r %s |cffFFD100(%s)|r%s", item.id, coloredNames, item.reason, datePart))
             rows[idx].btnRemove.targetID = item.id
             if not rows[idx]:IsShown() then rows[idx]:Show() end
         end
         for idx = shownCount + 1, 100 do rows[idx]:Hide() end
-        scrollContent:SetHeight(math.max(340, shownCount * 42 + 12))
+        scrollContent:SetHeight(math.max(340, shownCount * 30 + 12))
     end
 
     BlacklistFrame:SetScript("OnShow", RefreshBlacklistView)
@@ -5404,6 +5472,9 @@ local function CreateCharacterFrame()
                 if BlacklistFrame and BlacklistFrame:IsShown() then
                     RefreshBlacklistView()
                 end
+                if CharacterFrame and CharacterFrame:IsShown() then
+                    RefreshCharactersView()
+                end
             end
             blacklistMenu:Hide()
         end)
@@ -5544,7 +5615,8 @@ local function CreateCharacterFrame()
                     statusTag = " |cffFF5555[Left]|r"
                 end
             end
-            rows[idx].text:SetText(string.format("%s |cff888888(%s)|r - |cff00FF00%s|r%s", ColorizeText(pName, hexColor), pClass, RTExt.FormatZoneDuration(zoneSecs), statusTag))
+            local blTag = RTExt.IsPlayerBlacklisted(pName, pCharID) and " |cffFF4444(Blacklisted)|r" or ""
+            rows[idx].text:SetText(string.format("%s%s - |cff00FF00%s|r%s", ColorizeText(pName, hexColor), blTag, RTExt.FormatZoneDuration(zoneSecs), statusTag))
             rows[idx].btnWhisper.playerName = pName
             rows[idx].btnBlacklist.playerName = pName
             rows[idx].btnBlacklist.playerClass = pClass
@@ -5568,7 +5640,7 @@ function RTExt.BuildCharacterExportReportSpec()
         RTExt.activeMajorityRaidZone = majZone
     end
 
-    local playerMap, _, activeCount = RTExt.CollectSessionCharacters(activeSession)
+    local playerMap, playerIDMap, activeCount = RTExt.CollectSessionCharacters(activeSession)
 
     local sortedPlayers = {}
     for pName in pairs(playerMap) do table.insert(sortedPlayers, pName) end
@@ -5580,15 +5652,22 @@ function RTExt.BuildCharacterExportReportSpec()
     local rowItems = {}
     for _, pName in ipairs(sortedPlayers) do
         local pClass = string.upper(playerMap[pName] or "WARRIOR")
+        local pCharID = (activeSession and activeSession.playerIDs and activeSession.playerIDs[pName])
+            or playerIDMap[pName]
+            or nameToCharID[pName]
+        local isBL = RTExt.IsPlayerBlacklisted(pName, pCharID)
+        local blPlain = isBL and " (Blacklisted)" or ""
+        local blDiscord = isBL and " *(Blacklisted)*" or ""
+        local blHtml = isBL and ' <span style="color: #FF4444; font-weight: bold;">(Blacklisted)</span>' or ""
         local zoneSecs = 0
         if activeSession and activeSession.zoneTimes and activeSession.zoneTimes[pName] and majZone then
             zoneSecs = RTExt.GetZoneTimeTotal(activeSession.zoneTimes[pName][majZone])
         end
         local durStr = RTExt.FormatZoneDuration(zoneSecs)
         table.insert(rowItems, {
-            plain = string.format("%s (%s) - %s", pName, pClass, durStr),
-            discord = string.format("- **%s (%s)** - `%s`", pName, pClass, durStr),
-            html = string.format('%s (%s) &mdash; <span style="color: #00FF00; font-weight: bold;">%s</span>', RTExt.FormatClassHTML(pName, pClass), RTExt.EscapeHTML(pClass), RTExt.EscapeHTML(durStr)),
+            plain = string.format("%s%s - %s", pName, blPlain, durStr),
+            discord = string.format("- **%s**%s - `%s`", pName, blDiscord, durStr),
+            html = string.format('%s%s &mdash; <span style="color: #00FF00; font-weight: bold;">%s</span>', RTExt.FormatClassHTML(pName, pClass), blHtml, RTExt.EscapeHTML(durStr)),
         })
     end
 
