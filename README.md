@@ -1,6 +1,6 @@
 # Raiders Tracker (WoW 3.3.5a)
 
-**Raiders Tracker (v1.3.1 by Copper)** is an all-in-one raid performance, utility, consumable, fail-analysis, attendance, and death-tracking addon built specifically for **World of Warcraft: Wrath of the Lich King (3.3.5a)**.
+**Raiders Tracker (v1.3.3 by Copper)** is an all-in-one raid performance, utility, consumable, fail-analysis, attendance, and death-tracking addon built specifically for **World of Warcraft: Wrath of the Lich King (3.3.5a)**.
 
 Leading a 10-man or 25-man raid takes enough focus without having to dig through raw combat logs mid-run to see who pre-potted, what spellpower and uptime your Demonology Warlock's Demonic Pact gave the raid, whether a tank used a defensive cooldown, which Rogue slacked on Tricks of the Trade, which Hunter missed a Tranquilizing Shot, or what actually killed someone on a wipe. **Raiders Tracker** automatically segments your raid into Trash and Boss pulls, snapshots your roster's buffs, tracks group-only per-zone attendance time, and organizes potions, procs, class utility, raid fails, and detailed death logs into clean, consistently laid-out in-game panels—complete with a 5-tab **Reports Hub** (with synced Session/Segment dropdowns, **Boss Potions**, throttled **Raid Chat** broadcasting with safety confirmations, **Discord Markdown**, and **HTML Export**) plus an advanced **Player Blacklist System** with permanent character ID fingerprinting and secure Base64/XML import & export.
 
@@ -44,14 +44,14 @@ Verify whether your raiders are using their class toolkit to help the group surv
 
 
 ### 3. 5-Tab Reports Hub & Anti-Spam Raid Chat Queue (`Reports`)
-Click **`Reports`** on the Main Tracker window to open the expanded `740×560` **Reports Hub**. Synced **Session** and **Segment** dropdowns (with `<` / `>` pagination) sit right at the top so you can audit multiple bosses or saved sessions without ever leaving Reports. Every tab includes a read-only preview box, a one-click **`Select All`** button (`Ctrl+C`), and a **`Send to Raid`** button powered by an anti-spam queue (`~0.20s` per line, auto-stripping color codes and wrapping lines over 255 characters) with two built-in broadcast safeguards:
+Click **`Reports`** on the Main Tracker window to open the expanded `740×580` **Reports Hub**. Synced **Session** and **Segment** dropdowns (with `<` / `>` pagination) sit right at the top so you can audit multiple bosses or saved sessions without ever leaving Reports. Every tab includes a read-only preview box, a one-click **`Select All`** button (`Ctrl+C`), and a **`Send to Raid`** button powered by an anti-spam queue (`~0.20s` per line, auto-stripping color codes and wrapping lines over 255 characters) with two built-in broadcast safeguards:
 - **Large-Report Confirmation Popup:** Prompts for confirmation whenever sending a report longer than **25 lines** to Raid/Party chat.
 - **`Stop Sending` Emergency Cancel:** While a multi-line report is actively broadcasting, **`Send to Raid`** turns into a red **`Stop Sending`** button to immediately halt the queue.
 
 The Reports Hub organizes every report into five tabs:
 1. **`1. ALL Data`:**
    - Generates the complete segment breakdown (**1. Characters Present**, **2. Deaths & Death Log**, **3. Potions & Buffs** or **Consumables Only**, and **4. Raid Utility** including Demonic Pact spellpower histories and summary lines).
-   - Switch between **Plain Text**, **Discord Markdown**, and **Export as HTML** (self-contained `#141419` dark-theme HTML with inline CSS class colors, `<h1>` headers, and nested `<ul>`/`<li>` lists), plus toggle **`Filter: Everything` / `Filter: Consumables Only`**.
+   - Switch between **Raw Text**, **Discord Markdown**, and **HTML Output** (self-contained `#141419` dark-theme HTML with inline CSS class colors, `<h1>` headers, and nested `<ul>`/`<li>` lists), plus toggle **`Filter: Everything` / `Filter: Consumables Only`**.
    - **Live HTML Output Sample:** <https://sites.google.com/view/raiders-tracker-by-copper/raiders-tracker-output>
 2. **`2. Character`:**
    - Select any raider from the segment via a custom zero-taint dropdown and toggle between two modes:
@@ -85,16 +85,19 @@ Accessed directly from **`Reports` → `4. Deaths` → `Deaths & Death Log`** (w
 
 ### 5. Session Characters, Attendance & Player Blacklist (`Characters` & `Blacklist`)
 Track raid attendance and screen problem raiders across name changes:
-- **Live Active vs. Total Roster Counts & Sorting (`Characters`):** Displays **`Players: Active: X | Total: Y`** (updating live on roster changes) alongside **`Sort: Name` / `Sort: Time`** and **`Show: All` / `Show: Active Only`** toggles, plus the detected **Majority Raid Zone**.
+- **Live Active vs. Total Roster Counts, Sorting & Blacklist Badges (`Characters`):** Displays **`Players: Active: X | Total: Y`** (updating live on roster changes) alongside **`Sort: Name` / `Sort: Time`** and **`Show: All` / `Show: Active Only`** toggles, plus the detected **Majority Raid Zone**. Player names are rendered in class color without redundant class text, and blacklisted players are immediately flagged with a red **`(Blacklisted)`** tag after their name.
 - **Group-Only Zone Time (Previous + Current Raid Only):** Tracks online zone time strictly while in a raid or party (never when solo). If you or a raider leave a group and rejoin later, your previous raid time in that zone is added to your current raid time without stacking unlimited older sessions.
-- **One-Click Roster Actions & Export:** Every player row includes **`Blacklist`** and **`Whisper`** buttons, plus an **`Export Characters`** panel to copy names, classes, active/total counts, and raid zone online time as plain text.
-- **Persistent Character ID Fingerprinting (`Blacklist`):** Extracts the unique numeric character ID component from player GUIDs so blacklisted players stay tracked across name changes, recording their full comma-separated alias history (e.g., *Names: Distordark, Kittyscratch*), class, reason, and timestamp.
+- **One-Click Roster Actions & Export:** Every player row includes **`Blacklist`** and **`Whisper`** buttons, plus an **`Export Characters`** panel (supporting **Raw Text**, **Discord Markdown**, **HTML Output** with class colors, and **Send to Raid**) showing active/total counts, `(Blacklisted)` tags, and raid zone online time.
+- **Persistent Character ID Fingerprinting (`Blacklist`):** Extracts the unique numeric character ID component from player GUIDs so blacklisted players stay tracked across name changes, displaying every entry in a clean, readable format with class-colored comma-delimited aliases and `YYYY-Mon-DD` dates:
+  ```text
+  [123456] Distordark, Kittyscratch (leaver) (2026-Nov-27)
+  ```
 - **8 Categorized Blacklist Reasons:** Choose from **`leaver`**, **`bad dps`**, **`unskilled`**, **`ninja`**, **`ninja pulls`**, **`low gs`**, **`afk bot`**, or **`rude`**.
 - **Real-Time Group Join Warnings:** Automatically scans raid/party rosters against your blacklist and posts an immediate yellow warning alert in chat if a blacklisted player joins.
 - **Secure Base64/XML Blacklist Export & Import:**
   - **`Export Blacklist`:** Exports your entire blacklist into a compact Base64-encoded XML string (`schema="1"`) ready to back up or share (`Select All`, `Ctrl+C`).
   - **`Import Blacklist`:** Paste a Raiders Tracker Base64 export string and click **`Verify`** (dry-run preview) or **`Import`**. Strictly validates Base64 encoding, XML schema, IDs, names, classes, reasons, and timestamps, omits duplicates, and merges newly discovered aliases onto existing IDs.
-  - **`Copy as Text`:** Generates a clean plain-text copy of your blacklist for Discord or guild notes.
+  - **`Copy as Text`:** Exports your blacklist in **Raw Text**, **Discord Markdown**, **HTML Output**, or **Send to Raid**—including `(CLASS)` in brackets after player names for Raw Text and Discord Markdown while using class colors in HTML Output.
 
 
 ### 6. Automatic WotLK Boss Detection, Navigation & Session Archiving
@@ -110,6 +113,26 @@ Track raid attendance and screen problem raiders across name changes:
 
 ---
 
+## Changelog
+
+### v1.3.3
+- **Fixed Report Generation Lua Crash (`attempt to index field 'rawTargets'`):**
+  - Resolved a Lua error in `RTExt.BuildCondensedEntryItems()` (and applied the same fix to `BuildCondensedEntryLines()`) when a player had both an unbracketed entry (e.g., self-cast *Hand of Protection*, *Power Infusion*, *Innervate*, *Fear Ward*, or *Heroism*) and a bracketed `[Player]` entry for the same base spell in the same segment.
+  - Unified grouped bucket initialization (`total`, `targets`, `rawTargets`, `targetCount`, `untargetedCount`, `isTargeted`) and added nil-safe guards on `rawTargets` so output is completely independent of Lua's `pairs()` iteration order.
+  - Preserved combined totals for condensed summaries (`Power Word: Shield` and spells cast on `> 3` targets) and ensured untargeted casts are emitted alongside sorted `[Target]` lines whenever `targetCount <= 3` across Raw Text, Discord Markdown, and HTML outputs.
+- **Characters Panel Improvements:**
+  - Added a red **`(Blacklisted)`** tag directly after any blacklisted player's name (matched by character ID, `NAME:` fallback, or known aliases case-insensitively), refreshing live when players are added to or removed from the blacklist.
+  - Removed redundant `(CLASS)` text after player names since names are already displayed in class colors.
+  - Updated **Export Characters** (Raw Text, Discord Markdown, HTML Output, and Raid Chat) to include `(Blacklisted)` tags, remove redundant class labels, and render class-colored names in HTML.
+- **Blacklist Panel Redesign & Date Formatting:**
+  - Streamlined the in-game Blacklist display to `[ID#] Name1, Name2 (reason) (YYYY-Mon-DD)` using class-colored comma-delimited names and `GameFontHighlight` typography—removing redundant `ID:`, `Names:`, `Reason:`, and `(CLASS)` text.
+  - Added `YYYY-Mon-DD` 3-letter month date formatting (e.g., `2026-Nov-27`) while keeping Base64/XML import & export fully backwards-compatible with existing saved timestamps.
+- **Blacklist "Copy as Text" Format Updates:**
+  - Updated **Raw Text** (and **Send to Raid**) to `[ID#] Name1, Name2 (CLASS) (reason) (YYYY-Mon-DD)` and **Discord Markdown** to ``- `[ID#]` **Name1, Name2** (CLASS) (*reason*) (YYYY-Mon-DD)`` so player classes remain clearly identified where class colors aren't available.
+  - Updated **HTML Output** to follow the streamlined `[ID#] Name1, Name2 (reason) (YYYY-Mon-DD)` format with inline CSS class colors and no redundant class names.
+
+---
+
 ## Installation Instructions
 
 ### 1. Download the Addon
@@ -117,7 +140,7 @@ You can download **Raiders Tracker** in one of two ways from this GitHub reposit
 
 - **Option A — From the Releases Section (Recommended):**
   1. Look for the **Releases** section on the right-hand sidebar of this GitHub page.
-  2. Click on the latest release (`v1.3.0`) and download the attached `.zip` file.
+  2. Click on the latest release (`v1.3.3`) and download the attached `.zip` file.
 - **Option B — Using the Green Code Button:**
   1. Click the green **`<> Code`** button near the top-right of this page.
   2. Select **Download ZIP** from the dropdown menu.
